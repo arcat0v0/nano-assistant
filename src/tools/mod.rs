@@ -1,0 +1,21 @@
+pub mod traits;
+pub mod shell;
+pub mod file_read;
+pub mod file_write;
+pub mod file_edit;
+pub mod glob_search;
+pub mod content_search;
+
+pub use traits::{Tool, ToolResult, ToolSpec};
+
+/// Returns the 6 core tools every agent gets by default.
+pub fn default_tools() -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(shell::ShellTool::new()),
+        Box::new(file_read::FileReadTool::new()),
+        Box::new(file_write::FileWriteTool::new()),
+        Box::new(file_edit::FileEditTool::new()),
+        Box::new(glob_search::GlobSearchTool::new()),
+        Box::new(content_search::ContentSearchTool::new()),
+    ]
+}

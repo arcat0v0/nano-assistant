@@ -1,0 +1,72 @@
+[package]
+name = "nano-assistant"
+version = "0.1.0"
+edition = "2021"
+authors = ["nano-assistant team"]
+license = "MIT OR Apache-2.0"
+description = "A lightweight AI assistant in Rust"
+repository = "https://github.com/nano-assistant/nano-assistant"
+readme = "README.md"
+rust-version = "1.70"
+
+[lib]
+name = "nano_assistant"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "io-util", "fs", "signal"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.0"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Async traits
+async-trait = "0.1"
+
+# Async utilities
+futures = "0.3"
+
+# Regex
+regex = "1.10"
+
+# Glob patterns
+glob = "0.3"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Directories (config path resolution)
+directories = "5"
+
+# HMAC for JWT (GLM provider)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Logging
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
