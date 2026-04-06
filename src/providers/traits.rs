@@ -90,14 +90,21 @@ pub trait Provider: Send + Sync {
         self.capabilities().streaming
     }
 
+    /// Unified chat entry point. Always sends full message history.
+    /// Provider implementations should override `chat_with_history` to handle API-specific mapping.
     async fn chat(
         &self,
-        messages: &[ChatMessage],
+        request: ChatRequest<'_>,
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let text = self.chat_with_history(messages, model, temperature).await?;
-        Ok(ChatResponse { text: Some(text), tool_calls: vec![] })
+        let text = self
+            .chat_with_history(request.messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: vec![],
+        })
     }
 
     async fn chat_with_tools(
@@ -111,7 +118,8 @@ pub trait Provider: Send + Sync {
             anyhow::bail!("provider declares native tool support but did not override chat_with_tools()")
         }
         let _ = tools;
-        self.chat(messages, model, temperature).await
+        self.chat(ChatRequest { messages, tools: None }, model, temperature)
+            .await
     }
 
     fn stream_chat(

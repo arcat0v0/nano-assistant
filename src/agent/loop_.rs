@@ -8,10 +8,47 @@ use crate::agent::dispatcher::{create_dispatcher, ToolDispatcher, ToolExecutionR
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::memory::Memory;
-use crate::providers::{ChatMessage, ChatResponse, Provider};
+use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
 use crate::tools::{Tool, ToolSpec};
 use anyhow::{bail, Result};
 use std::sync::Arc;
+
+const TAG_OPEN: &str = "<antml:invoke";
+const TAG_CLOSE: &str = "</antml:invoke>";
+
+fn strip_tool_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+
+    while let Some(start) = remaining.find(TAG_OPEN) {
+        result.push_str(&remaining[..start]);
+
+        let after_open = &remaining[start + TAG_OPEN.len()..];
+        let after_close = match after_open.find('>') {
+            Some(pos) => pos,
+            None => {
+                result.push_str(TAG_OPEN);
+                remaining = after_open;
+                continue;
+            }
+        };
+
+        let inner_start = start + TAG_OPEN.len() + after_close + 1;
+        match remaining[inner_start..].find(TAG_CLOSE) {
+            Some(close_pos) => {
+                remaining = &remaining[inner_start + close_pos + TAG_CLOSE.len()..];
+            }
+            None => {
+                result.push_str(TAG_OPEN);
+                remaining = after_open;
+                continue;
+            }
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
 
 /// A single agent turn result.
 #[derive(Debug, Clone)]
@@ -77,6 +114,7 @@ pub struct Agent {
     config: Config,
     history: ConversationHistory,
     dispatcher: Box<dyn ToolDispatcher>,
+    last_visible_len: usize,
 }
 
 impl Agent {
@@ -98,6 +136,7 @@ impl Agent {
             config,
             history: ConversationHistory::new(),
             dispatcher,
+            last_visible_len: 0,
         }
     }
 
@@ -201,11 +240,23 @@ impl Agent {
                                 break;
                             }
                             accumulated.push_str(&chunk.delta);
-                            on_chunk(&chunk.delta);
+
+                            // Filter out tool call XML from streamed output
+                            let filtered = strip_tool_tags(&accumulated);
+                            let visible_delta = if filtered.len() > self.last_visible_len {
+                                &filtered[self.last_visible_len..]
+                            } else {
+                                ""
+                            };
+                            self.last_visible_len = filtered.len();
+                            if !visible_delta.is_empty() {
+                                on_chunk(visible_delta);
+                            }
                         }
                         Err(e) => return Err(e),
                     }
                 }
+                self.last_visible_len = 0;
 
                 let fake_response = ChatResponse {
                     text: Some(accumulated.clone()),
@@ -226,8 +277,17 @@ impl Agent {
                     self.history.push(ChatMessage::assistant(text));
                 }
 
+                // Notify about tool execution
+                for call in &calls {
+                    on_chunk(&format!("\n  ⏳ {} ... ", call.name));
+                }
                 let results = self.execute_tools(&calls).await?;
                 total_tool_calls += results.len();
+                for result in &results {
+                    let icon = if result.success { "✓" } else { "✗" };
+                    on_chunk(&format!("{}\n", icon));
+                }
+
                 let result_msg = self.dispatcher.format_results(&results);
                 self.history.push(result_msg);
                 self.trim_history();
@@ -309,13 +369,14 @@ impl Agent {
         model: &str,
         temperature: f64,
     ) -> Result<ChatResponse> {
-        if self.dispatcher.should_send_tool_specs() {
-            self.provider
-                .chat_with_tools(messages, &self.tool_specs, model, temperature)
-                .await
+        let tools = if self.dispatcher.should_send_tool_specs() {
+            Some(self.tool_specs.as_slice())
         } else {
-            self.provider.chat(messages, model, temperature).await
-        }
+            None
+        };
+        self.provider
+            .chat(ChatRequest { messages, tools }, model, temperature)
+            .await
     }
 
     async fn execute_tools(

@@ -150,14 +150,12 @@ impl ToolDispatcher for XmlToolDispatcher {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
         instructions.push_str(
-            "To use a tool, wrap a JSON object in `antml:invoke name=\"tool_name\"` tags:\n\n",
+            "To use a tool, output a JSON object wrapped in XML tags like <antml:invoke name=\"tool_name\">:\n\n",
         );
         instructions.push_str(
-            "```\n\
-             antml:invoke name=\"tool_name\"\n\
+            "<antml:invoke name=\"tool_name\">\n\
              {\"param\": \"value\"}\n\
-             antml:invoke\n\
-             ```\n\n",
+             </antml:invoke>\n\n",
         );
         instructions
     }

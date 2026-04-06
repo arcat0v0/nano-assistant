@@ -1,5 +1,6 @@
-use super::{ChatMessage, Provider};
+use super::{BoxStream, ChatMessage, Provider, ProviderCapabilities, StreamChunk};
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 pub struct OpenAiProvider {
@@ -34,6 +35,21 @@ struct Choice {
 struct ResponseMessage {
     content: Option<String>,
     reasoning_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StreamDelta {
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    delta: Option<StreamMessageDelta>,
+}
+
+#[derive(Deserialize)]
+struct StreamMessageDelta {
+    content: Option<String>,
 }
 
 impl ResponseMessage {
@@ -97,6 +113,13 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: false,
+            streaming: true,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -143,5 +166,104 @@ impl Provider for OpenAiProvider {
                 .await?;
         }
         Ok(())
+    }
+
+    fn stream_chat(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> BoxStream<'static, anyhow::Result<StreamChunk>> {
+        let api_messages: Vec<OpenAiMessage> = messages
+            .iter()
+            .map(|m| OpenAiMessage { role: m.role.clone(), content: m.content.clone() })
+            .collect();
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": api_messages,
+            "temperature": temperature,
+            "stream": true,
+        });
+
+        let key = self.api_key.clone();
+        let url = format!("{}/chat/completions", self.base_url);
+        let client = self.client();
+
+        let stream = async_stream::stream! {
+            let key = match key.as_ref() {
+                Some(k) => k.clone(),
+                None => {
+                    yield Err(anyhow::anyhow!("OpenAI API key not set"));
+                    return;
+                }
+            };
+
+            let response = match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(anyhow::anyhow!("stream request failed: {e}"));
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                yield Err(anyhow::anyhow!("OpenAI stream error ({status}): {body}"));
+                return;
+            }
+
+            let mut bytes = response.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = bytes.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos + 1..].to_string();
+
+                            if line.is_empty() || !line.starts_with("data: ") {
+                                continue;
+                            }
+                            let data = &line[6..];
+                            if data == "[DONE]" {
+                                yield Ok(StreamChunk::final_chunk());
+                                return;
+                            }
+
+                            if let Ok(delta) = serde_json::from_str::<StreamDelta>(data) {
+                                if let Some(choice) = delta.choices.first() {
+                                    if let Some(msg) = &choice.delta {
+                                        if let Some(content) = &msg.content {
+                                            if !content.is_empty() {
+                                                yield Ok(StreamChunk::delta(content));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(anyhow::anyhow!("stream read error: {e}"));
+                        return;
+                    }
+                }
+            }
+
+            yield Ok(StreamChunk::final_chunk());
+        };
+
+        Box::pin(stream)
     }
 }

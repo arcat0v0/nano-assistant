@@ -55,18 +55,8 @@ async fn run_streamed_turn(
 
 fn spawn_ctrl_c_handler(interrupted: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            tokio::signal::ctrl_c().await.ok();
-            if interrupted.swap(true, Ordering::Relaxed) {
-                break;
-            }
-            eprintln!("\n^C Press again to force quit...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if interrupted.load(Ordering::Relaxed) {
-                break;
-            }
-            interrupted.store(false, Ordering::Relaxed);
-        }
+        tokio::signal::ctrl_c().await.ok();
+        interrupted.store(true, Ordering::Relaxed);
     })
 }
 
