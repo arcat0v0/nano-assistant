@@ -13,45 +13,31 @@
 
 ## 安装
 
-### 前置条件
+### 方式一：下载预编译二进制（推荐）
 
-- Linux 操作系统
-- [Rust 工具链](https://rustup.rs/)（需要 `cargo`）
-
-### 方式一：使用安装脚本（推荐）
+从 [GitHub Releases](https://github.com/arcat0v0/nano-assistant/releases) 下载对应平台的压缩包：
 
 ```bash
-git clone <repo-url> nano-assistant
-cd nano-assistant
-bash install.sh
+# 下载最新版本（Linux x86_64）
+curl -sL https://github.com/arcat0v0/nano-assistant/releases/latest/download/na-x86_64-linux-gnu.tar.gz | tar xz
+
+# 移动到 PATH 目录
+mv na ~/.local/bin/
+chmod +x ~/.local/bin/na
+
+# 确保 ~/.local/bin 在 PATH 中
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-安装脚本会自动完成以下操作：
+### 方式二：从源码编译
 
-1. 使用 `cargo build --release` 编译项目
-2. 将二进制文件复制到 `~/.local/bin/na`，并创建 `nano-assistant` 符号链接
-3. 在 `~/.config/nano-assistant/` 下创建默认配置文件
-4. 将 `~/.local/bin` 添加到 PATH（修改 `.bashrc` / `.zshrc`）
-
-安装完成后，执行以下命令使 PATH 生效：
+需要 [Rust 工具链](https://rustup.rs/)：
 
 ```bash
-source ~/.bashrc   # 或 source ~/.zshrc
-```
-
-### 方式二：手动编译安装
-
-```bash
-git clone <repo-url> nano-assistant
+git clone https://github.com/arcat0v0/nano-assistant.git
 cd nano-assistant
 cargo build --release
 cp target/release/na ~/.local/bin/
-```
-
-确保 `~/.local/bin` 在 PATH 中：
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### 验证安装
