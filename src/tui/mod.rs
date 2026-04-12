@@ -28,6 +28,17 @@ pub async fn run_tui(mut agent: Agent, streaming: bool, history_path: PathBuf) -
                 match handle_inline_command(&mut agent, line) {
                     InlineCommandResult::Handled => continue,
                     InlineCommandResult::Quit => break,
+                    InlineCommandResult::Rescan => {
+                        match rescan_system_info().await {
+                            Ok(tool_count) => {
+                                println!("{}", accent(&format!("✓ System info updated ({} tools detected)", tool_count)));
+                            }
+                            Err(e) => {
+                                eprintln!("[tui] rescan failed: {e}");
+                            }
+                        }
+                        continue;
+                    }
                     InlineCommandResult::Prompt(prompt) => {
                         run_prompt(&mut agent, prompt, streaming).await?;
                     }
@@ -57,7 +68,7 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, streaming: bool) -> anyhow:
     } else {
         match agent.turn(prompt).await {
             Ok(result) => {
-                println!("{}", result.response);
+                crate::render::render_markdown_to_stdout(&result.response);
                 if result.tool_calls_count > 0 {
                     eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
                 }
@@ -75,6 +86,7 @@ enum InlineCommandResult<'a> {
     Handled,
     Quit,
     Prompt(&'a str),
+    Rescan,
 }
 
 fn handle_inline_command<'a>(agent: &mut Agent, line: &'a str) -> InlineCommandResult<'a> {
@@ -88,6 +100,19 @@ fn handle_inline_command<'a>(agent: &mut Agent, line: &'a str) -> InlineCommandR
         }
         "/help" => {
             print_help();
+            InlineCommandResult::Handled
+        }
+        "rescan" | "/rescan" => InlineCommandResult::Rescan,
+        "memory" | "/memory" => {
+            match std::fs::read_to_string(crate::cli::commands::memory_md_path()) {
+                Ok(content) => {
+                    crate::render::render_markdown_to_stdout(&content);
+                    println!();
+                }
+                Err(_) => {
+                    println!("{}", dim("No MEMORY.md found. Use /rescan to create one."));
+                }
+            }
             InlineCommandResult::Handled
         }
         cmd if cmd.starts_with('/') => {
@@ -123,13 +148,15 @@ fn print_welcome() {
         "{}",
         dim("Simple interactive mode • full terminal scrollback preserved • Ctrl+C/Ctrl+D to quit")
     );
-    println!("{}", dim("Commands: /help /clear /exit /quit"));
+    println!("{}", dim("Commands: /help /clear /rescan /memory /exit /quit"));
     println!();
 }
 
 fn print_help() {
     println!("{}", accent("Available commands"));
     println!("  {}  clear the conversation history and screen", accent("/clear"));
+    println!("  {}   re-detect system info and update MEMORY.md", accent("/rescan"));
+    println!("  {}  show current MEMORY.md contents", accent("/memory"));
     println!("  {}   show this help", accent("/help"));
     println!("  {}   quit interactive mode", accent("/exit"));
     println!("  {}   quit interactive mode", accent("/quit"));
@@ -147,6 +174,19 @@ fn dim(text: &str) -> String {
 
 fn warn(text: &str) -> String {
     format!("\x1b[33m{text}\x1b[0m")
+}
+
+async fn rescan_system_info() -> anyhow::Result<usize> {
+    let info = crate::system_info::detect().await;
+    let content = info.format_as_markdown();
+    let path = crate::cli::commands::memory_md_path();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &content)?;
+
+    Ok(info.installed_tools.len())
 }
 
 #[cfg(test)]
@@ -193,5 +233,33 @@ mod tests {
             InlineCommandResult::Prompt(prompt) => assert_eq!(prompt, "hello"),
             _ => panic!("expected prompt passthrough"),
         }
+    }
+
+    #[test]
+    fn rescan_is_recognized() {
+        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
+            "compatible",
+            "http://localhost:8080/v1",
+            None,
+            Some("http://localhost:8080/v1"),
+        ));
+        let agent = crate::agent::Agent::new(provider, vec![], None, crate::config::schema::Config::default());
+        let mut agent = agent;
+        assert!(matches!(handle_inline_command(&mut agent, "/rescan"), InlineCommandResult::Rescan));
+        assert!(matches!(handle_inline_command(&mut agent, "rescan"), InlineCommandResult::Rescan));
+    }
+
+    #[test]
+    fn memory_command_is_recognized() {
+        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
+            "compatible",
+            "http://localhost:8080/v1",
+            None,
+            Some("http://localhost:8080/v1"),
+        ));
+        let agent = crate::agent::Agent::new(provider, vec![], None, crate::config::schema::Config::default());
+        let mut agent = agent;
+        assert!(matches!(handle_inline_command(&mut agent, "/memory"), InlineCommandResult::Handled));
+        assert!(matches!(handle_inline_command(&mut agent, "memory"), InlineCommandResult::Handled));
     }
 }

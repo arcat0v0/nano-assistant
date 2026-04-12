@@ -18,9 +18,23 @@ pub async fn turn_streamed_to_stdout(
 ) -> anyhow::Result<TurnResult> {
     let mut loading = LoadingIndicator::new();
     loading.show();
-    let result = run_streamed_turn(agent, user_message, &mut loading).await?;
+    let mut printer = StreamPrinter::new();
+    let result = run_streamed_turn(agent, user_message, &mut loading, &mut printer).await?;
     loading.finish();
     println!();
+
+    // Redraw: replace raw streamed text with rendered markdown
+    let accumulated = printer.take_accumulated();
+    if !accumulated.is_empty() {
+        let raw_rendered = crate::render::render_markdown_fallback(&accumulated, 0);
+        let line_count = crate::render::count_rendered_lines(&raw_rendered);
+        if line_count > 0 {
+            print!("\x1b[{}A\x1b[J", line_count);
+            let _ = std::io::stdout().flush();
+            crate::render::render_markdown_to_stdout(&accumulated);
+        }
+    }
+
     Ok(result)
 }
 
@@ -28,9 +42,8 @@ async fn run_streamed_turn(
     agent: &mut Agent,
     user_message: &str,
     loading: &mut LoadingIndicator,
+    printer: &mut StreamPrinter,
 ) -> anyhow::Result<TurnResult> {
-    let mut printer = StreamPrinter::new();
-
     agent
         .turn_streamed(user_message, |event| {
             loading.clear_for_output();
@@ -82,6 +95,7 @@ impl LoadingIndicator {
 struct StreamPrinter {
     stdout: io::Stdout,
     stderr: io::Stderr,
+    accumulated: String,
 }
 
 impl StreamPrinter {
@@ -89,6 +103,7 @@ impl StreamPrinter {
         Self {
             stdout: io::stdout(),
             stderr: io::stderr(),
+            accumulated: String::new(),
         }
     }
 
@@ -105,8 +120,13 @@ impl StreamPrinter {
             StreamOutputEvent::Content(text) => {
                 let _ = self.stdout.write_all(text.as_bytes());
                 let _ = self.stdout.flush();
+                self.accumulated.push_str(&text);
             }
         }
+    }
+
+    fn take_accumulated(&mut self) -> String {
+        std::mem::take(&mut self.accumulated)
     }
 }
 
@@ -133,5 +153,47 @@ mod tests {
         assert!(loading.active);
         loading.clear_for_output();
         assert!(!loading.active);
+    }
+
+    #[test]
+    fn stream_printer_accumulates_content() {
+        let mut printer = StreamPrinter::new();
+        printer.print_event(StreamOutputEvent::Content("hello ".into()));
+        printer.print_event(StreamOutputEvent::Content("world".into()));
+        assert_eq!(printer.take_accumulated(), "hello world");
+    }
+
+    #[test]
+    fn stream_printer_take_accumulated_clears() {
+        let mut printer = StreamPrinter::new();
+        printer.print_event(StreamOutputEvent::Content("first".into()));
+        assert_eq!(printer.take_accumulated(), "first");
+        assert_eq!(printer.take_accumulated(), "");
+    }
+
+    #[test]
+    fn stream_printer_accumulates_multiple_chunks() {
+        let mut printer = StreamPrinter::new();
+        let chunks = vec![
+            "Hello ",
+            "world",
+            "! This ",
+            "is ",
+            "a ",
+            "test.",
+        ];
+        for chunk in chunks {
+            printer.print_event(StreamOutputEvent::Content(chunk.into()));
+        }
+        assert_eq!(printer.take_accumulated(), "Hello world! This is a test.");
+    }
+
+    #[test]
+    fn stream_printer_ignores_progress_for_accumulation() {
+        let mut printer = StreamPrinter::new();
+        printer.print_event(StreamOutputEvent::Progress("tool: running...".into()));
+        printer.print_event(StreamOutputEvent::Content("visible text".into()));
+        printer.print_event(StreamOutputEvent::Progress("tool: done".into()));
+        assert_eq!(printer.take_accumulated(), "visible text");
     }
 }
