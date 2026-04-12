@@ -10,6 +10,7 @@ use crate::agent::streaming::StreamOutputEvent;
 use crate::config::Config;
 use crate::memory::Memory;
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
+use crate::skills::Skill;
 use crate::tools::{Tool, ToolSpec};
 use anyhow::{bail, Result};
 use std::sync::Arc;
@@ -82,6 +83,7 @@ pub struct Agent {
     history: ConversationHistory,
     dispatcher: Box<dyn ToolDispatcher>,
     last_visible_len: usize,
+    skills: Vec<Skill>,
 }
 
 impl Agent {
@@ -91,9 +93,18 @@ impl Agent {
         memory: Option<Arc<dyn Memory>>,
         config: Config,
     ) -> Self {
-        let native = provider.supports_native_tools();
+        Self::with_skills(provider, tools, memory, config, Vec::new())
+    }
+
+    pub fn with_skills(
+        provider: Arc<dyn Provider>,
+        tools: Vec<Box<dyn Tool>>,
+        memory: Option<Arc<dyn Memory>>,
+        config: Config,
+        skills: Vec<Skill>,
+    ) -> Self {
         let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
-        let dispatcher = create_dispatcher(native);
+        let dispatcher = create_dispatcher(provider.supports_native_tools());
 
         Self {
             provider,
@@ -104,6 +115,7 @@ impl Agent {
             history: ConversationHistory::new(),
             dispatcher,
             last_visible_len: 0,
+            skills,
         }
     }
 
@@ -360,6 +372,7 @@ impl Agent {
             tool_specs: &self.tool_specs,
             native_tool_calling: self.provider.supports_native_tools(),
             dispatcher_instructions: &self.dispatcher.prompt_instructions(),
+            skills: &self.skills,
         };
         SystemPromptBuilder::build(&ctx)
     }

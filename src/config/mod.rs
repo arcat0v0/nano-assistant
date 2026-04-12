@@ -1,3 +1,5 @@
 pub mod schema;
 
-pub use schema::{BehaviorConfig, Config, MemoryConfig, ProviderConfig, SecurityConfig};
+pub use schema::{
+    BehaviorConfig, Config, MemoryConfig, ProviderConfig, SecurityConfig, SkillsConfig,
+};

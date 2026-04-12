@@ -25,6 +25,10 @@ pub struct Config {
     /// Behavior configuration (autonomy level, tool restrictions, etc.).
     #[serde(default)]
     pub behavior: BehaviorConfig,
+
+    /// Skills configuration.
+    #[serde(default)]
+    pub skills: SkillsConfig,
 }
 
 impl Default for Config {
@@ -34,6 +38,7 @@ impl Default for Config {
             memory: MemoryConfig::default(),
             security: SecurityConfig::default(),
             behavior: BehaviorConfig::default(),
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -205,6 +210,28 @@ fn default_max_iterations() -> usize {
     10
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub allow_scripts: bool,
+
+    #[serde(default)]
+    pub skills_dir: Option<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_scripts: false,
+            skills_dir: None,
+        }
+    }
+}
+
 /// Environment variable prefix for configuration overrides.
 pub const ENV_PREFIX: &str = "NA";
 
@@ -244,6 +271,9 @@ mod tests {
         assert!(config.behavior.streaming);
         assert!(config.behavior.verbose_errors);
         assert!(config.behavior.explain_tools);
+        assert!(config.skills.enabled);
+        assert!(!config.skills.allow_scripts);
+        assert!(config.skills.skills_dir.is_none());
     }
 
     #[test]
@@ -315,6 +345,11 @@ mod tests {
             [behavior]
             max_iterations = 5
             streaming = false
+
+            [skills]
+            enabled = false
+            allow_scripts = true
+            skills_dir = "/custom/skills"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.provider.provider, Some("anthropic".to_string()));
@@ -328,6 +363,9 @@ mod tests {
         assert_eq!(config.security.whitelist, vec!["ls", "cat"]);
         assert_eq!(config.behavior.max_iterations, 5);
         assert!(!config.behavior.streaming);
+        assert!(!config.skills.enabled);
+        assert!(config.skills.allow_scripts);
+        assert_eq!(config.skills.skills_dir.as_deref(), Some("/custom/skills"));
     }
 
     #[test]
@@ -377,5 +415,16 @@ mod tests {
         assert!(config.behavior.streaming);
         assert!(config.behavior.verbose_errors);
         assert!(config.behavior.explain_tools);
+        assert!(config.skills.enabled);
+        assert!(!config.skills.allow_scripts);
+        assert!(config.skills.skills_dir.is_none());
+    }
+
+    #[test]
+    fn skills_config_default() {
+        let s = SkillsConfig::default();
+        assert!(s.enabled);
+        assert!(!s.allow_scripts);
+        assert!(s.skills_dir.is_none());
     }
 }

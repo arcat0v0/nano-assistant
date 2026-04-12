@@ -3,23 +3,44 @@ pub mod commands;
 use clap::Parser;
 use std::path::PathBuf;
 
-/// nano-assistant — a lightweight AI assistant.
-///
-/// # Modes
-///
-/// * **Single command**: `na "deploy nginx"` — run one prompt and exit.
-/// * **Interactive**: `na` — enter a REPL loop until you type `exit` or `quit`.
-/// * **Config edit**: `na --config` — open the config file in $EDITOR.
-///
-/// # Security mode
-///
-/// Override the security mode from config.toml with `--mode`:
-///
-/// ```bash
-/// na --mode direct  "rm -rf /tmp/old"   # no confirmation
-/// na --mode confirm "rm -rf /tmp/old"   # confirm each tool call
-/// na --mode whitelist "ls /etc"         # only whitelisted commands
-/// ```
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum SkillsSubcommand {
+    List,
+    Install {
+        source: String,
+    },
+    Remove {
+        name: String,
+    },
+    Audit {
+        source: String,
+    },
+    Test {
+        name: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum Commands {
+    #[command(trailing_var_arg = true)]
+    Chat {
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+        #[arg(long)]
+        config: bool,
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    Skills {
+        #[command(subcommand)]
+        action: SkillsSubcommand,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "na")]
 #[command(author = "nano-assistant team")]
@@ -27,43 +48,45 @@ use std::path::PathBuf;
 #[command(about = "A lightweight AI assistant", long_about = None)]
 #[command(disable_help_subcommand = true)]
 pub struct CliArgs {
-    /// The prompt to execute. If omitted, enters interactive mode.
-    #[arg(trailing_var_arg = true)]
-    prompt: Vec<String>,
-
-    /// Override the security mode from config.toml.
-    /// Valid values: direct, confirm, whitelist.
-    #[arg(long, value_name = "MODE")]
-    pub mode: Option<String>,
-
-    /// Open the configuration file in $EDITOR (falls back to nano, then vim).
-    #[arg(long)]
-    pub config: bool,
-
-    /// Path to the configuration file.
-    /// Default: ~/.config/nano-assistant/config.toml
-    #[arg(long, value_name = "PATH")]
-    pub config_path: Option<PathBuf>,
-
-    /// Verbose output.
-    #[arg(short, long)]
-    pub verbose: bool,
+    #[command(subcommand)]
+    pub command: Option<Commands>,
 }
 
 impl CliArgs {
-    /// Return the prompt as a single string, or None for interactive mode.
     pub fn prompt_text(&self) -> Option<String> {
-        if self.prompt.is_empty() {
-            None
-        } else {
-            Some(self.prompt.join(" "))
+        match &self.command {
+            Some(Commands::Chat { prompt, .. }) => {
+                if prompt.is_empty() {
+                    None
+                } else {
+                    Some(prompt.join(" "))
+                }
+            }
+            _ => None,
         }
     }
 
-    /// Resolve the config file path.
+    pub fn mode(&self) -> Option<&str> {
+        match &self.command {
+            Some(Commands::Chat { mode, .. }) => mode.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn config_path(&self) -> PathBuf {
-        self.config_path
-            .clone()
-            .unwrap_or_else(crate::config::schema::default_config_path)
+        match &self.command {
+            Some(Commands::Chat { config_path, .. }) => {
+                config_path.clone().unwrap_or_else(crate::config::schema::default_config_path)
+            }
+            _ => crate::config::schema::default_config_path(),
+        }
+    }
+
+    pub fn is_config_flag(&self) -> bool {
+        matches!(&self.command, Some(Commands::Chat { config: true, .. }))
+    }
+
+    pub fn is_verbose(&self) -> bool {
+        matches!(&self.command, Some(Commands::Chat { verbose: true, .. }))
     }
 }

@@ -5,6 +5,8 @@ pub mod file_write;
 pub mod file_edit;
 pub mod glob_search;
 pub mod content_search;
+pub mod skill_tool;
+pub mod skill_http;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 

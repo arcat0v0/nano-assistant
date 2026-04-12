@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+use anyhow::Context;
 use crate::agent::turn_streamed_to_stdout;
 use crate::agent::Agent;
 use crate::config::schema::{Config, default_config_path};
@@ -11,14 +12,56 @@ use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use crate::tools;
 
 use super::CliArgs;
+use super::SkillsSubcommand;
+
+struct CliArgsInner {
+    prompt: Vec<String>,
+    mode: Option<String>,
+    config: bool,
+    config_path: Option<std::path::PathBuf>,
+    verbose: bool,
+}
+
+impl CliArgsInner {
+    fn prompt_text(&self) -> Option<String> {
+        if self.prompt.is_empty() {
+            None
+        } else {
+            Some(self.prompt.join(" "))
+        }
+    }
+}
 
 pub async fn run(args: CliArgs) -> anyhow::Result<()> {
+    match args.command {
+        Some(super::Commands::Chat { prompt, mode, config, config_path, verbose }) => {
+            let inner = CliArgsInner { prompt, mode, config, config_path, verbose };
+            run_chat(inner).await
+        }
+        Some(super::Commands::Skills { action }) => {
+            handle_skills_command(action).await
+        }
+        None => {
+            let config_path = default_config_path();
+            let config = load_config(&config_path);
+            let security_mode = SecurityMode::Direct;
+            let streaming = config.behavior.streaming;
+            let provider = build_provider(&config)?;
+            run_interactive(provider, &config, config_path, security_mode, streaming).await
+        }
+    }
+}
+
+async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
     if args.config {
-        return open_config_editor(args.config_path());
+        let config_path = args.config_path
+            .clone()
+            .unwrap_or_else(default_config_path);
+        return open_config_editor(config_path);
     }
 
-    let config = load_config(&args.config_path());
-    let security_mode = resolve_security_mode(&args, &config);
+    let config = load_config(&args.config_path.clone().unwrap_or_else(default_config_path));
+    let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
     let streaming = config.behavior.streaming;
 
     if args.verbose {
@@ -36,7 +79,8 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         }
         None => {
             let provider = build_provider(&config)?;
-            run_interactive(provider, &config, args.config_path(), security_mode, streaming).await
+            let config_path = args.config_path.unwrap_or_else(default_config_path);
+            run_interactive(provider, &config, config_path, security_mode, streaming).await
         }
     }
 }
@@ -62,8 +106,8 @@ fn load_config(path: &std::path::Path) -> Config {
     }
 }
 
-fn resolve_security_mode(args: &CliArgs, config: &Config) -> SecurityMode {
-    match &args.mode {
+fn resolve_security_mode(mode_override: Option<&str>, config: &Config) -> SecurityMode {
+    match mode_override {
         Some(m) => match m.parse::<SecurityMode>() {
             Ok(mode) => mode,
             Err(e) => {
@@ -142,7 +186,7 @@ fn build_agent(
     confirmer: Option<Arc<dyn UserConfirmation>>,
 ) -> Agent {
     let raw_tools = tools::default_tools();
-    let secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
+    let mut secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
         .into_iter()
         .map(|t| {
             let mut sec_mgr = SecurityManager::from_config_with_override(
@@ -157,6 +201,15 @@ fn build_agent(
         })
         .collect();
 
+    let skills = if config.skills.enabled {
+        crate::skills::load_skills(&config.skills)
+    } else {
+        Vec::new()
+    };
+
+    let skill_tools = crate::skills::skills_to_tools(&skills);
+    secured_tools.extend(skill_tools);
+
     let memory: Option<Arc<dyn crate::memory::Memory>> = if config.memory.enabled {
         let memory_dir = default_config_path()
             .parent()
@@ -167,7 +220,7 @@ fn build_agent(
         None
     };
 
-    Agent::new(provider, secured_tools, memory, config.clone())
+    Agent::with_skills(provider, secured_tools, memory, config.clone(), skills)
 }
 
 async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
@@ -275,6 +328,119 @@ fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> {
+    let config_path = default_config_path();
+    let config = load_config(&config_path);
+
+    match command {
+        SkillsSubcommand::List => {
+            let skills = crate::skills::load_skills(&config.skills);
+            if skills.is_empty() {
+                println!("No skills installed.");
+                println!();
+                println!("  Create one: mkdir -p ~/.config/nano-assistant/skills/my-skill");
+                println!("              echo '# My Skill' > ~/.config/nano-assistant/skills/my-skill/SKILL.md");
+                println!();
+                println!("  Or install: na skills install <source>");
+            } else {
+                println!("Installed skills ({}):", skills.len());
+                println!();
+                for skill in &skills {
+                    println!("  {} v{} — {}", skill.name, skill.version, skill.description);
+                    if !skill.tools.is_empty() {
+                        println!("    Tools: {}", skill.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
+                    }
+                    if !skill.tags.is_empty() {
+                        println!("    Tags:  {}", skill.tags.join(", "));
+                    }
+                }
+            }
+            println!();
+            Ok(())
+        }
+        SkillsSubcommand::Install { source } => {
+            println!("Installing skill from: {source}");
+            let skills_dir = crate::skills::skills_dir();
+            std::fs::create_dir_all(&skills_dir)?;
+
+            let allow_scripts = config.skills.allow_scripts;
+
+            let (installed_dir, files_scanned) = if crate::skills::is_clawhub_source(&source) {
+                crate::skills::install_clawhub_skill_source(&source, &skills_dir, allow_scripts)
+                    .with_context(|| format!("failed to install from ClawHub: {source}"))?
+            } else if crate::skills::is_git_source(&source) {
+                crate::skills::install_git_skill_source(&source, &skills_dir, allow_scripts)
+                    .with_context(|| format!("failed to install from git: {source}"))?
+            } else {
+                crate::skills::install_local_skill_source(&source, &skills_dir, allow_scripts)
+                    .with_context(|| format!("failed to install local skill: {source}"))?
+            };
+
+            println!("  ✓ Skill installed and audited: {} ({} files scanned)", installed_dir.display(), files_scanned);
+            Ok(())
+        }
+        SkillsSubcommand::Remove { name } => {
+            if name.contains("..") || name.contains('/') || name.contains('\\') {
+                anyhow::bail!("Invalid skill name: {name}");
+            }
+            let skill_path = crate::skills::skills_dir().join(&name);
+            if !skill_path.exists() {
+                anyhow::bail!("Skill not found: {name}");
+            }
+            std::fs::remove_dir_all(&skill_path)?;
+            println!("  ✓ Skill '{}' removed.", name);
+            Ok(())
+        }
+        SkillsSubcommand::Audit { source } => {
+            let source_path = std::path::PathBuf::from(&source);
+            let target = if source_path.exists() {
+                source_path
+            } else {
+                crate::skills::skills_dir().join(&source)
+            };
+            if !target.exists() {
+                anyhow::bail!("Skill source not found: {source}");
+            }
+            let report = crate::skills::audit::audit_skill_directory_with_options(
+                &target,
+                crate::skills::audit::SkillAuditOptions { allow_scripts: config.skills.allow_scripts },
+            )?;
+            if report.is_clean() {
+                println!("  ✓ Skill audit passed for {} ({} files scanned).", target.display(), report.files_scanned);
+            } else {
+                println!("  ✗ Skill audit failed for {}", target.display());
+                for finding in report.findings {
+                    println!("    - {finding}");
+                }
+                anyhow::bail!("Skill audit failed.");
+            }
+            Ok(())
+        }
+        SkillsSubcommand::Test { name } => {
+            let results = if let Some(ref skill_name) = name {
+                let target = crate::skills::skills_dir().join(skill_name);
+                if !target.exists() {
+                    anyhow::bail!("Skill not found: {}", skill_name);
+                }
+                let r = crate::skills::testing::test_skill(&target, skill_name, false)?;
+                if r.tests_run == 0 {
+                    println!("  - No TEST.sh found for skill '{}'.", skill_name);
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                crate::skills::testing::test_all_skills(&[crate::skills::skills_dir()], false)?
+            };
+            crate::skills::testing::print_results(&results);
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,26 +448,35 @@ mod tests {
     use crate::security::SecurityMode;
     use clap::Parser;
 
+    fn parse_chat(args: &[&str]) -> CliArgs {
+        let mut full = vec!["na", "chat"];
+        full.extend(args);
+        CliArgs::parse_from(full)
+    }
+
     #[test]
     fn resolve_security_mode_cli_override_precedence() {
-        let args = CliArgs::parse_from(["na", "--mode", "confirm"]);
+        let args = parse_chat(&["--mode", "confirm"]);
         let config = Config::default();
-        assert_eq!(resolve_security_mode(&args, &config), SecurityMode::Confirm);
+        let mode = resolve_security_mode(args.mode(), &config);
+        assert_eq!(mode, SecurityMode::Confirm);
     }
 
     #[test]
     fn resolve_security_mode_invalid_cli_falls_back_to_config() {
-        let args = CliArgs::parse_from(["na", "--mode", "bogus"]);
+        let args = parse_chat(&["--mode", "bogus"]);
         let config = Config::default();
-        assert_eq!(resolve_security_mode(&args, &config), SecurityMode::Direct);
+        let mode = resolve_security_mode(args.mode(), &config);
+        assert_eq!(mode, SecurityMode::Direct);
     }
 
     #[test]
     fn resolve_security_mode_no_cli_uses_config_mode() {
-        let args = CliArgs::parse_from(["na"]);
+        let args = parse_chat(&[]);
         let mut config = Config::default();
         config.security.mode = "whitelist".to_string();
-        assert_eq!(resolve_security_mode(&args, &config), SecurityMode::Whitelist);
+        let mode = resolve_security_mode(args.mode(), &config);
+        assert_eq!(mode, SecurityMode::Whitelist);
     }
 
     #[test]
@@ -350,19 +525,61 @@ mod tests {
 
     #[test]
     fn prompt_text_empty_returns_none() {
-        let args = CliArgs::parse_from(["na"]);
+        let args = parse_chat(&[]);
         assert!(args.prompt_text().is_none());
     }
 
     #[test]
     fn prompt_text_single_word_returns_some() {
-        let args = CliArgs::parse_from(["na", "hello"]);
+        let args = parse_chat(&["hello"]);
         assert_eq!(args.prompt_text(), Some("hello".to_string()));
     }
 
     #[test]
     fn prompt_text_multiple_words_joined_with_space() {
-        let args = CliArgs::parse_from(["na", "hello", "world"]);
+        let args = parse_chat(&["hello", "world"]);
         assert_eq!(args.prompt_text(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn cli_none_command_is_interactive() {
+        let args = CliArgs::parse_from(["na"]);
+        assert!(args.command.is_none());
+        assert!(args.prompt_text().is_none());
+    }
+
+    #[test]
+    fn cli_skills_subcommand_parses() {
+        let args = CliArgs::parse_from(["na", "skills", "list"]);
+        match args.command {
+            Some(crate::cli::Commands::Skills { action }) => {
+                assert!(matches!(action, SkillsSubcommand::List));
+            }
+            _ => panic!("expected Skills command"),
+        }
+    }
+
+    #[test]
+    fn cli_chat_mode_flag() {
+        let args = parse_chat(&["--mode", "confirm"]);
+        assert_eq!(args.mode(), Some("confirm"));
+    }
+
+    #[test]
+    fn cli_chat_verbose_flag() {
+        let args = parse_chat(&["-v"]);
+        assert!(args.is_verbose());
+    }
+
+    #[test]
+    fn cli_chat_config_flag() {
+        let args = parse_chat(&["--config"]);
+        assert!(args.is_config_flag());
+    }
+
+    #[test]
+    fn cli_chat_config_path_flag() {
+        let args = parse_chat(&["--config-path", "/tmp/test.toml"]);
+        assert_eq!(args.config_path(), std::path::PathBuf::from("/tmp/test.toml"));
     }
 }

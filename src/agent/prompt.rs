@@ -1,8 +1,9 @@
 //! System prompt builder for the agent.
 //!
-//! Simplified from ZeroClaw's `prompt.rs` — no AIEOS, no skills, no channel media.
-//! Builds a system prompt with: datetime, tools list, tool-usage protocol, safety.
+//! Simplified from ZeroClaw's `prompt.rs` — no AIEOS, no channel media.
+//! Builds a system prompt with: datetime, tools list, skills, tool-usage protocol, safety.
 
+use crate::skills::Skill;
 use crate::tools::Tool;
 use crate::tools::ToolSpec;
 use std::fmt::Write;
@@ -17,6 +18,8 @@ pub struct PromptContext<'a> {
     pub native_tool_calling: bool,
     /// Dispatcher-specific instructions (XML protocol for non-native, empty for native).
     pub dispatcher_instructions: &'a str,
+    /// Available skills for the agent.
+    pub skills: &'a [Skill],
 }
 
 /// Builds a system prompt from ordered sections.
@@ -29,10 +32,11 @@ impl SystemPromptBuilder {
 
         let datetime = build_datetime_section();
         let tools = build_tools_section(ctx);
+        let skills = build_skills_section(ctx);
         let protocol = build_protocol_section(ctx);
         let safety = build_safety_section();
 
-        for section in [&datetime, &tools, &protocol, &safety] {
+        for section in [&datetime, &tools, &skills, &protocol, &safety] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -105,6 +109,13 @@ fn build_tools_section(ctx: &PromptContext<'_>) -> String {
     out
 }
 
+fn build_skills_section(ctx: &PromptContext<'_>) -> String {
+    if ctx.skills.is_empty() {
+        return String::new();
+    }
+    crate::skills::skills_to_prompt(ctx.skills)
+}
+
 fn build_protocol_section(ctx: &PromptContext<'_>) -> String {
     if ctx.native_tool_calling {
         String::new()
@@ -169,6 +180,7 @@ mod tests {
             tool_specs: &specs,
             native_tool_calling: false,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Available Tools"));
@@ -182,6 +194,7 @@ mod tests {
             tool_specs: &[],
             native_tool_calling: false,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Safety"));
@@ -195,6 +208,7 @@ mod tests {
             tool_specs: &[],
             native_tool_calling: false,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Tool Use Protocol"));
@@ -207,6 +221,7 @@ mod tests {
             tool_specs: &[],
             native_tool_calling: true,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(!prompt.contains("## Tool Use Protocol"));
@@ -214,13 +229,11 @@ mod tests {
 
     #[test]
     fn days_to_date_epoch() {
-        // 1970-01-01
         assert_eq!(days_to_date(0), (1970, 1, 1));
     }
 
     #[test]
     fn days_to_date_recent() {
-        // 2024-01-01 is day 19723
         assert_eq!(days_to_date(19723), (2024, 1, 1));
     }
 
@@ -231,6 +244,7 @@ mod tests {
             tool_specs: &[],
             native_tool_calling: false,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Current Date & Time"));
@@ -243,10 +257,35 @@ mod tests {
             tool_specs: &[],
             native_tool_calling: true,
             dispatcher_instructions: "",
+            skills: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
-        // Should still have datetime and safety
         assert!(prompt.contains("## Current Date & Time"));
         assert!(prompt.contains("## Safety"));
+    }
+
+    #[test]
+    fn prompt_includes_skills_section() {
+        let skills = vec![crate::skills::Skill {
+            name: "test-skill".to_string(),
+            description: "A test skill".to_string(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec!["Do the thing.".to_string()],
+            location: None,
+        }];
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &skills,
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("<available_skills>"));
+        assert!(prompt.contains("<name>test-skill</name>"));
+        assert!(prompt.contains("</available_skills>"));
     }
 }
