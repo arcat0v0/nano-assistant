@@ -7,17 +7,12 @@ use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SecurityMode {
+    #[default]
     Direct,
     Confirm,
     Whitelist,
-}
-
-impl Default for SecurityMode {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 impl std::fmt::Display for SecurityMode {

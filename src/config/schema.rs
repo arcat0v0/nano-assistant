@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// Top-level configuration loaded from `config.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     /// Provider configuration (API key, model selection, etc.)
     #[serde(default)]
@@ -31,19 +31,6 @@ pub struct Config {
     pub skills: SkillsConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: ProviderConfig::default(),
-            memory: MemoryConfig::default(),
-            security: SecurityConfig::default(),
-            behavior: BehaviorConfig::default(),
-            skills: SkillsConfig::default(),
-        }
-    }
-}
-
-/// Provider configuration section.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
     /// API key for the selected provider.

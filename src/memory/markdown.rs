@@ -100,10 +100,8 @@ impl MarkdownMemory {
                         "**Key**" => current_key = value.to_string(),
                         "**Content**" => current_content = value.to_string(),
                         "**Category**" => current_category = parse_category(value),
-                        "**Session**" => {
-                            if value != "none" {
-                                current_session_id = Some(value.to_string());
-                            }
+                        "**Session**" if value != "none" => {
+                            current_session_id = Some(value.to_string());
                         }
                         _ => {}
                     }

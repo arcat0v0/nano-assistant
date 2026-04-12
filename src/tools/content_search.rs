@@ -33,7 +33,7 @@ fn walk_dir(
         .build()
         .map_err(|e| anyhow::anyhow!("Invalid regex pattern: {e}"))?;
 
-    let include_glob = include.map(|g| glob::Pattern::new(g)).transpose().ok().flatten();
+    let include_glob = include.map(glob::Pattern::new).transpose().ok().flatten();
 
     let mut results = Vec::new();
 
