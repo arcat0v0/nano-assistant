@@ -7,6 +7,8 @@ pub mod security;
 pub mod skills;
 pub mod cli;
 pub mod console;
+pub mod render;
 pub mod tui;
+pub mod system_info;
 
 pub use anyhow::Result;
