@@ -5,5 +5,7 @@ pub mod memory;
 pub mod agent;
 pub mod security;
 pub mod cli;
+pub mod console;
+pub mod tui;
 
 pub use anyhow::Result;

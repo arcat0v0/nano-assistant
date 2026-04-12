@@ -7,7 +7,7 @@ use crate::agent::turn_streamed_to_stdout;
 use crate::agent::Agent;
 use crate::config::schema::{Config, default_config_path};
 use crate::providers::Provider;
-use crate::security::{SecurityManager, SecurityMode};
+use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use crate::tools;
 
 use super::CliArgs;
@@ -28,12 +28,16 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         );
     }
 
-    let provider = build_provider(&config)?;
-    let agent = build_agent(provider, &config, security_mode);
-
     match args.prompt_text() {
-        Some(prompt) => run_single(agent, &prompt, streaming).await,
-        None => run_interactive(agent, streaming).await,
+        Some(prompt) => {
+            let provider = build_provider(&config)?;
+            let agent = build_agent(provider, &config, security_mode, None);
+            run_single(agent, &prompt, streaming).await
+        }
+        None => {
+            let provider = build_provider(&config)?;
+            run_interactive(provider, &config, args.config_path(), security_mode, streaming).await
+        }
     }
 }
 
@@ -131,15 +135,23 @@ fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
     Ok(provider)
 }
 
-fn build_agent(provider: Arc<dyn Provider>, config: &Config, _security_mode: SecurityMode) -> Agent {
+fn build_agent(
+    provider: Arc<dyn Provider>,
+    config: &Config,
+    security_mode: SecurityMode,
+    confirmer: Option<Arc<dyn UserConfirmation>>,
+) -> Agent {
     let raw_tools = tools::default_tools();
     let secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
         .into_iter()
         .map(|t| {
-            let sec_mgr = SecurityManager::from_config_with_override(
+            let mut sec_mgr = SecurityManager::from_config_with_override(
                 &config.security,
-                Some(_security_mode),
+                Some(security_mode),
             );
+            if let Some(confirmer) = confirmer.clone() {
+                sec_mgr = sec_mgr.with_confirmer(confirmer);
+            }
             Box::new(crate::security::SecureTool::new(t, Arc::new(sec_mgr)))
                 as Box<dyn crate::tools::Tool>
         })
@@ -159,18 +171,21 @@ fn build_agent(provider: Arc<dyn Provider>, config: &Config, _security_mode: Sec
 }
 
 async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
+    let ctrl_c_handle = spawn_immediate_ctrl_c_exit();
+
     if streaming {
         let result = turn_streamed_to_stdout(&mut agent, prompt).await?;
         if result.tool_calls_count > 0 {
-            eprintln!("[cli] {} tool call(s) executed", result.tool_calls_count);
+            eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
         }
+        ctrl_c_handle.abort();
         Ok(())
     } else {
-        match agent.turn(prompt).await {
+        let result = match agent.turn(prompt).await {
             Ok(result) => {
                 println!("{}", result.response);
                 if result.tool_calls_count > 0 {
-                    eprintln!("[cli] {} tool call(s) executed", result.tool_calls_count);
+                    eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
                 }
                 Ok(())
             }
@@ -178,76 +193,34 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
                 eprintln!("[cli] error: {e:#}");
                 Err(e)
             }
-        }
+        };
+        ctrl_c_handle.abort();
+        result
     }
 }
 
-async fn run_interactive(mut agent: Agent, streaming: bool) -> anyhow::Result<()> {
-    println!("nano-assistant v{}", env!("CARGO_PKG_VERSION"));
-    println!("Type your prompt and press Enter. Type `exit`, `quit`, or Ctrl+D to quit.\n");
+async fn run_interactive(
+    provider: Arc<dyn Provider>,
+    config: &Config,
+    config_path: std::path::PathBuf,
+    security_mode: SecurityMode,
+    streaming: bool,
+) -> anyhow::Result<()> {
+    let agent = build_agent(provider, config, security_mode, None);
+    let history_path = config_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("history.txt");
+    crate::tui::run_tui(agent, streaming, history_path).await
+}
 
-    let mut stdin_line = String::new();
-    loop {
-        print!("❯ ");
-        io::stderr().flush().map_err(|e| anyhow::anyhow!("{e}"))?;
-        io::stdout().flush().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        stdin_line.clear();
-        match io::stdin().read_line(&mut stdin_line) {
-            Ok(0) => {
-                println!();
-                break;
-            }
-            Ok(_) => {}
-            Err(e) => return Err(e.into()),
+fn spawn_immediate_ctrl_c_exit() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = writeln!(io::stderr());
+            std::process::exit(130);
         }
-
-        let line = stdin_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "exit" || line == "quit" {
-            break;
-        }
-        if line == "clear" {
-            agent.clear_history();
-            eprintln!("[cli] conversation history cleared");
-            continue;
-        }
-
-        if streaming {
-            match turn_streamed_to_stdout(&mut agent, line).await {
-                Ok(result) => {
-                    if result.tool_calls_count > 0 {
-                        eprintln!(
-                            "[cli] {} tool call(s) executed",
-                            result.tool_calls_count
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[cli] error: {e:#}");
-                }
-            }
-        } else {
-            match agent.turn(line).await {
-                Ok(result) => {
-                    println!("{}", result.response);
-                    if result.tool_calls_count > 0 {
-                        eprintln!(
-                            "[cli] {} tool call(s) executed",
-                            result.tool_calls_count
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[cli] error: {e:#}");
-                }
-            }
-        }
-    }
-
-    Ok(())
+    })
 }
 
 fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
