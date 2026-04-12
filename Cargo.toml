@@ -63,6 +63,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Terminal UI / line editing
 rustyline = "14"
+termimad = "0.34"
+crossterm = "0.28"
 
 [profile.dev]
 opt-level = 0
