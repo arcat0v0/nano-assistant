@@ -84,6 +84,7 @@ pub struct Agent {
     dispatcher: Box<dyn ToolDispatcher>,
     last_visible_len: usize,
     skills: Vec<Skill>,
+    system_info: Option<String>,
 }
 
 impl Agent {
@@ -93,7 +94,7 @@ impl Agent {
         memory: Option<Arc<dyn Memory>>,
         config: Config,
     ) -> Self {
-        Self::with_skills(provider, tools, memory, config, Vec::new())
+        Self::with_skills(provider, tools, memory, config, Vec::new(), None)
     }
 
     pub fn with_skills(
@@ -102,6 +103,7 @@ impl Agent {
         memory: Option<Arc<dyn Memory>>,
         config: Config,
         skills: Vec<Skill>,
+        system_info: Option<String>,
     ) -> Self {
         let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
         let dispatcher = create_dispatcher(provider.supports_native_tools());
@@ -116,6 +118,7 @@ impl Agent {
             dispatcher,
             last_visible_len: 0,
             skills,
+            system_info,
         }
     }
 
@@ -373,6 +376,7 @@ impl Agent {
             native_tool_calling: self.provider.supports_native_tools(),
             dispatcher_instructions: &self.dispatcher.prompt_instructions(),
             skills: &self.skills,
+            system_info: self.system_info.as_deref(),
         };
         SystemPromptBuilder::build(&ctx)
     }
@@ -463,9 +467,9 @@ fn trailing_tool_prefix_len(text: &str) -> usize {
     TOOL_MARKERS
         .iter()
         .flat_map(|marker| {
-            (1..marker.len()).rev().find_map(|prefix_len| {
-                let prefix = &marker[..prefix_len];
-                lowered.ends_with(prefix).then_some(prefix_len)
+            (1..marker.len()).rev().find(|prefix_len| {
+                let prefix = &marker[..*prefix_len];
+                lowered.ends_with(prefix)
             })
         })
         .max()

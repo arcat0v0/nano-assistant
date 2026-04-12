@@ -20,6 +20,8 @@ pub struct PromptContext<'a> {
     pub dispatcher_instructions: &'a str,
     /// Available skills for the agent.
     pub skills: &'a [Skill],
+    /// Optional system information from MEMORY.md.
+    pub system_info: Option<&'a str>,
 }
 
 /// Builds a system prompt from ordered sections.
@@ -31,12 +33,13 @@ impl SystemPromptBuilder {
         let mut output = String::with_capacity(2048);
 
         let datetime = build_datetime_section();
+        let system_info = ctx.system_info.map(build_system_info_section).unwrap_or_default();
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
         let protocol = build_protocol_section(ctx);
         let safety = build_safety_section();
 
-        for section in [&datetime, &tools, &skills, &protocol, &safety] {
+        for section in [&datetime, &system_info, &tools, &skills, &protocol, &safety] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -83,6 +86,10 @@ fn days_to_date(days_since_epoch: u64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+fn build_system_info_section(system_info: &str) -> String {
+    format!("## System Information\n\n{system_info}")
 }
 
 fn build_tools_section(ctx: &PromptContext<'_>) -> String {
@@ -181,6 +188,7 @@ mod tests {
             native_tool_calling: false,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Available Tools"));
@@ -195,6 +203,7 @@ mod tests {
             native_tool_calling: false,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Safety"));
@@ -209,6 +218,7 @@ mod tests {
             native_tool_calling: false,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Tool Use Protocol"));
@@ -222,6 +232,7 @@ mod tests {
             native_tool_calling: true,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(!prompt.contains("## Tool Use Protocol"));
@@ -245,6 +256,7 @@ mod tests {
             native_tool_calling: false,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Current Date & Time"));
@@ -258,6 +270,7 @@ mod tests {
             native_tool_calling: true,
             dispatcher_instructions: "",
             skills: &[],
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Current Date & Time"));
@@ -282,10 +295,73 @@ mod tests {
             native_tool_calling: false,
             dispatcher_instructions: "",
             skills: &skills,
+            system_info: None,
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test-skill</name>"));
         assert!(prompt.contains("</available_skills>"));
+    }
+
+    #[test]
+    fn prompt_includes_system_info_when_provided() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: Some("OS: Linux\nKernel: 5.15"),
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("## System Information"));
+        assert!(prompt.contains("OS: Linux"));
+    }
+
+    #[test]
+    fn prompt_omits_system_info_when_none() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(!prompt.contains("## System Information"));
+    }
+
+    #[test]
+    fn prompt_system_info_section_placed_after_datetime() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: Some("OS: TestLinux"),
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        let datetime_pos = prompt.find("## Current Date & Time").unwrap();
+        let sysinfo_pos = prompt.find("## System Information").unwrap();
+        assert!(sysinfo_pos > datetime_pos, "System info should appear after datetime");
+    }
+
+    #[test]
+    fn prompt_system_info_preserves_multiline_content() {
+        let multiline = "OS: Linux\nKernel: 6.1.0\nArch: x86_64\nUser: test";
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: Some(multiline),
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("OS: Linux"));
+        assert!(prompt.contains("Kernel: 6.1.0"));
+        assert!(prompt.contains("Arch: x86_64"));
     }
 }

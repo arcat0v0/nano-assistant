@@ -47,7 +47,8 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             let security_mode = SecurityMode::Direct;
             let streaming = config.behavior.streaming;
             let provider = build_provider(&config)?;
-            run_interactive(provider, &config, config_path, security_mode, streaming).await
+            let system_info = load_or_create_memory_md().await;
+            run_interactive(provider, &config, config_path, security_mode, streaming, system_info).await
         }
     }
 }
@@ -74,13 +75,15 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
     match args.prompt_text() {
         Some(prompt) => {
             let provider = build_provider(&config)?;
-            let agent = build_agent(provider, &config, security_mode, None);
+            let system_info = load_or_create_memory_md().await;
+            let agent = build_agent(provider, &config, security_mode, None, system_info);
             run_single(agent, &prompt, streaming).await
         }
         None => {
             let provider = build_provider(&config)?;
             let config_path = args.config_path.unwrap_or_else(default_config_path);
-            run_interactive(provider, &config, config_path, security_mode, streaming).await
+            let system_info = load_or_create_memory_md().await;
+            run_interactive(provider, &config, config_path, security_mode, streaming, system_info).await
         }
     }
 }
@@ -179,11 +182,40 @@ fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
     Ok(provider)
 }
 
+pub(crate) fn memory_md_path() -> std::path::PathBuf {
+    default_config_path()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("MEMORY.md")
+}
+
+async fn load_or_create_memory_md() -> Option<String> {
+    let path = memory_md_path();
+
+    if path.exists() {
+        return std::fs::read_to_string(&path).ok();
+    }
+
+    let info = crate::system_info::detect().await;
+    let content = info.format_as_markdown();
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if std::fs::write(&path, &content).is_ok() {
+        Some(content)
+    } else {
+        None
+    }
+}
+
 fn build_agent(
     provider: Arc<dyn Provider>,
     config: &Config,
     security_mode: SecurityMode,
     confirmer: Option<Arc<dyn UserConfirmation>>,
+    system_info: Option<String>,
 ) -> Agent {
     let raw_tools = tools::default_tools();
     let mut secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
@@ -220,7 +252,7 @@ fn build_agent(
         None
     };
 
-    Agent::with_skills(provider, secured_tools, memory, config.clone(), skills)
+    Agent::with_skills(provider, secured_tools, memory, config.clone(), skills, system_info)
 }
 
 async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
@@ -236,7 +268,7 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
     } else {
         let result = match agent.turn(prompt).await {
             Ok(result) => {
-                println!("{}", result.response);
+                crate::render::render_markdown_to_stdout(&result.response);
                 if result.tool_calls_count > 0 {
                     eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
                 }
@@ -258,8 +290,9 @@ async fn run_interactive(
     config_path: std::path::PathBuf,
     security_mode: SecurityMode,
     streaming: bool,
+    system_info: Option<String>,
 ) -> anyhow::Result<()> {
-    let agent = build_agent(provider, config, security_mode, None);
+    let agent = build_agent(provider, config, security_mode, None, system_info);
     let history_path = config_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -581,5 +614,53 @@ mod tests {
     fn cli_chat_config_path_flag() {
         let args = parse_chat(&["--config-path", "/tmp/test.toml"]);
         assert_eq!(args.config_path(), std::path::PathBuf::from("/tmp/test.toml"));
+    }
+
+    #[test]
+    fn memory_md_path_returns_config_dir() {
+        let path = memory_md_path();
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.contains(".config/nano-assistant/MEMORY.md"),
+            "path was: {path_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_or_create_memory_md_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join(".config/nano-assistant/MEMORY.md");
+
+        std::env::set_var("HOME", dir.path());
+        let path = memory_md_path();
+        assert_eq!(path, memory_path);
+
+        let content = load_or_create_memory_md().await;
+        assert!(content.is_some());
+        assert!(memory_path.exists());
+        assert!(content.unwrap().contains("# System Information"));
+
+        std::env::remove_var("HOME");
+    }
+
+    #[tokio::test]
+    async fn memory_md_lifecycle_read_existing_returns_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join(".config").join("nano-assistant");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        let memory_path = memory_dir.join("MEMORY.md");
+        let test_content = "# System Information\n\nTest content.";
+        std::fs::write(&memory_path, &test_content).unwrap();
+
+        std::env::set_var("HOME", dir.path());
+        let content = load_or_create_memory_md().await;
+        std::env::remove_var("HOME");
+
+        assert_eq!(content, Some(test_content.to_string()));
+    }
+
+    #[tokio::test]
+    async fn load_memory_md_handles_readonly_fs() {
+        let _ = load_or_create_memory_md().await;
     }
 }
