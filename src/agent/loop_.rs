@@ -6,6 +6,7 @@
 
 use crate::agent::dispatcher::{create_dispatcher, ToolDispatcher, ToolExecutionResult};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::streaming::StreamOutputEvent;
 use crate::config::Config;
 use crate::memory::Memory;
 use crate::providers::{ChatMessage, ChatRequest, ChatResponse, Provider};
@@ -13,42 +14,8 @@ use crate::tools::{Tool, ToolSpec};
 use anyhow::{bail, Result};
 use std::sync::Arc;
 
-const TAG_OPEN: &str = "<antml:invoke";
-const TAG_CLOSE: &str = "</antml:invoke>";
-
-fn strip_tool_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut remaining = s;
-
-    while let Some(start) = remaining.find(TAG_OPEN) {
-        result.push_str(&remaining[..start]);
-
-        let after_open = &remaining[start + TAG_OPEN.len()..];
-        let after_close = match after_open.find('>') {
-            Some(pos) => pos,
-            None => {
-                result.push_str(TAG_OPEN);
-                remaining = after_open;
-                continue;
-            }
-        };
-
-        let inner_start = start + TAG_OPEN.len() + after_close + 1;
-        match remaining[inner_start..].find(TAG_CLOSE) {
-            Some(close_pos) => {
-                remaining = &remaining[inner_start + close_pos + TAG_CLOSE.len()..];
-            }
-            None => {
-                result.push_str(TAG_OPEN);
-                remaining = after_open;
-                continue;
-            }
-        }
-    }
-
-    result.push_str(remaining);
-    result
-}
+const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
+const TOOL_MARKERS: [&str; 2] = ["<antml:invoke", "\"tool_calls\""];
 
 /// A single agent turn result.
 #[derive(Debug, Clone)]
@@ -210,7 +177,7 @@ impl Agent {
     pub async fn turn_streamed(
         &mut self,
         user_message: &str,
-        mut on_chunk: impl FnMut(&str),
+        mut on_chunk: impl FnMut(StreamOutputEvent),
     ) -> Result<TurnResult> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt();
@@ -231,6 +198,9 @@ impl Agent {
             if self.provider.supports_streaming() {
                 let mut accumulated = String::new();
                 let mut stream = self.provider.stream_chat(messages, &model, temperature);
+                let mut suppress_forwarding = false;
+                let mut marker_window = String::new();
+                let mut pending_visible = String::new();
 
                 use futures::StreamExt;
                 while let Some(chunk_result) = stream.next().await {
@@ -241,20 +211,60 @@ impl Agent {
                             }
                             accumulated.push_str(&chunk.delta);
 
-                            // Filter out tool call XML from streamed output
-                            let filtered = strip_tool_tags(&accumulated);
-                            let visible_delta = if filtered.len() > self.last_visible_len {
-                                &filtered[self.last_visible_len..]
-                            } else {
-                                ""
-                            };
-                            self.last_visible_len = filtered.len();
-                            if !visible_delta.is_empty() {
-                                on_chunk(visible_delta);
+                            marker_window.push_str(&chunk.delta);
+                            if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
+                                let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                                let boundary = marker_window
+                                    .char_indices()
+                                    .find(|(idx, _)| *idx >= keep_from)
+                                    .map_or(0, |(idx, _)| idx);
+                                marker_window.drain(..boundary);
                             }
+
+                            if !suppress_forwarding && {
+                                let lowered = marker_window.to_ascii_lowercase();
+                                lowered.contains("<antml:invoke")
+                                    || lowered.contains("\"tool_calls\"")
+                            } {
+                                suppress_forwarding = true;
+                                pending_visible.clear();
+                                if self.last_visible_len > 0 {
+                                    on_chunk(StreamOutputEvent::Clear);
+                                    self.last_visible_len = 0;
+                                }
+                            }
+
+                            if suppress_forwarding || chunk.delta.is_empty() {
+                                continue;
+                            }
+
+                            pending_visible.push_str(&chunk.delta);
+                            let reserve = trailing_tool_prefix_len(&pending_visible);
+                            let emit_len = pending_visible.len().saturating_sub(reserve);
+                            if emit_len == 0 {
+                                continue;
+                            }
+
+                            let emit_text = pending_visible[..emit_len].to_string();
+                            pending_visible.drain(..emit_len);
+
+                            if self.last_visible_len == 0 {
+                                on_chunk(StreamOutputEvent::Clear);
+                            }
+
+                            self.last_visible_len += emit_text.len();
+                            on_chunk(StreamOutputEvent::Content(emit_text));
                         }
                         Err(e) => return Err(e),
                     }
+                }
+
+                if !suppress_forwarding && !pending_visible.is_empty() {
+                    if self.last_visible_len == 0 {
+                        on_chunk(StreamOutputEvent::Clear);
+                    }
+                    self.last_visible_len += pending_visible.len();
+                    on_chunk(StreamOutputEvent::Content(pending_visible));
                 }
                 self.last_visible_len = 0;
 
@@ -279,20 +289,26 @@ impl Agent {
 
                 // Notify about tool execution
                 for call in &calls {
-                    on_chunk(&format!("\n  ⏳ {} ... ", call.name));
+                    let summary = crate::console::args_summary(&call.name, &call.arguments);
+                    on_chunk(StreamOutputEvent::Progress(format!(
+                        "\n{}",
+                        crate::console::format_tool_pending(&call.name, &summary)
+                    )));
                 }
                 let results = self.execute_tools(&calls).await?;
                 total_tool_calls += results.len();
-                for result in &results {
-                    let icon = if result.success { "✓" } else { "✗" };
-                    on_chunk(&format!("{}\n", icon));
+                for (call, result) in calls.iter().zip(results.iter()) {
+                    let summary = crate::console::args_summary(&call.name, &call.arguments);
+                    on_chunk(StreamOutputEvent::Progress(
+                        crate::console::format_tool_call_line(&result.name, &summary, result.success),
+                    ));
                 }
 
                 let result_msg = self.dispatcher.format_results(&results);
                 self.history.push(result_msg);
                 self.trim_history();
             } else {
-            let response = self.call_llm(messages, &model, temperature).await?;
+                let response = self.call_llm(messages, &model, temperature).await?;
                 let (text, calls) = self.dispatcher.parse_response(&response);
 
                 if calls.is_empty() {
@@ -301,7 +317,7 @@ impl Agent {
                     } else {
                         text
                     };
-                    on_chunk(&final_text);
+                    on_chunk(StreamOutputEvent::Content(final_text.clone()));
                     self.history.push(ChatMessage::assistant(final_text.clone()));
                     self.trim_history();
                     return Ok(TurnResult {
@@ -428,6 +444,21 @@ impl Agent {
     }
 }
 
+fn trailing_tool_prefix_len(text: &str) -> usize {
+    let lowered = text.to_ascii_lowercase();
+
+    TOOL_MARKERS
+        .iter()
+        .flat_map(|marker| {
+            (1..marker.len()).rev().find_map(|prefix_len| {
+                let prefix = &marker[..prefix_len];
+                lowered.ends_with(prefix).then_some(prefix_len)
+            })
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,7 +543,7 @@ mod tests {
     #[test]
     fn agent_builds_system_prompt_on_first_turn() {
         let provider = Arc::new(MockProvider { native_tools: false, streaming: false });
-        let mut agent = Agent::new(provider, vec![], None, make_config());
+        let agent = Agent::new(provider, vec![], None, make_config());
         assert!(agent.history.is_empty());
     }
 
@@ -554,5 +585,17 @@ mod tests {
         history.push(ChatMessage::user("test"));
         history.clear();
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn trailing_tool_prefix_detects_partial_tool_markup() {
+        assert_eq!(trailing_tool_prefix_len("<"), 1);
+        assert_eq!(trailing_tool_prefix_len("prefix <antml:i"), 8);
+        assert_eq!(trailing_tool_prefix_len("{\"too"), 4);
+    }
+
+    #[test]
+    fn trailing_tool_prefix_ignores_normal_text() {
+        assert_eq!(trailing_tool_prefix_len("hello world"), 0);
     }
 }

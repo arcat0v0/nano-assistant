@@ -1,84 +1,112 @@
 use crate::agent::loop_::{Agent, TurnResult};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
-/// Streams an agent turn to stdout with real-time output and Ctrl+C support.
+pub enum StreamOutputEvent {
+    Clear,
+    Progress(String),
+    Content(String),
+}
+
+/// Streams an agent turn to stdout/stderr with real-time output.
 ///
 /// Wraps `Agent::turn_streamed()` to provide:
 /// - Immediate flushing of each text delta
-/// - Tool call status display ("⏳ tool_name ... ✓")
-/// - Graceful Ctrl+C interruption
-pub async fn turn_streamed_to_stdout(agent: &mut Agent, user_message: &str) -> anyhow::Result<TurnResult> {
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let ctrl_c_handler = spawn_ctrl_c_handler(interrupted.clone());
-
-    let result = run_streamed_turn(agent, user_message, &interrupted).await;
-
-    ctrl_c_handler.abort();
-
-    let was_interrupted = interrupted.load(Ordering::Relaxed);
-    if was_interrupted {
-        eprintln!("\n[interrupted]");
-    }
-
-    match result {
-        Ok(turn_result) => {
-            println!();
-            Ok(turn_result)
-        }
-        Err(e) => {
-            if was_interrupted {
-                anyhow::bail!("Stream interrupted by user")
-            }
-            Err(e)
-        }
-    }
+/// - Tool call progress on stderr and content on stdout
+pub async fn turn_streamed_to_stdout(
+    agent: &mut Agent,
+    user_message: &str,
+) -> anyhow::Result<TurnResult> {
+    let mut loading = LoadingIndicator::new();
+    loading.show();
+    let result = run_streamed_turn(agent, user_message, &mut loading).await?;
+    loading.finish();
+    println!();
+    Ok(result)
 }
 
 async fn run_streamed_turn(
     agent: &mut Agent,
     user_message: &str,
-    interrupted: &Arc<AtomicBool>,
+    loading: &mut LoadingIndicator,
 ) -> anyhow::Result<TurnResult> {
-    let mut printer = StreamPrinter::new(interrupted.clone());
+    let mut printer = StreamPrinter::new();
 
     agent
-        .turn_streamed(user_message, |chunk| {
-            if interrupted.load(Ordering::Relaxed) {
-                return;
-            }
-            printer.print_delta(chunk);
+        .turn_streamed(user_message, |event| {
+            loading.clear_for_output();
+            printer.print_event(event);
         })
         .await
 }
 
-fn spawn_ctrl_c_handler(interrupted: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        interrupted.store(true, Ordering::Relaxed);
-    })
+struct LoadingIndicator {
+    stderr: io::Stderr,
+    active: bool,
 }
 
-struct StreamPrinter {
-    interrupted: Arc<AtomicBool>,
-    stdout: io::Stdout,
-}
-
-impl StreamPrinter {
-    fn new(interrupted: Arc<AtomicBool>) -> Self {
+impl LoadingIndicator {
+    fn new() -> Self {
         Self {
-            interrupted,
-            stdout: io::stdout(),
+            stderr: io::stderr(),
+            active: false,
         }
     }
 
-    fn print_delta(&mut self, text: &str) {
-        if self.interrupted.load(Ordering::Relaxed) {
+    fn show(&mut self) {
+        if self.active {
             return;
         }
-        let _ = self.stdout.write_all(text.as_bytes());
-        let _ = self.stdout.flush();
+
+        let _ = self
+            .stderr
+            .write_all(b"\r\x1b[2K\x1b[2m\xe2\x8f\xb3 thinking...\x1b[0m");
+        let _ = self.stderr.flush();
+        self.active = true;
+    }
+
+    fn clear_for_output(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        let _ = self.stderr.write_all(b"\r\x1b[2K");
+        let _ = self.stderr.flush();
+        self.active = false;
+    }
+
+    fn finish(&mut self) {
+        self.clear_for_output();
+    }
+}
+
+struct StreamPrinter {
+    stdout: io::Stdout,
+    stderr: io::Stderr,
+}
+
+impl StreamPrinter {
+    fn new() -> Self {
+        Self {
+            stdout: io::stdout(),
+            stderr: io::stderr(),
+        }
+    }
+
+    fn print_event(&mut self, event: StreamOutputEvent) {
+        match event {
+            StreamOutputEvent::Clear => {
+                let _ = self.stderr.write_all(b"\n");
+                let _ = self.stderr.flush();
+            }
+            StreamOutputEvent::Progress(text) => {
+                let _ = self.stderr.write_all(text.as_bytes());
+                let _ = self.stderr.flush();
+            }
+            StreamOutputEvent::Content(text) => {
+                let _ = self.stdout.write_all(text.as_bytes());
+                let _ = self.stdout.flush();
+            }
+        }
     }
 }
 
@@ -87,29 +115,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_printer_writes_to_stdout() {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let mut printer = StreamPrinter::new(interrupted);
-        printer.print_delta("test");
-        assert!(!printer.interrupted.load(Ordering::Relaxed));
+    fn stream_printer_writes_content() {
+        let mut printer = StreamPrinter::new();
+        printer.print_event(StreamOutputEvent::Content("test".into()));
     }
 
     #[test]
-    fn stream_printer_skips_when_interrupted() {
-        let interrupted = Arc::new(AtomicBool::new(true));
-        let mut printer = StreamPrinter::new(interrupted);
-        printer.print_delta("should not print");
-        assert!(printer.interrupted.load(Ordering::Relaxed));
+    fn stream_printer_writes_progress() {
+        let mut printer = StreamPrinter::new();
+        printer.print_event(StreamOutputEvent::Progress("progress".into()));
     }
 
-    #[tokio::test]
-    async fn ctrl_c_handler_sets_interrupted_flag() {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let handle = spawn_ctrl_c_handler(interrupted.clone());
-        interrupted.store(true, Ordering::Relaxed);
-        interrupted.store(true, Ordering::Relaxed);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        handle.abort();
-        assert!(interrupted.load(Ordering::Relaxed));
+    #[test]
+    fn loading_indicator_transitions_cleanly() {
+        let mut loading = LoadingIndicator::new();
+        loading.show();
+        assert!(loading.active);
+        loading.clear_for_output();
+        assert!(!loading.active);
     }
 }
