@@ -306,13 +306,7 @@ pub const ENV_PREFIX: &str = "NA";
 
 /// Get the default config file path: ~/.config/nano-assistant/config.toml
 pub fn default_config_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home
-            .join(".config")
-            .join("nano-assistant")
-            .join("config.toml");
-    }
-    PathBuf::from("~/.config/nano-assistant/config.toml")
+    crate::platform::current_platform().config_path()
 }
 
 #[cfg(test)]

@@ -183,10 +183,7 @@ fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
 }
 
 pub(crate) fn memory_md_path() -> std::path::PathBuf {
-    default_config_path()
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("MEMORY.md")
+    crate::platform::current_platform().memory_md_path()
 }
 
 async fn load_or_create_memory_md() -> Option<String> {
