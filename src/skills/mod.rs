@@ -146,20 +146,12 @@ pub fn load_skills(config: &crate::config::SkillsConfig) -> Vec<Skill> {
 
 /// Get the ~/.agents/skills/ directory path (skills.sh default install location).
 fn agents_skills_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".agents").join("skills");
-    }
-    PathBuf::from("~/.agents/skills")
+    crate::platform::current_platform().agents_skills_dir()
 }
 
 /// Expand leading `~` to $HOME.
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
+    crate::platform::current_platform().expand_tilde(path)
 }
 
 /// Load all skills from a directory (no open-skills, no workspace wrapping).
@@ -409,10 +401,7 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
 
 /// Get the default skills directory path: ~/.config/nano-assistant/skills/
 pub fn skills_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        return home.join(".config").join("nano-assistant").join("skills");
-    }
-    PathBuf::from("~/.config/nano-assistant/skills")
+    crate::platform::current_platform().skills_dir()
 }
 
 /// Initialize the skills directory with a README
