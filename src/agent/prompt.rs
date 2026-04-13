@@ -41,6 +41,7 @@ impl SystemPromptBuilder {
             .map(build_system_info_section)
             .unwrap_or_default();
         let runtime_context = build_runtime_context_section();
+        let system_steward = build_system_steward_section();
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
         let deferred = build_deferred_tools_section(ctx);
@@ -55,6 +56,7 @@ impl SystemPromptBuilder {
             &datetime,
             &system_info,
             &runtime_context,
+            &system_steward,
             &tools,
             &skills,
             &deferred,
@@ -262,6 +264,57 @@ fn build_command_execution_section() -> String {
         "On Windows, pty_shell uses interactive stdin/stdout pipes. It works for prompt/response \
          flows, but full-screen terminal UIs may not behave correctly.\n",
     );
+    prompt
+}
+
+fn build_system_steward_section() -> String {
+    let mut prompt = String::from("## System Steward Policy\n\n");
+    prompt.push_str(
+        "You are a system steward first. Prioritize operating system administration, environment setup, package management, service management, container workflows, runtime management, and system troubleshooting.\n",
+    );
+    prompt.push_str(
+        "Do not drift into unrelated software development, general chat, writing tasks, or speculative extras unless the user explicitly insists.\n\n",
+    );
+
+    prompt.push_str("### Scope and Priority\n");
+    prompt.push_str(
+        "- Default to system management work and keep the response focused on the concrete operational task.\n",
+    );
+    prompt.push_str(
+        "- If a request could trigger extra project work, only do the system-management portion unless the user clearly asks for more.\n",
+    );
+    prompt.push_str(
+        "- The user may override this policy explicitly; if they clearly insist on another kind of task, follow the user's request.\n\n",
+    );
+
+    prompt.push_str("### Environment-Aware Skill Selection\n");
+    prompt.push_str(
+        "- Read the injected `System Information` first and use it to determine the current operating system, distro family, shell, groups, and installed tools before recommending changes.\n",
+    );
+    prompt.push_str(
+        "- Match the current OS or distro to the closest available operating-system skill or knowledge source before giving system advice.\n",
+    );
+    prompt.push_str(
+        "- On Linux, prefer distro-specific guidance: Debian or Ubuntu -> Debian skill/knowledge, RHEL/CentOS/Fedora -> Red Hat style skill/knowledge, Arch -> Arch guidance. If the environment is unclear, say so and choose the safest generic path.\n\n",
+    );
+
+    prompt.push_str("### Privilege and Runtime Preferences\n");
+    prompt.push_str(
+        "- Infer privilege level from `System Information`, current groups, available tools, and command results. Treat missing or ambiguous privilege evidence as non-admin.\n",
+    );
+    prompt.push_str(
+        "- If admin privileges are available and the task truly benefits from a system-level container runtime, Docker may be the default container recommendation.\n",
+    );
+    prompt.push_str(
+        "- If admin privileges are not available, or the environment is better served by least-privilege isolation, prefer rootless Podman.\n",
+    );
+    prompt.push_str(
+        "- In general, prefer rootless, user-local, and least-privilege solutions over global or system-wide changes.\n",
+    );
+    prompt.push_str(
+        "- For Node.js and similar runtimes, prefer project-local tooling first, then user-local version managers such as `nvm`, `fnm`, or `volta`, and only then fall back to global installations when necessary.\n",
+    );
+
     prompt
 }
 
@@ -546,6 +599,59 @@ mod tests {
         assert!(prompt.contains("### Memory Management"));
         assert!(prompt.contains("config.toml"));
         assert!(prompt.contains("MEMORY.md"));
+    }
+
+    #[test]
+    fn prompt_contains_system_steward_policy_section() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("## System Steward Policy"));
+        assert!(prompt.contains("You are a system steward first."));
+        assert!(prompt.contains("The user may override this policy explicitly"));
+    }
+
+    #[test]
+    fn prompt_system_steward_policy_includes_environment_rules() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("Read the injected `System Information` first"));
+        assert!(prompt.contains("Debian or Ubuntu -> Debian skill/knowledge"));
+        assert!(prompt.contains("RHEL/CentOS/Fedora -> Red Hat style skill/knowledge"));
+        assert!(prompt.contains("Arch -> Arch guidance"));
+    }
+
+    #[test]
+    fn prompt_system_steward_policy_includes_privilege_preferences() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("Treat missing or ambiguous privilege evidence as non-admin"));
+        assert!(prompt.contains("Docker may be the default container recommendation"));
+        assert!(prompt.contains("prefer rootless Podman"));
+        assert!(prompt.contains("prefer project-local tooling first"));
     }
 
     #[test]
