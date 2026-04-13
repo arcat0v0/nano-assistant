@@ -12,7 +12,7 @@ pub mod web_search;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 
-/// Returns the 6 core tools every agent gets by default.
+/// Returns the 8 core tools every agent gets by default.
 pub fn default_tools() -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(shell::ShellTool::new()),
@@ -21,5 +21,7 @@ pub fn default_tools() -> Vec<Box<dyn Tool>> {
         Box::new(file_edit::FileEditTool::new()),
         Box::new(glob_search::GlobSearchTool::new()),
         Box::new(content_search::ContentSearchTool::new()),
+        Box::new(web_fetch::WebFetchTool::new()),
+        Box::new(web_search::WebSearchTool::new()),
     ]
 }
