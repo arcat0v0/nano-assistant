@@ -156,7 +156,7 @@ impl Tool for WebFetchTool {
         };
 
         let mut output = if is_html(&content_type) {
-            html2text::from_read(body.as_bytes(), 80).unwrap_or(body)
+            html2text::from_read(body.as_bytes(), 80).unwrap_or_else(|_| body)
         } else {
             body
         };
