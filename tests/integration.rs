@@ -677,7 +677,7 @@ fn skill_lifecycle_toml() {
 [skill]
 name = "test-toml"
 description = "A test skill"
-version = "0.2.0"
+version = "0.3.0"
 author = "test"
 tags = ["test"]
 
@@ -702,7 +702,7 @@ command = "https://httpbin.org/get"
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "test-toml");
     assert_eq!(skills[0].description, "A test skill");
-    assert_eq!(skills[0].version, "0.2.0");
+    assert_eq!(skills[0].version, "0.3.0");
     assert_eq!(skills[0].author, Some("test".to_string()));
     assert_eq!(skills[0].tools.len(), 2);
 

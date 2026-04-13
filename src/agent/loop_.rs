@@ -567,7 +567,7 @@ impl Agent {
                 }
 
                 if call.name == "file_edit" {
-                    let file_path = call.arguments.get("file_path")
+                    let file_path = call.arguments.get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if file_path.ends_with("config.toml") {
@@ -950,5 +950,41 @@ mod tests {
     #[test]
     fn trailing_tool_prefix_ignores_normal_text() {
         assert_eq!(trailing_tool_prefix_len("hello world"), 0);
+    }
+
+    #[tokio::test]
+    async fn file_edit_mcp_changes_trigger_auto_reload_notice() {
+        let provider = Arc::new(MockProvider {
+            native_tools: false,
+            streaming: false,
+        });
+        let mut agent = Agent::new(
+            provider,
+            vec![Box::new(crate::tools::file_edit::FileEditTool::new())],
+            None,
+            make_config(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "mode = \"test\"\n").unwrap();
+
+        let results = agent
+            .execute_tools(&[crate::agent::dispatcher::ParsedToolCall {
+                name: "file_edit".to_string(),
+                arguments: serde_json::json!({
+                    "path": config_path.to_string_lossy(),
+                    "old_string": "mode = \"test\"\n",
+                    "new_string": "[mcp]\nenabled = false\n"
+                }),
+                tool_call_id: None,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "file_edit");
+        assert_eq!(results[1].name, "system");
+        assert!(results[1].output.contains("[Auto-reload] MCP"));
     }
 }

@@ -1,0 +1,15 @@
+[skill]
+name = "debian-wiki"
+type = "knowledge-source"
+description = "Debian Wiki — Debian system administration and packaging knowledge"
+version = "0.3.0"
+tags = ["linux", "debian", "wiki"]
+
+[source]
+engine = "moinmoin"
+base_url = "https://wiki.debian.org"
+language = "en"
+
+[routing]
+triggers = ["debian", "apt", "apt-get", "aptitude", "dpkg", "bookworm", "bullseye"]
+priority = 10

@@ -18,6 +18,8 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("server-security", include_str!("../../skills/server-security/SKILL.md")),
     ("container-orchestration", include_str!("../../skills/container-orchestration/SKILL.md")),
     ("arch-wiki", include_str!("../../skills/arch-wiki/SKILL.toml")),
+    ("debian-wiki", include_str!("../../skills/debian-wiki/SKILL.toml")),
+    ("redhat-wiki", include_str!("../../skills/redhat-wiki/SKILL.toml")),
 ];
 
 // ─── ClawhHub constants ────────────────────────────────────────────────
@@ -151,6 +153,24 @@ impl std::fmt::Display for SkillSource {
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+/// Return the filesystem source directories for builtin skills in a source checkout.
+pub fn builtin_skill_source_dirs() -> Vec<PathBuf> {
+    let skills_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+    BUILTIN_SKILLS
+        .iter()
+        .map(|(name, _)| skills_root.join(name))
+        .collect()
+}
+
+/// Check whether a path targets a builtin skill source file or directory.
+pub fn is_builtin_skill_path(path: &Path) -> bool {
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    builtin_skill_source_dirs().into_iter().any(|dir| {
+        let builtin = dir.canonicalize().unwrap_or(dir);
+        target == builtin || target.starts_with(&builtin)
+    })
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
@@ -1413,6 +1433,18 @@ command = "echo hello"
     fn skills_to_prompt_empty() {
         let prompt = skills_to_prompt(&[]);
         assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn builtin_knowledge_sources_include_linux_wikis() {
+        let names: std::collections::HashSet<String> = load_builtin_skills()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
+        assert!(names.contains("arch-wiki"));
+        assert!(names.contains("debian-wiki"));
+        assert!(names.contains("redhat-wiki"));
     }
 
     #[test]

@@ -196,6 +196,10 @@ fn build_command_execution_section() -> String {
     prompt.push_str("- `yes | command`, `--batch`, `--non-interactive`\n");
     prompt.push_str("Only use `pty_shell` when no non-interactive option exists.\n");
     prompt.push_str("For passwords, use `__USER_INPUT__` — collected from terminal, never sent to AI.\n");
+    prompt.push_str(
+        "On Windows, pty_shell uses interactive stdin/stdout pipes. It works for prompt/response \
+         flows, but full-screen terminal UIs may not behave correctly.\n",
+    );
     prompt
 }
 
@@ -438,6 +442,22 @@ mod tests {
         assert!(prompt.contains("### Memory Management"));
         assert!(prompt.contains("config.toml"));
         assert!(prompt.contains("MEMORY.md"));
+    }
+
+    #[test]
+    fn prompt_mentions_windows_interactive_limit() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("On Windows, pty_shell uses interactive stdin/stdout pipes"));
+        assert!(prompt.contains("full-screen terminal UIs may not behave correctly"));
     }
 
     #[test]

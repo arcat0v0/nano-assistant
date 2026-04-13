@@ -72,6 +72,18 @@ impl Tool for FileEditTool {
             });
         }
 
+        let path_buf = std::path::PathBuf::from(path);
+        if crate::skills::is_builtin_skill_path(&path_buf) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Refusing to edit builtin skill source: {}",
+                    path_buf.display()
+                )),
+            });
+        }
+
         let content = match tokio::fs::read_to_string(path).await {
             Ok(c) => c,
             Err(e) => {
@@ -126,6 +138,7 @@ impl Tool for FileEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(name);
@@ -227,5 +240,38 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn rejects_builtin_skill_edits() {
+        let builtin_skill = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("skills")
+            .join("arch-wiki")
+            .join("SKILL.toml");
+
+        let original = tokio::fs::read_to_string(&builtin_skill).await.unwrap();
+        let old_string = r#"description = "ArchLinux official wiki — comprehensive Linux documentation""#;
+
+        let tool = FileEditTool::new();
+        let result = tool
+            .execute(json!({
+                "path": builtin_skill.to_string_lossy(),
+                "old_string": old_string,
+                "new_string": r#"description = "Modified""#
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("builtin skill")
+        );
+
+        let after = tokio::fs::read_to_string(&builtin_skill).await.unwrap();
+        assert_eq!(after, original);
     }
 }

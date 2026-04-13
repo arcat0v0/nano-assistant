@@ -1,6 +1,6 @@
 # nano-assistant
 
-运行在 Linux 终端的轻量级 AI 助手 -- 接入 LLM，用自然语言执行命令，完成任务。
+运行在终端里的轻量级 AI 助手 -- 接入 LLM，用自然语言执行命令，完成任务。当前以 Linux/macOS 为主要目标，也支持 Windows 基础路径与命令执行。
 
 ## 功能特性
 
@@ -13,8 +13,35 @@
 - **持久化记忆**: 基于 Markdown 文件的对话记忆存储
 - **实时流式输出**: LLM 响应实时显示，支持 Ctrl+C 中断
 - **两种使用方式**: 单命令模式 `na "prompt"` + 交互模式 `na`
+- **Windows 基础支持**: 支持 Windows 配置路径、`cmd /C` 执行、以及基于 stdin/stdout 的交互式命令控制
 
 ## 安装
+
+### 平台说明
+
+- Linux / macOS：完整支持当前工具集
+- Windows：支持配置、普通命令执行、以及问答式交互命令
+- Windows 限制：`pty_shell` 在 Windows 上当前走 stdin/stdout 管道，不是原生 ConPTY；安装器提示、确认、密码输入这类场景可用，复杂全屏 TUI 程序可能表现不完整
+
+### Windows 安装与使用
+
+推荐优先使用预编译二进制。下载 `na-x86_64-pc-windows-msvc.zip` 后解压，并把 `na.exe` 放到一个固定目录，例如 `%USERPROFILE%\\bin`。
+
+PowerShell 示例：
+
+```powershell
+$BinDir = "$env:USERPROFILE\bin"
+New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+Copy-Item .\na.exe "$BinDir\na.exe" -Force
+
+# 当前 PowerShell 会话临时生效
+$env:Path = "$BinDir;$env:Path"
+
+na --version
+na --help
+```
+
+如果要长期生效，把 `%USERPROFILE%\bin` 加到用户级 `Path`。配置文件默认位于 `%APPDATA%\nano-assistant\config.toml`，记忆文件位于 `%APPDATA%\nano-assistant\MEMORY.md`。
 
 ### 方式一：下载预编译二进制（推荐）
 
@@ -41,6 +68,17 @@ git clone https://github.com/arcat0v0/nano-assistant.git
 cd nano-assistant
 cargo build --release
 cp target/release/na ~/.local/bin/
+```
+
+Windows 上从源码编译时，使用 `x86_64-pc-windows-msvc` 工具链并在 PowerShell 中执行：
+
+```powershell
+git clone https://github.com/arcat0v0/nano-assistant.git
+cd nano-assistant
+cargo build --release
+
+# 生成的二进制
+.\target\release\na.exe
 ```
 
 ### 验证安装
@@ -88,7 +126,7 @@ na
 进入交互模式后，提示符为 `❯`，输入你的问题或指令，按回车执行：
 
 ```
-nano-assistant v0.2.0
+nano-assistant v0.3.0
 Type your prompt and press Enter. Type `exit`, `quit`, or Ctrl+D to quit.
 
 ❯ 查看当前目录有哪些 Rust 项目

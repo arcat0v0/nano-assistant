@@ -1,0 +1,15 @@
+[skill]
+name = "redhat-wiki"
+type = "knowledge-source"
+description = "Red Hat documentation — RHEL administration and platform knowledge"
+version = "0.3.0"
+tags = ["linux", "redhat", "rhel", "docs"]
+
+[source]
+engine = "web"
+base_url = "https://docs.redhat.com"
+language = "en"
+
+[routing]
+triggers = ["redhat", "rhel", "yum", "dnf", "selinux", "systemd", "kickstart"]
+priority = 10
