@@ -85,6 +85,9 @@ pub struct Agent {
     last_visible_len: usize,
     skills: Vec<Skill>,
     system_info: Option<String>,
+    // MCP support
+    activated_tools: Option<Arc<std::sync::Mutex<crate::mcp::ActivatedToolSet>>>,
+    deferred_tool_names: Vec<String>,
 }
 
 impl Agent {
@@ -119,6 +122,81 @@ impl Agent {
             last_visible_len: 0,
             skills,
             system_info,
+            activated_tools: None,
+            deferred_tool_names: Vec::new(),
+        }
+    }
+
+    /// Create an agent with MCP server support.
+    pub async fn with_mcp(
+        provider: Arc<dyn Provider>,
+        mut tools: Vec<Box<dyn Tool>>,
+        memory: Option<Arc<dyn Memory>>,
+        config: Config,
+        skills: Vec<Skill>,
+        system_info: Option<String>,
+    ) -> Self {
+        let mut activated_tools = None;
+        let mut deferred_tool_names = Vec::new();
+
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            match crate::mcp::McpRegistry::connect_all(&config.mcp.servers).await {
+                Ok(registry) => {
+                    let registry = std::sync::Arc::new(registry);
+
+                    if config.mcp.deferred_loading {
+                        let deferred = crate::mcp::DeferredMcpToolSet::from_registry(
+                            std::sync::Arc::clone(&registry),
+                        ).await;
+                        deferred_tool_names = deferred.stubs.iter()
+                            .map(|s| s.prefixed_name.clone())
+                            .collect();
+
+                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::mcp::ActivatedToolSet::new(),
+                        ));
+
+                        tools.push(Box::new(crate::mcp::ToolSearchTool::new(
+                            deferred,
+                            std::sync::Arc::clone(&activated),
+                        )));
+
+                        activated_tools = Some(activated);
+                    } else {
+                        let names = registry.tool_names();
+                        for name in names {
+                            if let Some(def) = registry.get_tool_def(&name).await {
+                                tools.push(Box::new(
+                                    crate::mcp::McpToolWrapper::new(
+                                        name, def, std::sync::Arc::clone(&registry),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("MCP registry connection failed: {e:#}");
+                }
+            }
+        }
+
+        let tool_specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+        let dispatcher = create_dispatcher(provider.supports_native_tools());
+
+        Self {
+            provider,
+            tools,
+            tool_specs,
+            memory,
+            config,
+            history: ConversationHistory::new(),
+            dispatcher,
+            last_visible_len: 0,
+            skills,
+            system_info,
+            activated_tools,
+            deferred_tool_names,
         }
     }
 
@@ -377,6 +455,7 @@ impl Agent {
             dispatcher_instructions: &self.dispatcher.prompt_instructions(),
             skills: &self.skills,
             system_info: self.system_info.as_deref(),
+            deferred_tool_names: &self.deferred_tool_names,
         };
         SystemPromptBuilder::build(&ctx)
     }
@@ -396,14 +475,28 @@ impl Agent {
         format!("{context}{user_message}")
     }
 
+    /// Build tool specs including any activated MCP tools.
+    fn current_tool_specs(&self) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self.tools.iter().map(|t| t.spec()).collect();
+        if let Some(at) = &self.activated_tools {
+            for spec in at.lock().unwrap().tool_specs() {
+                if !specs.iter().any(|s| s.name == spec.name) {
+                    specs.push(spec);
+                }
+            }
+        }
+        specs
+    }
+
     async fn call_llm(
         &self,
         messages: &[ChatMessage],
         model: &str,
         temperature: f64,
     ) -> Result<ChatResponse> {
+        let specs = self.current_tool_specs();
         let tools = if self.dispatcher.should_send_tool_specs() {
-            Some(self.tool_specs.as_slice())
+            Some(specs.as_slice())
         } else {
             None
         };
@@ -419,10 +512,21 @@ impl Agent {
         let mut results = Vec::with_capacity(calls.len());
 
         for call in calls {
-            let tool = self
-                .tools
-                .iter()
-                .find(|t| t.name() == call.name);
+            // 1. Try static tool registry
+            let static_tool = self.tools.iter().find(|t| t.name() == call.name);
+
+            // 2. Try activated MCP tools (deferred loading)
+            let activated_arc = if static_tool.is_none() {
+                self.activated_tools.as_ref().and_then(|at| {
+                    at.lock().unwrap().get_resolved(&call.name)
+                })
+            } else {
+                None
+            };
+
+            let tool: Option<&dyn Tool> = static_tool
+                .map(|t| t.as_ref())
+                .or(activated_arc.as_deref());
 
             let result = match tool {
                 Some(t) => match t.execute(call.arguments.clone()).await {

@@ -22,6 +22,8 @@ pub struct PromptContext<'a> {
     pub skills: &'a [Skill],
     /// Optional system information from MEMORY.md.
     pub system_info: Option<&'a str>,
+    /// Deferred MCP tool names (not yet activated).
+    pub deferred_tool_names: &'a [String],
 }
 
 /// Builds a system prompt from ordered sections.
@@ -36,10 +38,11 @@ impl SystemPromptBuilder {
         let system_info = ctx.system_info.map(build_system_info_section).unwrap_or_default();
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
+        let deferred = build_deferred_tools_section(ctx);
         let protocol = build_protocol_section(ctx);
         let safety = build_safety_section();
 
-        for section in [&datetime, &system_info, &tools, &skills, &protocol, &safety] {
+        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -123,6 +126,25 @@ fn build_skills_section(ctx: &PromptContext<'_>) -> String {
     crate::skills::skills_to_prompt(ctx.skills)
 }
 
+fn build_deferred_tools_section(ctx: &PromptContext<'_>) -> String {
+    if ctx.deferred_tool_names.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "## Available Deferred Tools\n\n\
+         The following MCP tools are available but not yet activated.\n\
+         Call `tool_search` with a query to activate them before use.\n\n\
+         <available-deferred-tools>\n"
+    );
+    for name in ctx.deferred_tool_names {
+        out.push_str(name);
+        out.push('\n');
+    }
+    out.push_str("</available-deferred-tools>");
+    out
+}
+
 fn build_protocol_section(ctx: &PromptContext<'_>) -> String {
     if ctx.native_tool_calling {
         String::new()
@@ -189,6 +211,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Available Tools"));
@@ -204,6 +227,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Safety"));
@@ -219,6 +243,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Tool Use Protocol"));
@@ -233,6 +258,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(!prompt.contains("## Tool Use Protocol"));
@@ -257,6 +283,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Current Date & Time"));
@@ -271,6 +298,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## Current Date & Time"));
@@ -296,6 +324,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &skills,
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("<available_skills>"));
@@ -312,6 +341,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: Some("OS: Linux\nKernel: 5.15"),
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("## System Information"));
@@ -327,6 +357,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: None,
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(!prompt.contains("## System Information"));
@@ -341,6 +372,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: Some("OS: TestLinux"),
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         let datetime_pos = prompt.find("## Current Date & Time").unwrap();
@@ -358,6 +390,7 @@ mod tests {
             dispatcher_instructions: "",
             skills: &[],
             system_info: Some(multiline),
+            deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("OS: Linux"));
