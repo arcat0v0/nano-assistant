@@ -506,10 +506,15 @@ impl Agent {
     }
 
     async fn execute_tools(
-        &self,
+        &mut self,
         calls: &[crate::agent::dispatcher::ParsedToolCall],
     ) -> Result<Vec<ToolExecutionResult>> {
         let mut results = Vec::with_capacity(calls.len());
+        let mut needs_skill_rescan = false;
+        let mut needs_mcp_reload = false;
+
+        let skill_install_re = regex::Regex::new(r"(?:npx\s+)?skills\s+(add|install)\b")
+            .expect("valid regex");
 
         for call in calls {
             // 1. Try static tool registry
@@ -551,10 +556,226 @@ impl Agent {
                 },
             };
 
+            // Post-execution hook detection
+            if result.success {
+                if call.name == "shell" {
+                    if let Some(cmd) = call.arguments.get("command").and_then(|v| v.as_str()) {
+                        if skill_install_re.is_match(cmd) {
+                            needs_skill_rescan = true;
+                        }
+                    }
+                }
+
+                if call.name == "file_edit" {
+                    let file_path = call.arguments.get("file_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if file_path.ends_with("config.toml") {
+                        let old_str = call.arguments.get("old_string")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let new_str = call.arguments.get("new_string")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if old_str.contains("[mcp")
+                            || old_str.contains("[[mcp.servers]]")
+                            || new_str.contains("[mcp")
+                            || new_str.contains("[[mcp.servers]]")
+                        {
+                            needs_mcp_reload = true;
+                        }
+                    }
+                }
+            }
+
             results.push(result);
         }
 
+        // Post-execution hooks
+        if needs_skill_rescan {
+            let skills_config = self.config.skills.clone();
+            let new_names = self.rescan_skills(&skills_config);
+            if !new_names.is_empty() {
+                results.push(ToolExecutionResult {
+                    name: "system".to_string(),
+                    output: format!(
+                        "[Auto-reload] New skills detected and loaded: {}",
+                        new_names.join(", ")
+                    ),
+                    success: true,
+                    tool_call_id: None,
+                });
+            }
+        }
+
+        if needs_mcp_reload {
+            let reload_result = self.reload_mcp().await;
+            let msg = match &reload_result {
+                McpReloadResult::Success { new_servers } if !new_servers.is_empty() => {
+                    format!(
+                        "[Auto-reload] New MCP servers connected: {}",
+                        new_servers.join(", ")
+                    )
+                }
+                McpReloadResult::Success { .. } => {
+                    "[Auto-reload] MCP config reloaded, no new servers found.".to_string()
+                }
+                McpReloadResult::PartialFailure { connected, failed } => {
+                    let mut msg = String::from("[Auto-reload] MCP reload partial: ");
+                    if !connected.is_empty() {
+                        msg.push_str(&format!("connected: {}; ", connected.join(", ")));
+                    }
+                    for (name, err) in failed {
+                        msg.push_str(&format!("failed {name}: {err}; "));
+                    }
+                    msg
+                }
+                McpReloadResult::Disabled => {
+                    "[Auto-reload] MCP is disabled in config.".to_string()
+                }
+            };
+            results.push(ToolExecutionResult {
+                name: "system".to_string(),
+                output: msg,
+                success: true,
+                tool_call_id: None,
+            });
+        }
+
         Ok(results)
+    }
+
+    /// Rescan skills directories and add any newly discovered skills.
+    /// Returns the names of newly added skills.
+    pub fn rescan_skills(&mut self, config: &crate::config::SkillsConfig) -> Vec<String> {
+        let fresh = crate::skills::load_skills(config);
+        let existing_names: std::collections::HashSet<String> =
+            self.skills.iter().map(|s| s.name.clone()).collect();
+
+        let mut new_names = Vec::new();
+
+        for skill in fresh {
+            if !existing_names.contains(&skill.name) {
+                let skill_tools = crate::skills::skills_to_tools(&[skill.clone()]);
+                for tool in skill_tools {
+                    let spec = tool.spec();
+                    self.tools.push(tool);
+                    self.tool_specs.push(spec);
+                }
+                new_names.push(skill.name.clone());
+                self.skills.push(skill);
+            }
+        }
+
+        new_names
+    }
+
+    /// Reload MCP configuration and connect to any new servers.
+    pub async fn reload_mcp(&mut self) -> McpReloadResult {
+        let config_path = crate::config::schema::default_config_path();
+        let config_content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to read config for MCP reload: {e}");
+                return McpReloadResult::Disabled;
+            }
+        };
+
+        let config: crate::config::Config = match toml::from_str(&config_content) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to parse config for MCP reload: {e}");
+                return McpReloadResult::Disabled;
+            }
+        };
+
+        if !config.mcp.enabled || config.mcp.servers.is_empty() {
+            return McpReloadResult::Disabled;
+        }
+
+        // Determine which servers are already connected by checking tool name prefixes
+        let existing_prefixes: std::collections::HashSet<String> = {
+            let mut prefixes = std::collections::HashSet::new();
+            for tool in &self.tools {
+                if let Some(prefix) = tool.name().split("__").next() {
+                    prefixes.insert(prefix.to_string());
+                }
+            }
+            for name in &self.deferred_tool_names {
+                if let Some(prefix) = name.split("__").next() {
+                    prefixes.insert(prefix.to_string());
+                }
+            }
+            prefixes
+        };
+
+        let new_server_configs: Vec<_> = config
+            .mcp
+            .servers
+            .iter()
+            .filter(|s| !existing_prefixes.contains(&s.name))
+            .cloned()
+            .collect();
+
+        if new_server_configs.is_empty() {
+            return McpReloadResult::Success {
+                new_servers: Vec::new(),
+            };
+        }
+
+        match crate::mcp::McpRegistry::connect_all(&new_server_configs).await {
+            Ok(registry) => {
+                let registry = std::sync::Arc::new(registry);
+                let mut connected = Vec::new();
+                let mut failed: Vec<(String, String)> = Vec::new();
+
+                for server_config in &new_server_configs {
+                    let names = registry.tool_names();
+                    let server_tools: Vec<_> = names
+                        .iter()
+                        .filter(|n| n.starts_with(&format!("{}__", server_config.name)))
+                        .collect();
+
+                    if server_tools.is_empty() {
+                        failed.push((
+                            server_config.name.clone(),
+                            "no tools discovered".to_string(),
+                        ));
+                        continue;
+                    }
+
+                    for tool_name in server_tools {
+                        if let Some(def) = registry.get_tool_def(tool_name).await {
+                            let wrapper = crate::mcp::McpToolWrapper::new(
+                                tool_name.clone(),
+                                def,
+                                std::sync::Arc::clone(&registry),
+                            );
+                            let spec = wrapper.spec();
+                            self.tools.push(Box::new(wrapper));
+                            self.tool_specs.push(spec);
+                        }
+                    }
+
+                    connected.push(server_config.name.clone());
+                }
+
+                if failed.is_empty() {
+                    McpReloadResult::Success {
+                        new_servers: connected,
+                    }
+                } else {
+                    McpReloadResult::PartialFailure { connected, failed }
+                }
+            }
+            Err(e) => McpReloadResult::PartialFailure {
+                connected: Vec::new(),
+                failed: new_server_configs
+                    .iter()
+                    .map(|s| (s.name.clone(), e.to_string()))
+                    .collect(),
+            },
+        }
     }
 
     fn trim_history(&mut self) {
@@ -563,6 +784,17 @@ impl Agent {
             self.history.trim_to(max);
         }
     }
+}
+
+/// Result of reloading MCP server configuration.
+#[derive(Debug)]
+pub enum McpReloadResult {
+    Success { new_servers: Vec<String> },
+    PartialFailure {
+        connected: Vec<String>,
+        failed: Vec<(String, String)>,
+    },
+    Disabled,
 }
 
 fn trailing_tool_prefix_len(text: &str) -> usize {

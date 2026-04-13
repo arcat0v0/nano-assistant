@@ -42,7 +42,9 @@ impl SystemPromptBuilder {
         let protocol = build_protocol_section(ctx);
         let safety = build_safety_section();
 
-        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety] {
+        let self_management = build_self_management_section();
+
+        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety, &self_management] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -160,6 +162,29 @@ fn build_protocol_section(ctx: &PromptContext<'_>) -> String {
          if they are independent."
             .to_string()
     }
+}
+
+fn build_self_management_section() -> String {
+    let mut prompt = String::from("## Self-Management Capabilities\n\n");
+
+    prompt.push_str("### Skill Installation\n");
+    prompt.push_str("You can install community skills:\n");
+    prompt.push_str("1. Search: `npx skills search \"<keyword>\"`\n");
+    prompt.push_str("2. Install: `npx skills add <package> -g`\n");
+    prompt.push_str("3. Skills auto-reload after installation.\n");
+    prompt.push_str("Do NOT modify builtin skills.\n\n");
+
+    prompt.push_str("### MCP Server Configuration\n");
+    let config_path = crate::platform::current_platform().config_path();
+    prompt.push_str(&format!("Edit {} to add MCP servers.\n", config_path.display()));
+    prompt.push_str("Add `[[mcp.servers]]` section. Config auto-reloads after edit.\n\n");
+
+    prompt.push_str("### Memory Management\n");
+    let memory_path = crate::platform::current_platform().memory_md_path();
+    prompt.push_str(&format!("Your memory file: {}\n", memory_path.display()));
+    prompt.push_str("Read and edit to persist info across sessions.\n");
+
+    prompt
 }
 
 fn build_safety_section() -> String {
@@ -381,6 +406,26 @@ mod tests {
         let datetime_pos = prompt.find("## Current Date & Time").unwrap();
         let sysinfo_pos = prompt.find("## System Information").unwrap();
         assert!(sysinfo_pos > datetime_pos, "System info should appear after datetime");
+    }
+
+    #[test]
+    fn prompt_contains_self_management_section() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("## Self-Management Capabilities"));
+        assert!(prompt.contains("### Skill Installation"));
+        assert!(prompt.contains("### MCP Server Configuration"));
+        assert!(prompt.contains("### Memory Management"));
+        assert!(prompt.contains("config.toml"));
+        assert!(prompt.contains("MEMORY.md"));
     }
 
     #[test]
