@@ -29,6 +29,9 @@ toml = "1.0"
 reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# HTML to text conversion (for web_fetch / web_search)
+html2text = "0.14"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
