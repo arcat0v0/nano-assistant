@@ -173,6 +173,10 @@ pub struct BehaviorConfig {
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
 
+    /// Enable debug diagnostics to stderr. Default: false.
+    #[serde(default)]
+    pub debug: bool,
+
     /// Verbose error messages. Default: true.
     #[serde(default = "default_true")]
     pub verbose_errors: bool,
@@ -190,6 +194,7 @@ impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
+            debug: false,
             verbose_errors: true,
             explain_tools: true,
             streaming: true,
@@ -504,7 +509,10 @@ mod tests {
             extra_paths = ["/opt/my-skills", "~/.agents/skills"]
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.skills.extra_paths, vec!["/opt/my-skills", "~/.agents/skills"]);
+        assert_eq!(
+            config.skills.extra_paths,
+            vec!["/opt/my-skills", "~/.agents/skills"]
+        );
     }
 
     #[test]
@@ -554,6 +562,9 @@ mod tests {
             EXA_API_KEY = "test-key"
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.mcp.servers[0].env.get("EXA_API_KEY").unwrap(), "test-key");
+        assert_eq!(
+            config.mcp.servers[0].env.get("EXA_API_KEY").unwrap(),
+            "test-key"
+        );
     }
 }

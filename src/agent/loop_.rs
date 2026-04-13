@@ -33,7 +33,9 @@ pub struct ConversationHistory {
 
 impl ConversationHistory {
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self {
+            messages: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, msg: ChatMessage) {
@@ -147,8 +149,11 @@ impl Agent {
                     if config.mcp.deferred_loading {
                         let deferred = crate::mcp::DeferredMcpToolSet::from_registry(
                             std::sync::Arc::clone(&registry),
-                        ).await;
-                        deferred_tool_names = deferred.stubs.iter()
+                        )
+                        .await;
+                        deferred_tool_names = deferred
+                            .stubs
+                            .iter()
                             .map(|s| s.prefixed_name.clone())
                             .collect();
 
@@ -166,11 +171,11 @@ impl Agent {
                         let names = registry.tool_names();
                         for name in names {
                             if let Some(def) = registry.get_tool_def(&name).await {
-                                tools.push(Box::new(
-                                    crate::mcp::McpToolWrapper::new(
-                                        name, def, std::sync::Arc::clone(&registry),
-                                    ),
-                                ));
+                                tools.push(Box::new(crate::mcp::McpToolWrapper::new(
+                                    name,
+                                    def,
+                                    std::sync::Arc::clone(&registry),
+                                )));
                             }
                         }
                     }
@@ -208,25 +213,56 @@ impl Agent {
     /// 4. If tool calls → execute → append results → loop
     /// 5. Return final text response
     pub async fn turn(&mut self, user_message: &str) -> Result<TurnResult> {
+        self.debug_log(format!(
+            "turn start streaming=false model={} history={} max_iterations={} user_chars={}",
+            self.config
+                .provider
+                .model
+                .as_deref()
+                .unwrap_or("gpt-4o-mini"),
+            self.history.len(),
+            self.config.behavior.max_iterations,
+            user_message.chars().count()
+        ));
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt();
+            self.debug_log(format!(
+                "system prompt initialized chars={}",
+                system_prompt.chars().count()
+            ));
             self.history.push(ChatMessage::system(system_prompt));
         }
 
         let enriched = self.enrich_user_message(user_message).await;
         self.history.push(ChatMessage::user(enriched));
 
-        let model = self.config.provider.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+        let model = self
+            .config
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-4o-mini".into());
         let temperature = self.config.provider.temperature;
         let max_iterations = self.config.behavior.max_iterations;
 
         let mut total_tool_calls = 0;
 
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
+            self.debug_log(format!(
+                "iteration {} start history_messages={}",
+                iteration + 1,
+                self.history.len()
+            ));
             let messages = self.history.messages();
             let response = self.call_llm(messages, &model, temperature).await?;
 
             let (text, calls) = self.dispatcher.parse_response(&response);
+            self.debug_log(format!(
+                "iteration {} llm response text_chars={} tool_calls={}",
+                iteration + 1,
+                response.text_or_empty().chars().count(),
+                calls.len()
+            ));
 
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
@@ -235,8 +271,14 @@ impl Agent {
                     text
                 };
 
-                self.history.push(ChatMessage::assistant(final_text.clone()));
+                self.history
+                    .push(ChatMessage::assistant(final_text.clone()));
                 self.trim_history();
+                self.debug_log(format!(
+                    "turn complete final_chars={} total_tool_calls={}",
+                    final_text.chars().count(),
+                    total_tool_calls
+                ));
 
                 return Ok(TurnResult {
                     response: final_text,
@@ -257,6 +299,10 @@ impl Agent {
             self.trim_history();
         }
 
+        self.debug_log(format!(
+            "turn failed max iterations exceeded limit={}",
+            max_iterations
+        ));
         bail!(
             "Agent exceeded maximum tool iterations ({})",
             max_iterations
@@ -272,20 +318,45 @@ impl Agent {
         user_message: &str,
         mut on_chunk: impl FnMut(StreamOutputEvent),
     ) -> Result<TurnResult> {
+        self.debug_log(format!(
+            "turn start streaming=true model={} history={} max_iterations={} user_chars={}",
+            self.config
+                .provider
+                .model
+                .as_deref()
+                .unwrap_or("gpt-4o-mini"),
+            self.history.len(),
+            self.config.behavior.max_iterations,
+            user_message.chars().count()
+        ));
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt();
+            self.debug_log(format!(
+                "system prompt initialized chars={}",
+                system_prompt.chars().count()
+            ));
             self.history.push(ChatMessage::system(system_prompt));
         }
 
         let enriched = self.enrich_user_message(user_message).await;
         self.history.push(ChatMessage::user(enriched));
 
-        let model = self.config.provider.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+        let model = self
+            .config
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-4o-mini".into());
         let temperature = self.config.provider.temperature;
         let max_iterations = self.config.behavior.max_iterations;
         let mut total_tool_calls = 0;
 
-        for _ in 0..max_iterations {
+        for iteration in 0..max_iterations {
+            self.debug_log(format!(
+                "iteration {} start history_messages={}",
+                iteration + 1,
+                self.history.len()
+            ));
             let messages = self.history.messages();
 
             if self.provider.supports_streaming() {
@@ -306,7 +377,8 @@ impl Agent {
 
                             marker_window.push_str(&chunk.delta);
                             if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
-                                let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                                let keep_from =
+                                    marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
                                 let boundary = marker_window
                                     .char_indices()
                                     .find(|(idx, _)| *idx >= keep_from)
@@ -366,10 +438,22 @@ impl Agent {
                     tool_calls: vec![],
                 };
                 let (text, calls) = self.dispatcher.parse_response(&fake_response);
+                self.debug_log(format!(
+                    "iteration {} streamed response text_chars={} tool_calls={}",
+                    iteration + 1,
+                    accumulated.chars().count(),
+                    calls.len()
+                ));
 
                 if calls.is_empty() {
-                    self.history.push(ChatMessage::assistant(accumulated.clone()));
+                    self.history
+                        .push(ChatMessage::assistant(accumulated.clone()));
                     self.trim_history();
+                    self.debug_log(format!(
+                        "turn complete final_chars={} total_tool_calls={}",
+                        accumulated.chars().count(),
+                        total_tool_calls
+                    ));
                     return Ok(TurnResult {
                         response: accumulated,
                         tool_calls_count: total_tool_calls,
@@ -393,7 +477,11 @@ impl Agent {
                 for (call, result) in calls.iter().zip(results.iter()) {
                     let summary = crate::console::args_summary(&call.name, &call.arguments);
                     on_chunk(StreamOutputEvent::Progress(
-                        crate::console::format_tool_call_line(&result.name, &summary, result.success),
+                        crate::console::format_tool_call_line(
+                            &result.name,
+                            &summary,
+                            result.success,
+                        ),
                     ));
                 }
 
@@ -403,6 +491,12 @@ impl Agent {
             } else {
                 let response = self.call_llm(messages, &model, temperature).await?;
                 let (text, calls) = self.dispatcher.parse_response(&response);
+                self.debug_log(format!(
+                    "iteration {} llm response text_chars={} tool_calls={}",
+                    iteration + 1,
+                    response.text_or_empty().chars().count(),
+                    calls.len()
+                ));
 
                 if calls.is_empty() {
                     let final_text = if text.is_empty() {
@@ -411,8 +505,14 @@ impl Agent {
                         text
                     };
                     on_chunk(StreamOutputEvent::Content(final_text.clone()));
-                    self.history.push(ChatMessage::assistant(final_text.clone()));
+                    self.history
+                        .push(ChatMessage::assistant(final_text.clone()));
                     self.trim_history();
+                    self.debug_log(format!(
+                        "turn complete final_chars={} total_tool_calls={}",
+                        final_text.chars().count(),
+                        total_tool_calls
+                    ));
                     return Ok(TurnResult {
                         response: final_text,
                         tool_calls_count: total_tool_calls,
@@ -431,6 +531,10 @@ impl Agent {
             }
         }
 
+        self.debug_log(format!(
+            "turn failed max iterations exceeded limit={}",
+            max_iterations
+        ));
         bail!(
             "Agent exceeded maximum tool iterations ({})",
             max_iterations
@@ -500,9 +604,27 @@ impl Agent {
         } else {
             None
         };
-        self.provider
+        self.debug_log(format!(
+            "llm request model={} temperature={} messages={} tools_sent={} total_tools={}",
+            model,
+            temperature,
+            messages.len(),
+            tools.map(|t| t.len()).unwrap_or(0),
+            specs.len()
+        ));
+        let response = self
+            .provider
             .chat(ChatRequest { messages, tools }, model, temperature)
-            .await
+            .await;
+        match &response {
+            Ok(resp) => self.debug_log(format!(
+                "llm response received text_chars={} native_tool_calls={}",
+                resp.text_or_empty().chars().count(),
+                resp.tool_calls.len()
+            )),
+            Err(err) => self.debug_log(format!("llm request failed error={err:#}")),
+        }
+        response
     }
 
     async fn execute_tools(
@@ -513,25 +635,29 @@ impl Agent {
         let mut needs_skill_rescan = false;
         let mut needs_mcp_reload = false;
 
-        let skill_install_re = regex::Regex::new(r"(?:npx\s+)?skills\s+(add|install)\b")
-            .expect("valid regex");
+        let skill_install_re =
+            regex::Regex::new(r"(?:npx\s+)?skills\s+(add|install)\b").expect("valid regex");
 
         for call in calls {
+            self.debug_log(format!(
+                "tool call name={} args={}",
+                call.name,
+                Self::summarize_json(&call.arguments)
+            ));
             // 1. Try static tool registry
             let static_tool = self.tools.iter().find(|t| t.name() == call.name);
 
             // 2. Try activated MCP tools (deferred loading)
             let activated_arc = if static_tool.is_none() {
-                self.activated_tools.as_ref().and_then(|at| {
-                    at.lock().unwrap().get_resolved(&call.name)
-                })
+                self.activated_tools
+                    .as_ref()
+                    .and_then(|at| at.lock().unwrap().get_resolved(&call.name))
             } else {
                 None
             };
 
-            let tool: Option<&dyn Tool> = static_tool
-                .map(|t| t.as_ref())
-                .or(activated_arc.as_deref());
+            let tool: Option<&dyn Tool> =
+                static_tool.map(|t| t.as_ref()).or(activated_arc.as_deref());
 
             let result = match tool {
                 Some(t) => match t.execute(call.arguments.clone()).await {
@@ -555,6 +681,13 @@ impl Agent {
                     tool_call_id: call.tool_call_id.clone(),
                 },
             };
+            self.debug_log(format!(
+                "tool result name={} success={} output_chars={} summary={}",
+                result.name,
+                result.success,
+                result.output.chars().count(),
+                Self::summarize_text(&result.output)
+            ));
 
             // Post-execution hook detection
             if result.success {
@@ -567,14 +700,20 @@ impl Agent {
                 }
 
                 if call.name == "file_edit" {
-                    let file_path = call.arguments.get("path")
+                    let file_path = call
+                        .arguments
+                        .get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if file_path.ends_with("config.toml") {
-                        let old_str = call.arguments.get("old_string")
+                        let old_str = call
+                            .arguments
+                            .get("old_string")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let new_str = call.arguments.get("new_string")
+                        let new_str = call
+                            .arguments
+                            .get("new_string")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if old_str.contains("[mcp")
@@ -630,9 +769,7 @@ impl Agent {
                     }
                     msg
                 }
-                McpReloadResult::Disabled => {
-                    "[Auto-reload] MCP is disabled in config.".to_string()
-                }
+                McpReloadResult::Disabled => "[Auto-reload] MCP is disabled in config.".to_string(),
             };
             results.push(ToolExecutionResult {
                 name: "system".to_string(),
@@ -643,6 +780,29 @@ impl Agent {
         }
 
         Ok(results)
+    }
+
+    fn debug_log(&self, message: impl AsRef<str>) {
+        if self.config.behavior.debug {
+            eprintln!("[debug] {}", message.as_ref());
+        }
+    }
+
+    fn summarize_json(value: &serde_json::Value) -> String {
+        let serialized = serde_json::to_string(value).unwrap_or_else(|_| "<invalid-json>".into());
+        Self::summarize_text(&serialized)
+    }
+
+    fn summarize_text(text: &str) -> String {
+        const LIMIT: usize = 240;
+        let single_line = text.replace('\n', "\\n");
+        let mut chars = single_line.chars();
+        let summary: String = chars.by_ref().take(LIMIT).collect();
+        if chars.next().is_some() {
+            format!("{summary}...")
+        } else {
+            summary
+        }
     }
 
     /// Rescan skills directories and add any newly discovered skills.
@@ -789,7 +949,9 @@ impl Agent {
 /// Result of reloading MCP server configuration.
 #[derive(Debug)]
 pub enum McpReloadResult {
-    Success { new_servers: Vec<String> },
+    Success {
+        new_servers: Vec<String>,
+    },
     PartialFailure {
         connected: Vec<String>,
         failed: Vec<(String, String)>,
@@ -849,14 +1011,22 @@ mod tests {
 
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes input" }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes input"
+        }
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {"msg": {"type": "string"}}})
         }
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             let msg = args.get("msg").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(ToolResult { success: true, output: msg.to_string(), error: None })
+            Ok(ToolResult {
+                success: true,
+                output: msg.to_string(),
+                error: None,
+            })
         }
     }
 
@@ -881,21 +1051,30 @@ mod tests {
 
     #[test]
     fn agent_creates_with_xml_dispatcher_for_non_native() {
-        let provider = Arc::new(MockProvider { native_tools: false, streaming: false });
+        let provider = Arc::new(MockProvider {
+            native_tools: false,
+            streaming: false,
+        });
         let agent = Agent::new(provider, vec![], None, make_config());
         assert!(!agent.dispatcher.should_send_tool_specs());
     }
 
     #[test]
     fn agent_creates_with_native_dispatcher_for_native() {
-        let provider = Arc::new(MockProvider { native_tools: true, streaming: false });
+        let provider = Arc::new(MockProvider {
+            native_tools: true,
+            streaming: false,
+        });
         let agent = Agent::new(provider, vec![], None, make_config());
         assert!(agent.dispatcher.should_send_tool_specs());
     }
 
     #[test]
     fn agent_builds_system_prompt_on_first_turn() {
-        let provider = Arc::new(MockProvider { native_tools: false, streaming: false });
+        let provider = Arc::new(MockProvider {
+            native_tools: false,
+            streaming: false,
+        });
         let agent = Agent::new(provider, vec![], None, make_config());
         assert!(agent.history.is_empty());
     }

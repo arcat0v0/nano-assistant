@@ -193,7 +193,31 @@ na --mode whitelist "ls -la /etc"
 
 ```bash
 na -v "查看当前目录"
-# [cli] config loaded, security mode: confirm
+# [cli] config loaded, security mode: confirm, debug: false
+```
+
+### DEBUG 模式
+
+使用 `--debug` 打开运行时调试信息，输出到终端 `stderr`，不会影响正常回答的 `stdout`：
+
+```bash
+na --debug "查看当前目录"
+na chat --debug
+```
+
+DEBUG 模式会输出高信号摘要，例如：
+
+- 当前 provider、model、security mode、streaming、max_iterations
+- 每轮 agent iteration 的开始和结束
+- LLM 请求/响应摘要
+- tool call 参数摘要
+- tool result 成功/失败与输出摘要
+
+也可以在配置文件中默认开启：
+
+```toml
+[behavior]
+debug = true
 ```
 
 ### 自定义配置文件路径
@@ -207,6 +231,16 @@ na --config-path ./my-config.toml "hello"
 配置文件路径：`~/.config/nano-assistant/config.toml`
 
 配置优先级：**CLI 参数 > 环境变量 > 配置文件**
+
+### 自动运行时上下文
+
+每次会话首次构建 system prompt 时，nano-assistant 会自动注入当前运行目录相关上下文，帮助模型理解它当前所在的项目环境：
+
+- 当前工作目录（Current Working Directory）
+- Git 仓库根目录（如果当前目录位于 Git 仓库内）
+- Git 分支名（如果当前目录位于 Git 仓库内）
+
+这些信息会作为独立的 `Runtime Context` section 注入给模型，不需要额外配置。
 
 ### 完整配置示例
 
@@ -230,6 +264,7 @@ whitelist = ["ls", "cat", "grep", "docker *", "systemctl status *"]
 [behavior]
 streaming = true             # 是否启用流式输出
 max_iterations = 10          # 每次用户消息的最大工具调用轮数
+debug = false               # 是否输出 DEBUG 摘要到 stderr
 verbose_errors = true        # 是否显示详细错误信息
 explain_tools = true         # 是否在系统提示中包含工具使用说明
 ```

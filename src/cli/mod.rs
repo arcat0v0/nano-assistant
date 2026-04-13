@@ -6,18 +6,10 @@ use std::path::PathBuf;
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum SkillsSubcommand {
     List,
-    Install {
-        source: String,
-    },
-    Remove {
-        name: String,
-    },
-    Audit {
-        source: String,
-    },
-    Test {
-        name: Option<String>,
-    },
+    Install { source: String },
+    Remove { name: String },
+    Audit { source: String },
+    Test { name: Option<String> },
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -28,6 +20,8 @@ pub enum Commands {
         prompt: Vec<String>,
         #[arg(long, value_name = "MODE")]
         mode: Option<String>,
+        #[arg(long)]
+        debug: bool,
         #[arg(long)]
         config: bool,
         #[arg(long, value_name = "PATH")]
@@ -75,9 +69,9 @@ impl CliArgs {
 
     pub fn config_path(&self) -> PathBuf {
         match &self.command {
-            Some(Commands::Chat { config_path, .. }) => {
-                config_path.clone().unwrap_or_else(crate::config::schema::default_config_path)
-            }
+            Some(Commands::Chat { config_path, .. }) => config_path
+                .clone()
+                .unwrap_or_else(crate::config::schema::default_config_path),
             _ => crate::config::schema::default_config_path(),
         }
     }
@@ -88,5 +82,9 @@ impl CliArgs {
 
     pub fn is_verbose(&self) -> bool {
         matches!(&self.command, Some(Commands::Chat { verbose: true, .. }))
+    }
+
+    pub fn is_debug(&self) -> bool {
+        matches!(&self.command, Some(Commands::Chat { debug: true, .. }))
     }
 }

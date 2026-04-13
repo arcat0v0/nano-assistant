@@ -3,13 +3,13 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::Context;
 use crate::agent::turn_streamed_to_stdout;
 use crate::agent::Agent;
-use crate::config::schema::{Config, default_config_path};
+use crate::config::schema::{default_config_path, Config};
 use crate::providers::Provider;
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use crate::tools;
+use anyhow::Context;
 
 use super::CliArgs;
 use super::SkillsSubcommand;
@@ -17,6 +17,7 @@ use super::SkillsSubcommand;
 struct CliArgsInner {
     prompt: Vec<String>,
     mode: Option<String>,
+    debug: bool,
     config: bool,
     config_path: Option<std::path::PathBuf>,
     verbose: bool,
@@ -34,13 +35,25 @@ impl CliArgsInner {
 
 pub async fn run(args: CliArgs) -> anyhow::Result<()> {
     match args.command {
-        Some(super::Commands::Chat { prompt, mode, config, config_path, verbose }) => {
-            let inner = CliArgsInner { prompt, mode, config, config_path, verbose };
+        Some(super::Commands::Chat {
+            prompt,
+            mode,
+            debug,
+            config,
+            config_path,
+            verbose,
+        }) => {
+            let inner = CliArgsInner {
+                prompt,
+                mode,
+                debug,
+                config,
+                config_path,
+                verbose,
+            };
             run_chat(inner).await
         }
-        Some(super::Commands::Skills { action }) => {
-            handle_skills_command(action).await
-        }
+        Some(super::Commands::Skills { action }) => handle_skills_command(action).await,
         None => {
             let config_path = default_config_path();
             let config = load_config(&config_path);
@@ -48,27 +61,34 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             let streaming = config.behavior.streaming;
             let provider = build_provider(&config)?;
             let system_info = load_or_create_memory_md().await;
-            run_interactive(provider, &config, config_path, security_mode, streaming, system_info).await
+            run_interactive(
+                provider,
+                &config,
+                config_path,
+                security_mode,
+                streaming,
+                system_info,
+            )
+            .await
         }
     }
 }
 
 async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
     if args.config {
-        let config_path = args.config_path
-            .clone()
-            .unwrap_or_else(default_config_path);
+        let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
         return open_config_editor(config_path);
     }
 
-    let config = load_config(&args.config_path.clone().unwrap_or_else(default_config_path));
+    let mut config = load_config(&args.config_path.clone().unwrap_or_else(default_config_path));
     let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
+    config.behavior.debug = resolve_debug_mode(args.debug, &config);
     let streaming = config.behavior.streaming;
 
     if args.verbose {
         eprintln!(
-            "[cli] config loaded, security mode: {}",
-            security_mode
+            "[cli] config loaded, security mode: {}, debug: {}",
+            security_mode, config.behavior.debug
         );
     }
 
@@ -83,7 +103,15 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
             let provider = build_provider(&config)?;
             let config_path = args.config_path.unwrap_or_else(default_config_path);
             let system_info = load_or_create_memory_md().await;
-            run_interactive(provider, &config, config_path, security_mode, streaming, system_info).await
+            run_interactive(
+                provider,
+                &config,
+                config_path,
+                security_mode,
+                streaming,
+                system_info,
+            )
+            .await
         }
     }
 }
@@ -93,7 +121,10 @@ fn load_config(path: &std::path::Path) -> Config {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[cli] warning: failed to read config {}: {e}", path.display());
+                eprintln!(
+                    "[cli] warning: failed to read config {}: {e}",
+                    path.display()
+                );
                 return Config::default();
             }
         };
@@ -122,6 +153,10 @@ fn resolve_security_mode(mode_override: Option<&str>, config: &Config) -> Securi
     }
 }
 
+fn resolve_debug_mode(cli_debug: bool, config: &Config) -> bool {
+    cli_debug || config.behavior.debug
+}
+
 fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
     config
         .provider
@@ -131,11 +166,7 @@ fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
 }
 
 fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
-    let provider_name = config
-        .provider
-        .provider
-        .as_deref()
-        .unwrap_or("openai");
+    let provider_name = config.provider.provider.as_deref().unwrap_or("openai");
 
     let base_url = config.provider.api_url.as_deref();
 
@@ -149,11 +180,15 @@ fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
         }
         "anthropic" => {
             let key = resolve_api_key(config, &["NA_API_KEY", "ANTHROPIC_API_KEY"]);
-            Arc::new(crate::providers::anthropic::AnthropicProvider::new(key.as_deref()))
+            Arc::new(crate::providers::anthropic::AnthropicProvider::new(
+                key.as_deref(),
+            ))
         }
         "gemini" => {
             let key = resolve_api_key(config, &["NA_API_KEY", "GEMINI_API_KEY"]);
-            Arc::new(crate::providers::gemini::GeminiProvider::new(key.as_deref()))
+            Arc::new(crate::providers::gemini::GeminiProvider::new(
+                key.as_deref(),
+            ))
         }
         "glm" => {
             let key = resolve_api_key(config, &["NA_API_KEY", "GLM_API_KEY"]);
@@ -218,10 +253,8 @@ fn build_agent(
     let mut secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
         .into_iter()
         .map(|t| {
-            let mut sec_mgr = SecurityManager::from_config_with_override(
-                &config.security,
-                Some(security_mode),
-            );
+            let mut sec_mgr =
+                SecurityManager::from_config_with_override(&config.security, Some(security_mode));
             if let Some(confirmer) = confirmer.clone() {
                 sec_mgr = sec_mgr.with_confirmer(confirmer);
             }
@@ -258,7 +291,14 @@ fn build_agent(
         None
     };
 
-    Agent::with_skills(provider, secured_tools, memory, config.clone(), skills, system_info)
+    Agent::with_skills(
+        provider,
+        secured_tools,
+        memory,
+        config.clone(),
+        skills,
+        system_info,
+    )
 }
 
 async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
@@ -267,7 +307,10 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
     if streaming {
         let result = turn_streamed_to_stdout(&mut agent, prompt).await?;
         if result.tool_calls_count > 0 {
-            eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
+            eprintln!(
+                "{}",
+                crate::console::format_tool_summary(result.tool_calls_count)
+            );
         }
         ctrl_c_handle.abort();
         Ok(())
@@ -276,7 +319,10 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
             Ok(result) => {
                 crate::render::render_markdown_to_stdout(&result.response);
                 if result.tool_calls_count > 0 {
-                    eprintln!("{}", crate::console::format_tool_summary(result.tool_calls_count));
+                    eprintln!(
+                        "{}",
+                        crate::console::format_tool_summary(result.tool_calls_count)
+                    );
                 }
                 Ok(())
             }
@@ -338,6 +384,7 @@ fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
 
 [behavior]
 # max_iterations = 10
+# debug = false
 # verbose_errors = true
 # explain_tools = true
 "#;
@@ -345,18 +392,15 @@ fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
         eprintln!("[cli] created default config at {}", config_path.display());
     }
 
-    let editor = std::env::var("EDITOR")
-        .unwrap_or_else(|_| {
-            if Command::new("nano").arg("--version").output().is_ok() {
-                "nano".to_string()
-            } else {
-                "vim".to_string()
-            }
-        });
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+        if Command::new("nano").arg("--version").output().is_ok() {
+            "nano".to_string()
+        } else {
+            "vim".to_string()
+        }
+    });
 
-    let status = Command::new(&editor)
-        .arg(&config_path)
-        .status()?;
+    let status = Command::new(&editor).arg(&config_path).status()?;
 
     if status.success() {
         eprintln!("[cli] config saved to {}", config_path.display());
@@ -383,20 +427,32 @@ async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> 
                 println!("  Or install: na skills install <source>");
             } else {
                 // Compute column widths
-                let name_width = skills.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
-                let version_width = skills.iter().map(|s| s.version.len()).max().unwrap_or(7).max(7);
+                let name_width = skills
+                    .iter()
+                    .map(|s| s.name.len())
+                    .max()
+                    .unwrap_or(4)
+                    .max(4);
+                let version_width = skills
+                    .iter()
+                    .map(|s| s.version.len())
+                    .max()
+                    .unwrap_or(7)
+                    .max(7);
 
                 println!("Installed skills ({}):", skills.len());
                 println!();
                 println!(
                     "  {:<name_w$}  {:<ver_w$}  SOURCE",
-                    "NAME", "VERSION",
+                    "NAME",
+                    "VERSION",
                     name_w = name_width,
                     ver_w = version_width,
                 );
                 println!(
                     "  {:<name_w$}  {:<ver_w$}  ------",
-                    "----", "-------",
+                    "----",
+                    "-------",
                     name_w = name_width,
                     ver_w = version_width,
                 );
@@ -436,7 +492,11 @@ async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> 
                     .with_context(|| format!("failed to install local skill: {source}"))?
             };
 
-            println!("  ✓ Skill installed and audited: {} ({} files scanned)", installed_dir.display(), files_scanned);
+            println!(
+                "  ✓ Skill installed and audited: {} ({} files scanned)",
+                installed_dir.display(),
+                files_scanned
+            );
             Ok(())
         }
         SkillsSubcommand::Remove { name } => {
@@ -463,10 +523,16 @@ async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> 
             }
             let report = crate::skills::audit::audit_skill_directory_with_options(
                 &target,
-                crate::skills::audit::SkillAuditOptions { allow_scripts: config.skills.allow_scripts },
+                crate::skills::audit::SkillAuditOptions {
+                    allow_scripts: config.skills.allow_scripts,
+                },
             )?;
             if report.is_clean() {
-                println!("  ✓ Skill audit passed for {} ({} files scanned).", target.display(), report.files_scanned);
+                println!(
+                    "  ✓ Skill audit passed for {} ({} files scanned).",
+                    target.display(),
+                    report.files_scanned
+                );
             } else {
                 println!("  ✗ Skill audit failed for {}", target.display());
                 for finding in report.findings {
@@ -549,6 +615,7 @@ mod tests {
         assert!(config.memory.enabled);
         assert_eq!(config.security.mode, "direct");
         assert_eq!(config.behavior.max_iterations, 10);
+        assert!(!config.behavior.debug);
         assert!(config.behavior.streaming);
     }
 
@@ -632,6 +699,28 @@ mod tests {
     }
 
     #[test]
+    fn cli_chat_debug_flag() {
+        let args = parse_chat(&["--debug"]);
+        assert!(args.is_debug());
+    }
+
+    #[test]
+    fn resolve_debug_mode_cli_takes_precedence() {
+        let args = parse_chat(&["--debug"]);
+        let mut config = Config::default();
+        config.behavior.debug = false;
+        assert!(resolve_debug_mode(args.is_debug(), &config));
+    }
+
+    #[test]
+    fn resolve_debug_mode_uses_config_when_cli_off() {
+        let args = parse_chat(&[]);
+        let mut config = Config::default();
+        config.behavior.debug = true;
+        assert!(resolve_debug_mode(args.is_debug(), &config));
+    }
+
+    #[test]
     fn cli_chat_config_flag() {
         let args = parse_chat(&["--config"]);
         assert!(args.is_config_flag());
@@ -640,7 +729,10 @@ mod tests {
     #[test]
     fn cli_chat_config_path_flag() {
         let args = parse_chat(&["--config-path", "/tmp/test.toml"]);
-        assert_eq!(args.config_path(), std::path::PathBuf::from("/tmp/test.toml"));
+        assert_eq!(
+            args.config_path(),
+            std::path::PathBuf::from("/tmp/test.toml")
+        );
     }
 
     #[test]

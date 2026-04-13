@@ -7,6 +7,7 @@ use crate::skills::Skill;
 use crate::tools::Tool;
 use crate::tools::ToolSpec;
 use std::fmt::Write;
+use std::process::Command;
 
 /// Context required to build the system prompt.
 pub struct PromptContext<'a> {
@@ -35,7 +36,11 @@ impl SystemPromptBuilder {
         let mut output = String::with_capacity(2048);
 
         let datetime = build_datetime_section();
-        let system_info = ctx.system_info.map(build_system_info_section).unwrap_or_default();
+        let system_info = ctx
+            .system_info
+            .map(build_system_info_section)
+            .unwrap_or_default();
+        let runtime_context = build_runtime_context_section();
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
         let deferred = build_deferred_tools_section(ctx);
@@ -46,7 +51,18 @@ impl SystemPromptBuilder {
 
         let command_exec = build_command_execution_section();
 
-        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety, &self_management, &command_exec] {
+        for section in [
+            &datetime,
+            &system_info,
+            &runtime_context,
+            &tools,
+            &skills,
+            &deferred,
+            &protocol,
+            &safety,
+            &self_management,
+            &command_exec,
+        ] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -99,6 +115,47 @@ fn build_system_info_section(system_info: &str) -> String {
     format!("## System Information\n\n{system_info}")
 }
 
+fn build_runtime_context_section() -> String {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(_) => return String::new(),
+    };
+
+    let mut out = String::from("## Runtime Context\n\n");
+    let _ = writeln!(out, "- **Current Working Directory**: {}", cwd.display());
+
+    if let Some(repo_root) = git_output(&cwd, &["rev-parse", "--show-toplevel"]) {
+        let _ = writeln!(out, "- **Git Repository Root**: {repo_root}");
+    }
+
+    if let Some(branch) = git_output(&cwd, &["branch", "--show-current"]) {
+        if !branch.is_empty() {
+            let _ = writeln!(out, "- **Git Branch**: {branch}");
+        }
+    }
+
+    out
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn build_tools_section(ctx: &PromptContext<'_>) -> String {
     if ctx.tools.is_empty() {
         return String::new();
@@ -139,7 +196,7 @@ fn build_deferred_tools_section(ctx: &PromptContext<'_>) -> String {
         "## Available Deferred Tools\n\n\
          The following MCP tools are available but not yet activated.\n\
          Call `tool_search` with a query to activate them before use.\n\n\
-         <available-deferred-tools>\n"
+         <available-deferred-tools>\n",
     );
     for name in ctx.deferred_tool_names {
         out.push_str(name);
@@ -178,7 +235,10 @@ fn build_self_management_section() -> String {
 
     prompt.push_str("### MCP Server Configuration\n");
     let config_path = crate::platform::current_platform().config_path();
-    prompt.push_str(&format!("Edit {} to add MCP servers.\n", config_path.display()));
+    prompt.push_str(&format!(
+        "Edit {} to add MCP servers.\n",
+        config_path.display()
+    ));
     prompt.push_str("Add `[[mcp.servers]]` section. Config auto-reloads after edit.\n\n");
 
     prompt.push_str("### Memory Management\n");
@@ -195,7 +255,9 @@ fn build_command_execution_section() -> String {
     prompt.push_str("- `apt install -y`, `pacman --noconfirm`\n");
     prompt.push_str("- `yes | command`, `--batch`, `--non-interactive`\n");
     prompt.push_str("Only use `pty_shell` when no non-interactive option exists.\n");
-    prompt.push_str("For passwords, use `__USER_INPUT__` — collected from terminal, never sent to AI.\n");
+    prompt.push_str(
+        "For passwords, use `__USER_INPUT__` — collected from terminal, never sent to AI.\n",
+    );
     prompt.push_str(
         "On Windows, pty_shell uses interactive stdin/stdout pipes. It works for prompt/response \
          flows, but full-screen terminal UIs may not behave correctly.\n",
@@ -231,7 +293,10 @@ mod tests {
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: "ok".into(),
@@ -393,6 +458,22 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_runtime_context() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("## Runtime Context"));
+        assert!(prompt.contains("Current Working Directory"));
+    }
+
+    #[test]
     fn prompt_omits_system_info_when_none() {
         let ctx = PromptContext {
             tools: &[],
@@ -421,7 +502,30 @@ mod tests {
         let prompt = SystemPromptBuilder::build(&ctx);
         let datetime_pos = prompt.find("## Current Date & Time").unwrap();
         let sysinfo_pos = prompt.find("## System Information").unwrap();
-        assert!(sysinfo_pos > datetime_pos, "System info should appear after datetime");
+        assert!(
+            sysinfo_pos > datetime_pos,
+            "System info should appear after datetime"
+        );
+    }
+
+    #[test]
+    fn prompt_runtime_context_section_placed_after_system_info() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: Some("OS: TestLinux"),
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        let sysinfo_pos = prompt.find("## System Information").unwrap();
+        let runtime_pos = prompt.find("## Runtime Context").unwrap();
+        assert!(
+            runtime_pos > sysinfo_pos,
+            "Runtime context should appear after system info"
+        );
     }
 
     #[test]
