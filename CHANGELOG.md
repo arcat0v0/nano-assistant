@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.1 - 2026-04-13
+
+### Added
+
+- Stronger runtime self-management guidance in the system prompt for execution flow, durable memory writes, and concise final reporting
+- Richer system bootstrap context including CPU model, GPU, virtualization, and detected tool paths
+- A regression test that blocks Unix path handling from falling back to a literal `~/` directory
+
+### Changed
+
+- Unix config and skills path resolution now falls back to the real user home discovery path before any temporary fallback
+- Local workspace artifacts such as `.sisyphus/`, `AGENTS.md`, `nvim.log`, and accidental literal `~/` directories are now ignored by git
+- `HOME`-dependent tests now restore environment state and run serially where needed
+
+### Fixed
+
+- `~/.config/nano-assistant` is now resolved as the executing user's home config directory instead of creating a literal `~/` tree inside the repository
+- Full `cargo test` runs are stable again without cross-test `HOME` pollution
+
 ## v0.3.0 - 2026-04-13
 
 ### Added

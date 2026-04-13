@@ -126,7 +126,7 @@ na
 进入交互模式后，提示符为 `❯`，输入你的问题或指令，按回车执行：
 
 ```
-nano-assistant v0.3.0
+nano-assistant v0.3.1
 Type your prompt and press Enter. Type `exit`, `quit`, or Ctrl+D to quit.
 
 ❯ 查看当前目录有哪些 Rust 项目
