@@ -80,10 +80,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(self.timeout_secs);
 
+        let (shell, flag) = crate::platform::current_platform().shell_command();
         let result = tokio::time::timeout(
             Duration::from_secs(timeout),
-            tokio::process::Command::new("sh")
-                .arg("-c")
+            tokio::process::Command::new(shell)
+                .arg(flag)
                 .arg(command)
                 .output(),
         )
