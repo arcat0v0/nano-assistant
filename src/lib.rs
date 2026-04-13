@@ -10,5 +10,6 @@ pub mod console;
 pub mod render;
 pub mod tui;
 pub mod system_info;
+pub mod mcp;
 
 pub use anyhow::Result;
