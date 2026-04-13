@@ -11,5 +11,6 @@ pub mod render;
 pub mod tui;
 pub mod system_info;
 pub mod mcp;
+pub mod platform;
 
 pub use anyhow::Result;
