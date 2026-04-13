@@ -270,9 +270,9 @@ fn agent_creates_with_tools_and_memory() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn default_tools_returns_six_tools_with_correct_names() {
+fn default_tools_returns_eight_tools_with_correct_names() {
     let tools = nano_assistant::tools::default_tools();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 8);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
     assert!(names.contains(&"shell"));
@@ -281,6 +281,8 @@ fn default_tools_returns_six_tools_with_correct_names() {
     assert!(names.contains(&"file_edit"));
     assert!(names.contains(&"glob_search"));
     assert!(names.contains(&"content_search"));
+    assert!(names.contains(&"web_fetch"));
+    assert!(names.contains(&"web_search"));
 }
 
 #[test]
