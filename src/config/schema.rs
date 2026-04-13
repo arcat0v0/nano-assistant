@@ -207,6 +207,12 @@ pub struct SkillsConfig {
 
     #[serde(default)]
     pub skills_dir: Option<String>,
+
+    /// Additional directories to scan for skills.
+    /// `~/.agents/skills` is always scanned automatically (hardcoded default).
+    /// Use this for custom paths beyond the defaults.
+    #[serde(default)]
+    pub extra_paths: Vec<String>,
 }
 
 impl Default for SkillsConfig {
@@ -215,6 +221,7 @@ impl Default for SkillsConfig {
             enabled: true,
             allow_scripts: false,
             skills_dir: None,
+            extra_paths: Vec::new(),
         }
     }
 }
@@ -413,5 +420,21 @@ mod tests {
         assert!(s.enabled);
         assert!(!s.allow_scripts);
         assert!(s.skills_dir.is_none());
+    }
+
+    #[test]
+    fn skills_config_extra_paths_default_empty() {
+        let s = SkillsConfig::default();
+        assert!(s.extra_paths.is_empty());
+    }
+
+    #[test]
+    fn toml_deserialization_skills_extra_paths() {
+        let toml_str = r#"
+            [skills]
+            extra_paths = ["/opt/my-skills", "~/.agents/skills"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.skills.extra_paths, vec!["/opt/my-skills", "~/.agents/skills"]);
     }
 }
