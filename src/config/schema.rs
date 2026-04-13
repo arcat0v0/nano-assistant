@@ -29,6 +29,10 @@ pub struct Config {
     /// Skills configuration.
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// MCP server configuration.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +226,77 @@ impl Default for SkillsConfig {
             allow_scripts: false,
             skills_dir: None,
             extra_paths: Vec::new(),
+        }
+    }
+}
+
+/// MCP transport protocol.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    Http,
+    Sse,
+}
+
+/// Configuration for a single MCP server.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpServerConfig {
+    /// Server name, used as tool name prefix.
+    pub name: String,
+
+    /// Transport protocol. Default: Stdio.
+    #[serde(default)]
+    pub transport: McpTransport,
+
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Command to spawn for Stdio transport.
+    #[serde(default)]
+    pub command: String,
+
+    /// Arguments for the Stdio command.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Environment variables for Stdio command.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+
+    /// HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+
+    /// Per-tool call timeout in seconds. Default: 180, max: 600.
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// MCP (Model Context Protocol) configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpConfig {
+    /// Enable MCP server connections. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Use deferred loading. Default: true.
+    #[serde(default = "default_true")]
+    pub deferred_loading: bool,
+
+    /// MCP server definitions.
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            deferred_loading: true,
+            servers: Vec::new(),
         }
     }
 }
@@ -436,5 +511,55 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.skills.extra_paths, vec!["/opt/my-skills", "~/.agents/skills"]);
+    }
+
+    #[test]
+    fn mcp_config_default() {
+        let m = McpConfig::default();
+        assert!(!m.enabled);
+        assert!(m.deferred_loading);
+        assert!(m.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_transport_default_is_stdio() {
+        let t = McpTransport::default();
+        assert_eq!(t, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn toml_deserialization_mcp_config() {
+        let toml_str = r#"
+            [mcp]
+            enabled = true
+
+            [[mcp.servers]]
+            name = "context7"
+            command = "npx"
+            args = ["-y", "@upstash/context7-mcp@latest"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.mcp.enabled);
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "context7");
+        assert_eq!(config.mcp.servers[0].transport, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn toml_deserialization_mcp_server_with_env() {
+        let toml_str = r#"
+            [mcp]
+            enabled = true
+
+            [[mcp.servers]]
+            name = "exa"
+            command = "npx"
+            args = ["-y", "exa-mcp-server"]
+
+            [mcp.servers.env]
+            EXA_API_KEY = "test-key"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.mcp.servers[0].env.get("EXA_API_KEY").unwrap(), "test-key");
     }
 }
