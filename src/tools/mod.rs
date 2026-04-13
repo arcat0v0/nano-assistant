@@ -8,6 +8,7 @@ pub mod content_search;
 pub mod skill_tool;
 pub mod skill_http;
 pub mod web_fetch;
+pub mod web_search;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 
