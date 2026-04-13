@@ -114,13 +114,52 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
 
 // ─── Loading ──────────────────────────────────────────────────────────
 
-/// Public entry point: load all skills from the configured skills directory.
+/// Public entry point: load all skills from configured directories.
+/// Scans in priority order:
+/// 1. Primary skills dir (~/.config/nano-assistant/skills/ or custom)
+/// 2. ~/.agents/skills/ (hardcoded, for skills.sh compatibility)
+/// 3. Any extra_paths from config
 pub fn load_skills(config: &crate::config::SkillsConfig) -> Vec<Skill> {
-    let skills_dir = match &config.skills_dir {
+    let primary = match &config.skills_dir {
         Some(dir) => PathBuf::from(dir),
         None => skills_dir(),
     };
-    load_skills_from_directory(&skills_dir, config.allow_scripts)
+
+    let agents_skills = agents_skills_dir();
+
+    let mut dirs: Vec<PathBuf> = vec![primary];
+
+    // Hardcoded: always include ~/.agents/skills/ if it exists
+    if agents_skills.exists() {
+        dirs.push(agents_skills);
+    }
+
+    // User-configured extra paths
+    for extra in &config.extra_paths {
+        let expanded = expand_tilde(extra);
+        dirs.push(expanded);
+    }
+
+    let dir_refs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
+    load_skills_multi(&dir_refs, config.allow_scripts)
+}
+
+/// Get the ~/.agents/skills/ directory path (skills.sh default install location).
+fn agents_skills_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        return home.join(".agents").join("skills");
+    }
+    PathBuf::from("~/.agents/skills")
+}
+
+/// Expand leading `~` to $HOME.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// Load all skills from a directory (no open-skills, no workspace wrapping).
@@ -176,6 +215,31 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
     }
 
     skills
+}
+
+/// Load skills from multiple directories with priority-based dedup.
+/// Earlier directories have higher priority — if two directories contain
+/// a skill with the same name, the one from the earlier directory wins.
+pub fn load_skills_multi(dirs: &[&Path], allow_scripts: bool) -> Vec<Skill> {
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut all_skills: Vec<Skill> = Vec::new();
+
+    for dir in dirs {
+        let dir_skills = load_skills_from_directory(dir, allow_scripts);
+        for skill in dir_skills {
+            if seen_names.insert(skill.name.clone()) {
+                all_skills.push(skill);
+            } else {
+                tracing::debug!(
+                    "skipping duplicate skill '{}' from {}",
+                    skill.name,
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    all_skills
 }
 
 /// Load a skill from a SKILL.toml manifest
@@ -1212,5 +1276,63 @@ command = "echo hello"
         fs::write(dir.path().join("not-a-skill.txt"), "hello").unwrap();
         let skills = load_skills_from_directory(dir.path(), false);
         assert!(skills.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod multi_dir_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_skill_md(dir: &Path, name: &str, desc: &str) {
+        let skill_dir = dir.join(name);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\n# {name}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_skills_multi_merges_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let secondary = tmp.path().join("secondary");
+
+        write_skill_md(&primary, "alpha", "Primary alpha");
+        write_skill_md(&secondary, "beta", "Secondary beta");
+
+        let skills = load_skills_multi(&[&primary, &secondary], false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"alpha"));
+        assert!(names.contains(&"beta"));
+    }
+
+    #[test]
+    fn load_skills_multi_primary_wins_on_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let secondary = tmp.path().join("secondary");
+
+        write_skill_md(&primary, "clash", "I am primary");
+        write_skill_md(&secondary, "clash", "I am secondary");
+
+        let skills = load_skills_multi(&[&primary, &secondary], false);
+        let clash = skills.iter().find(|s| s.name == "clash").unwrap();
+        assert_eq!(clash.description, "I am primary");
+    }
+
+    #[test]
+    fn load_skills_multi_skips_nonexistent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary");
+        let ghost = tmp.path().join("does-not-exist");
+
+        write_skill_md(&primary, "solo", "Only one");
+
+        let skills = load_skills_multi(&[&primary, &ghost], false);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "solo");
     }
 }
