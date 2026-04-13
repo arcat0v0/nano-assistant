@@ -33,6 +33,10 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # HTML to text conversion (for web_fetch / web_search)
 html2text = "0.14"
+scraper = "0.22"
+
+# URL encoding (for knowledge source adapters)
+urlencoding = "2"
 
 # Error handling
 anyhow = "1.0"

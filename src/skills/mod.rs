@@ -17,6 +17,7 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
     ("database-admin", include_str!("../../skills/database-admin/SKILL.md")),
     ("server-security", include_str!("../../skills/server-security/SKILL.md")),
     ("container-orchestration", include_str!("../../skills/container-orchestration/SKILL.md")),
+    ("arch-wiki", include_str!("../../skills/arch-wiki/SKILL.toml")),
 ];
 
 // ─── ClawhHub constants ────────────────────────────────────────────────
@@ -47,6 +48,9 @@ pub struct Skill {
     pub is_builtin: bool,
     #[serde(skip)]
     pub source: Option<SkillSource>,
+    /// Raw TOML content for knowledge-source skills (set during load_builtin_skills).
+    #[serde(skip)]
+    pub raw_content: Option<String>,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -70,6 +74,10 @@ pub(crate) struct SkillManifest {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    /// Source config for knowledge-source type skills.
+    pub source: Option<SkillSourceConfig>,
+    /// Routing config for knowledge-source type skills.
+    pub routing: Option<SkillRoutingConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +90,35 @@ pub(crate) struct SkillMeta {
     pub author: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Skill type: omitted for normal skills, "knowledge-source" for wiki adapters.
+    #[serde(rename = "type", default)]
+    pub skill_type: Option<String>,
+}
+
+/// Source configuration block for knowledge-source skills.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SkillSourceConfig {
+    pub engine: String,
+    pub base_url: String,
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+/// Routing configuration block for knowledge-source skills.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SkillRoutingConfig {
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
+fn default_language() -> String {
+    "en".to_string()
+}
+
+fn default_priority() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Default)]
@@ -149,23 +186,49 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
 fn load_builtin_skills() -> Vec<Skill> {
     let mut skills = Vec::new();
     for (name, content) in BUILTIN_SKILLS {
-        let parsed = parse_skill_markdown(content);
-        skills.push(Skill {
-            name: parsed.meta.name.unwrap_or_else(|| name.to_string()),
-            description: parsed
-                .meta
-                .description
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| extract_description(&parsed.body)),
-            version: NA_VERSION.to_string(),
-            author: parsed.meta.author,
-            tags: parsed.meta.tags,
-            tools: Vec::new(),
-            prompts: vec![parsed.body],
-            location: None,
-            is_builtin: true,
-            source: Some(SkillSource::Builtin),
-        });
+        // Detect TOML format (starts with '[') vs Markdown
+        let is_toml = content.trim_start().starts_with('[');
+
+        if is_toml {
+            // Parse as TOML manifest
+            if let Ok(manifest) = toml::from_str::<SkillManifest>(content) {
+                skills.push(Skill {
+                    name: manifest.skill.name,
+                    description: manifest.skill.description,
+                    version: NA_VERSION.to_string(),
+                    author: manifest.skill.author,
+                    tags: manifest.skill.tags,
+                    tools: manifest.tools,
+                    prompts: manifest.prompts,
+                    location: None,
+                    is_builtin: true,
+                    source: Some(SkillSource::Builtin),
+                    raw_content: Some(content.to_string()),
+                });
+            } else {
+                tracing::warn!("failed to parse builtin skill TOML for '{name}'");
+            }
+        } else {
+            // Parse as Markdown
+            let parsed = parse_skill_markdown(content);
+            skills.push(Skill {
+                name: parsed.meta.name.unwrap_or_else(|| name.to_string()),
+                description: parsed
+                    .meta
+                    .description
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| extract_description(&parsed.body)),
+                version: NA_VERSION.to_string(),
+                author: parsed.meta.author,
+                tags: parsed.meta.tags,
+                tools: Vec::new(),
+                prompts: vec![parsed.body],
+                location: None,
+                is_builtin: true,
+                source: Some(SkillSource::Builtin),
+                raw_content: None,
+            });
+        }
     }
     skills
 }
@@ -331,6 +394,13 @@ pub fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
 
+    // Preserve raw content for knowledge-source skills
+    let raw_content = if manifest.skill.skill_type.as_deref() == Some("knowledge-source") {
+        Some(content)
+    } else {
+        None
+    };
+
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
@@ -342,6 +412,7 @@ pub fn load_skill_toml(path: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         is_builtin: false,
         source: None,
+        raw_content,
     })
 }
 
@@ -370,6 +441,7 @@ pub fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         location: Some(path.to_path_buf()),
         is_builtin: false,
         source: None,
+        raw_content: None,
     })
 }
 
@@ -1069,6 +1141,49 @@ pub fn install_clawhub_skill_source(
     }
 }
 
+// ─── Knowledge source config parsing ─────────────────────────────────
+
+/// Check if a skill is a knowledge-source type and extract its config.
+///
+/// For builtin skills: uses the `raw_content` field (TOML content set during load).
+/// For file-based skills: re-reads the SKILL.toml from disk.
+pub fn parse_knowledge_source_config(
+    skill: &Skill,
+) -> Option<crate::knowledge::types::KnowledgeSourceConfig> {
+    let toml_content = if let Some(ref raw) = skill.raw_content {
+        raw.clone()
+    } else if let Some(ref location) = skill.location {
+        // Re-read the SKILL.toml from disk
+        let toml_path = if location.ends_with("SKILL.toml") {
+            location.clone()
+        } else {
+            location.parent()?.join("SKILL.toml")
+        };
+        std::fs::read_to_string(&toml_path).ok()?
+    } else {
+        return None;
+    };
+
+    let manifest: SkillManifest = toml::from_str(&toml_content).ok()?;
+
+    // Must have type = "knowledge-source" and a [source] section
+    if manifest.skill.skill_type.as_deref() != Some("knowledge-source") {
+        return None;
+    }
+
+    let source = manifest.source?;
+    let routing = manifest.routing.unwrap_or_default();
+
+    Some(crate::knowledge::types::KnowledgeSourceConfig {
+        name: manifest.skill.name,
+        engine: source.engine,
+        base_url: source.base_url,
+        language: source.language,
+        triggers: routing.triggers,
+        priority: routing.priority,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1259,6 +1374,7 @@ command = "echo hello"
             location: None,
             is_builtin: false,
             source: None,
+            raw_content: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("<available_skills>"));
@@ -1283,6 +1399,7 @@ command = "echo hello"
             location: None,
             is_builtin: false,
             source: None,
+            raw_content: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));

@@ -318,6 +318,7 @@ mod tests {
             location: None,
             is_builtin: false,
             source: None,
+            raw_content: None,
         }];
         let ctx = PromptContext {
             tools: &[],

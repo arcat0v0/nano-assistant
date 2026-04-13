@@ -239,6 +239,15 @@ fn build_agent(
     let skill_tools = crate::skills::skills_to_tools(&skills);
     secured_tools.extend(skill_tools);
 
+    // Register knowledge source tools from skills with type = "knowledge-source"
+    for skill in &skills {
+        if let Some(ks_config) = crate::skills::parse_knowledge_source_config(skill) {
+            let source = crate::knowledge::create_source(&ks_config);
+            let ks_tools = crate::knowledge::source_to_tools(source);
+            secured_tools.extend(ks_tools);
+        }
+    }
+
     let memory: Option<Arc<dyn crate::memory::Memory>> = if config.memory.enabled {
         let memory_dir = default_config_path()
             .parent()

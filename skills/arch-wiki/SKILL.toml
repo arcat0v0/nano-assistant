@@ -1,0 +1,15 @@
+[skill]
+name = "arch-wiki"
+type = "knowledge-source"
+description = "ArchLinux official wiki — comprehensive Linux documentation"
+version = "0.3.0"
+tags = ["linux", "archlinux", "wiki"]
+
+[source]
+engine = "mediawiki"
+base_url = "https://wiki.archlinux.org"
+language = "en"
+
+[routing]
+triggers = ["arch", "archlinux", "pacman", "makepkg", "AUR", "PKGBUILD", "systemd", "mkinitcpio"]
+priority = 10

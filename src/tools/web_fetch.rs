@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
+use scraper::{Html, Selector};
 use serde_json::json;
 use std::time::Duration;
 
@@ -7,6 +8,63 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_REDIRECTS: usize = 5;
 const MAX_OUTPUT_BYTES: usize = 1_048_576; // 1 MiB
 const DEFAULT_MAX_LENGTH: usize = 102_400; // 100 KB
+
+/// Convert HTML to readable markdown/text.
+///
+/// Tries to extract main content via common wiki/article selectors,
+/// falls back to `<body>` or the full document.
+pub fn html_to_markdown(html: &str) -> String {
+    html_to_markdown_with_selector(html, None)
+}
+
+/// Convert HTML to readable text, optionally using a custom CSS selector
+/// to extract a specific portion of the page.
+pub fn html_to_markdown_with_selector(html: &str, selector: Option<&str>) -> String {
+    let document = Html::parse_document(html);
+
+    // If caller provided a custom selector, try it first
+    let custom_selectors: Vec<&str> = match selector {
+        Some(s) => vec![s],
+        None => Vec::new(),
+    };
+
+    // Common content selectors for wikis and article pages
+    let default_selectors = [
+        "#mw-content-text",   // MediaWiki
+        "#content",           // Generic content div
+        "article",            // HTML5 article element
+        "main",               // HTML5 main element
+        ".moin-content",      // MoinMoin wiki
+    ];
+
+    let all_selectors: Vec<&str> = custom_selectors
+        .iter()
+        .chain(default_selectors.iter())
+        .copied()
+        .collect();
+
+    for sel_str in &all_selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(element) = document.select(&sel).next() {
+                let inner_html = element.inner_html();
+                return html2text::from_read(inner_html.as_bytes(), 120)
+                    .unwrap_or_else(|_| inner_html);
+            }
+        }
+    }
+
+    // Fallback: try <body>, then full document
+    if let Ok(body_sel) = Selector::parse("body") {
+        if let Some(body) = document.select(&body_sel).next() {
+            let inner = body.inner_html();
+            return html2text::from_read(inner.as_bytes(), 120)
+                .unwrap_or_else(|_| inner);
+        }
+    }
+
+    html2text::from_read(html.as_bytes(), 120)
+        .unwrap_or_else(|_| html.to_string())
+}
 
 /// Fetch a URL and return its content as readable text.
 /// HTML is converted to plain text; JSON and plain text are returned as-is.
@@ -89,6 +147,10 @@ impl Tool for WebFetchTool {
                 "max_length": {
                     "type": "integer",
                     "description": "Maximum output length in bytes (default: 102400, max: 1048576)"
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector to extract specific content from HTML pages"
                 }
             },
             "required": ["url"]
@@ -106,6 +168,11 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(DEFAULT_MAX_LENGTH);
+
+        let selector = args
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         let response = match self.client.get(url).send().await {
             Ok(resp) => resp,
@@ -156,7 +223,7 @@ impl Tool for WebFetchTool {
         };
 
         let mut output = if is_html(&content_type) {
-            html2text::from_read(body.as_bytes(), 80).unwrap_or_else(|_| body)
+            html_to_markdown_with_selector(&body, selector.as_deref())
         } else {
             body
         };
