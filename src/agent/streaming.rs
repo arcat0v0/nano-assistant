@@ -174,14 +174,7 @@ mod tests {
     #[test]
     fn stream_printer_accumulates_multiple_chunks() {
         let mut printer = StreamPrinter::new();
-        let chunks = vec![
-            "Hello ",
-            "world",
-            "! This ",
-            "is ",
-            "a ",
-            "test.",
-        ];
+        let chunks = vec!["Hello ", "world", "! This ", "is ", "a ", "test."];
         for chunk in chunks {
             printer.print_event(StreamOutputEvent::Content(chunk.into()));
         }

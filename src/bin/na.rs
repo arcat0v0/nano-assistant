@@ -1,5 +1,5 @@
 use clap::Parser;
-use nano_assistant::cli::{CliArgs, commands};
+use nano_assistant::cli::{commands, CliArgs};
 
 fn is_bare_global_flag(arg: &str) -> bool {
     matches!(arg, "--help" | "-h" | "--version" | "-V")
@@ -14,7 +14,10 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             // Global flags (--help/--version) or "skills" subcommand must not
             // fall through to the chat-mode backward-compat path.
-            if raw.get(1).is_some_and(|s| is_bare_global_flag(s) || s == "skills") {
+            if raw
+                .get(1)
+                .is_some_and(|s| is_bare_global_flag(s) || s == "skills")
+            {
                 eprintln!("{e}");
                 std::process::exit(e.exit_code());
             }

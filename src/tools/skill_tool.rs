@@ -83,7 +83,8 @@ impl Tool for SkillShellTool {
             }
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -116,10 +117,7 @@ impl Tool for SkillShellTool {
             Err(_) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {}s",
-                    SHELL_TIMEOUT_SECS
-                )),
+                error: Some(format!("Command timed out after {}s", SHELL_TIMEOUT_SECS)),
             }),
         }
     }
@@ -130,7 +128,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_skill_tool(name: &str, kind: &str, command: &str, args: HashMap<String, String>) -> SkillTool {
+    fn make_skill_tool(
+        name: &str,
+        kind: &str,
+        command: &str,
+        args: HashMap<String, String>,
+    ) -> SkillTool {
         SkillTool {
             name: name.to_string(),
             description: format!("{} tool", name),
@@ -182,10 +185,7 @@ mod tests {
         let tool = make_skill_tool("echo", "shell", "echo {{msg}}", args);
         let st = SkillShellTool::new("demo", &tool);
 
-        let result = st
-            .execute(json!({ "msg": "hello world" }))
-            .await
-            .unwrap();
+        let result = st.execute(json!({ "msg": "hello world" })).await.unwrap();
 
         assert!(result.success);
         assert!(result.output.contains("hello world"));

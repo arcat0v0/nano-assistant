@@ -14,16 +14,28 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: content.into() }
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
     }
     pub fn tool(content: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: content.into() }
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -57,10 +69,16 @@ pub struct StreamChunk {
 
 impl StreamChunk {
     pub fn delta(text: impl Into<String>) -> Self {
-        Self { delta: text.into(), is_final: false }
+        Self {
+            delta: text.into(),
+            is_final: false,
+        }
     }
     pub fn final_chunk() -> Self {
-        Self { delta: String::new(), is_final: true }
+        Self {
+            delta: String::new(),
+            is_final: true,
+        }
     }
 }
 
@@ -115,11 +133,20 @@ pub trait Provider: Send + Sync {
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
         if self.supports_native_tools() {
-            anyhow::bail!("provider declares native tool support but did not override chat_with_tools()")
+            anyhow::bail!(
+                "provider declares native tool support but did not override chat_with_tools()"
+            )
         }
         let _ = tools;
-        self.chat(ChatRequest { messages, tools: None }, model, temperature)
-            .await
+        self.chat(
+            ChatRequest {
+                messages,
+                tools: None,
+            },
+            model,
+            temperature,
+        )
+        .await
     }
 
     fn stream_chat(
@@ -145,13 +172,17 @@ pub trait Provider: Send + Sync {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let system = messages.iter().find(|m| m.role == "system").map(|m| m.content.as_str());
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
         let last_user = messages
             .iter()
             .rfind(|m| m.role == "user")
             .map(|m| m.content.as_str())
             .unwrap_or("");
-        self.chat_with_system(system, last_user, model, temperature).await
+        self.chat_with_system(system, last_user, model, temperature)
+            .await
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -173,13 +204,20 @@ mod tests {
 
     #[test]
     fn chat_response_helpers() {
-        let empty = ChatResponse { text: None, tool_calls: vec![] };
+        let empty = ChatResponse {
+            text: None,
+            tool_calls: vec![],
+        };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
 
         let with_tools = ChatResponse {
             text: Some("check".into()),
-            tool_calls: vec![ToolCall { id: "1".into(), name: "s".into(), arguments: "{}".into() }],
+            tool_calls: vec![ToolCall {
+                id: "1".into(),
+                name: "s".into(),
+                arguments: "{}".into(),
+            }],
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "check");
@@ -187,7 +225,11 @@ mod tests {
 
     #[test]
     fn tool_call_serialization() {
-        let tc = ToolCall { id: "c1".into(), name: "f".into(), arguments: r#"{"x":1}"#.into() };
+        let tc = ToolCall {
+            id: "c1".into(),
+            name: "f".into(),
+            arguments: r#"{"x":1}"#.into(),
+        };
         let json = serde_json::to_string(&tc).unwrap();
         assert!(json.contains("c1") && json.contains("f"));
     }

@@ -21,10 +21,7 @@ impl MoinMoinSource {
     pub fn new(config: &KnowledgeSourceConfig) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(format!(
-                "nano-assistant/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("nano-assistant/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -84,11 +81,7 @@ impl KnowledgeSource for MoinMoinSource {
                         continue;
                     }
 
-                    let href = element
-                        .value()
-                        .attr("href")
-                        .unwrap_or_default()
-                        .to_string();
+                    let href = element.value().attr("href").unwrap_or_default().to_string();
 
                     let page_id = title.replace(' ', "/");
                     let page_url = if href.starts_with("http") {
@@ -131,12 +124,7 @@ impl KnowledgeSource for MoinMoinSource {
                 let trimmed = line.trim();
                 trimmed.starts_with('=') && trimmed.ends_with('=')
             })
-            .map(|line| {
-                line.trim()
-                    .trim_matches('=')
-                    .trim()
-                    .to_string()
-            })
+            .map(|line| line.trim().trim_matches('=').trim().to_string())
             .collect();
 
         let content = if let Some(section_name) = section {

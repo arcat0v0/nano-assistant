@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::tools::traits::{Tool, ToolResult};
 use super::KnowledgeSource;
+use crate::tools::traits::{Tool, ToolResult};
 
 const MAX_READ_CHARS: usize = 50_000;
 
@@ -70,8 +70,8 @@ impl Tool for KnowledgeSearchTool {
 
         match self.source.search(query, limit).await {
             Ok(results) => {
-                let output = serde_json::to_string_pretty(&results)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let output =
+                    serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
                 Ok(ToolResult {
                     success: true,
                     output,
@@ -183,12 +183,10 @@ fn truncate_at_paragraph(text: &mut String, max_chars: usize) {
 
     // Find the last paragraph boundary before the limit
     let search_region = &text[..max_chars];
-    let boundary = search_region
-        .rfind("\n\n")
-        .unwrap_or_else(|| {
-            // Fall back to last newline
-            search_region.rfind('\n').unwrap_or(max_chars)
-        });
+    let boundary = search_region.rfind("\n\n").unwrap_or_else(|| {
+        // Fall back to last newline
+        search_region.rfind('\n').unwrap_or(max_chars)
+    });
 
     // Ensure we're at a char boundary
     let mut pos = boundary;

@@ -67,7 +67,7 @@ fn walk_dir(
             }
 
             if let Ok(content) = std::fs::read_to_string(&path) {
-                    for (line_num, line) in content.lines().enumerate() {
+                for (line_num, line) in content.lines().enumerate() {
                     if re.is_match(line) {
                         results.push(MatchResult {
                             path: path.clone(),
@@ -153,17 +153,16 @@ impl Tool for ContentSearchTool {
         let include_owned = include.map(|s| s.to_string());
         let search_path_owned = search_path.to_string();
 
-        let matches =
-            tokio::task::spawn_blocking(move || {
-                walk_dir(
-                    Path::new(&search_path_owned),
-                    &pattern_owned,
-                    case_sensitive,
-                    include_owned.as_deref(),
-                )
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Search task failed: {e}"))??;
+        let matches = tokio::task::spawn_blocking(move || {
+            walk_dir(
+                Path::new(&search_path_owned),
+                &pattern_owned,
+                case_sensitive,
+                include_owned.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Search task failed: {e}"))??;
 
         if matches.is_empty() {
             return Ok(ToolResult {
@@ -187,8 +186,13 @@ impl Tool for ContentSearchTool {
             }
         }
 
-        writeln!(buf, "\n\nTotal: {} matches in {} files", matches.len(), file_count.len())
-            .unwrap();
+        writeln!(
+            buf,
+            "\n\nTotal: {} matches in {} files",
+            matches.len(),
+            file_count.len()
+        )
+        .unwrap();
 
         Ok(ToolResult {
             success: true,
@@ -213,8 +217,11 @@ mod tests {
     #[tokio::test]
     async fn finds_matches() {
         let dir = test_dir("nano_content_search_test");
-        std::fs::write(dir.join("main.rs"), "fn main() {\n    println!(\"hello\");\n}\n")
-            .unwrap();
+        std::fs::write(
+            dir.join("main.rs"),
+            "fn main() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("lib.rs"), "pub fn greet() {}\n").unwrap();
 
         let tool = ContentSearchTool::new();

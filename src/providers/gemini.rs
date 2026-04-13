@@ -64,7 +64,9 @@ impl CandidateContent {
 
         for part in self.parts {
             if let Some(text) = part.text {
-                if text.is_empty() { continue; }
+                if text.is_empty() {
+                    continue;
+                }
                 if !part.thought {
                     answer_parts.push(text);
                 } else if first_thinking.is_none() {
@@ -73,7 +75,11 @@ impl CandidateContent {
             }
         }
 
-        if answer_parts.is_empty() { first_thinking } else { Some(answer_parts.join("")) }
+        if answer_parts.is_empty() {
+            first_thinking
+        } else {
+            Some(answer_parts.join(""))
+        }
     }
 }
 
@@ -88,7 +94,11 @@ impl GeminiProvider {
             .map(str::trim)
             .filter(|k| !k.is_empty())
             .map(ToString::to_string)
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok().filter(|k| !k.is_empty()));
+            .or_else(|| {
+                std::env::var("GEMINI_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            });
 
         Self {
             api_key: key,
@@ -105,10 +115,20 @@ impl GeminiProvider {
     }
 
     fn format_model(model: &str) -> String {
-        if model.starts_with("models/") { model.to_string() } else { format!("models/{model}") }
+        if model.starts_with("models/") {
+            model.to_string()
+        } else {
+            format!("models/{model}")
+        }
     }
 
-    async fn send(&self, contents: Vec<Content>, system_instruction: Option<Content>, model: &str, temperature: f64) -> anyhow::Result<String> {
+    async fn send(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
         let key = self.api_key.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Gemini API key not set. Set GEMINI_API_KEY or edit config.toml.")
         })?;
@@ -116,11 +136,18 @@ impl GeminiProvider {
         let request = GenerateContentRequest {
             contents,
             system_instruction,
-            generation_config: GenerationConfig { temperature, max_output_tokens: 8192 },
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
         };
 
         let model_name = Self::format_model(model);
-        let url = format!("{}/{model_name}:generateContent?key={key}", self.base_url, model_name = model_name);
+        let url = format!(
+            "{}/{model_name}:generateContent?key={key}",
+            self.base_url,
+            model_name = model_name
+        );
 
         let response = self.client().post(&url).json(&request).send().await?;
 
@@ -153,8 +180,18 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let system = system_prompt.map(|s| Content { role: None, parts: vec![Part { text: s.to_string() }] });
-        let contents = vec![Content { role: Some("user".into()), parts: vec![Part { text: message.to_string() }] }];
+        let system = system_prompt.map(|s| Content {
+            role: None,
+            parts: vec![Part {
+                text: s.to_string(),
+            }],
+        });
+        let contents = vec![Content {
+            role: Some("user".into()),
+            parts: vec![Part {
+                text: message.to_string(),
+            }],
+        }];
         self.send(contents, system, model, temperature).await
     }
 
@@ -170,8 +207,18 @@ impl Provider for GeminiProvider {
         for msg in messages {
             match msg.role.as_str() {
                 "system" => system_parts.push(&msg.content),
-                "user" => contents.push(Content { role: Some("user".into()), parts: vec![Part { text: msg.content.clone() }] }),
-                "assistant" => contents.push(Content { role: Some("model".into()), parts: vec![Part { text: msg.content.clone() }] }),
+                "user" => contents.push(Content {
+                    role: Some("user".into()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
+                "assistant" => contents.push(Content {
+                    role: Some("model".into()),
+                    parts: vec![Part {
+                        text: msg.content.clone(),
+                    }],
+                }),
                 _ => {}
             }
         }
@@ -179,7 +226,12 @@ impl Provider for GeminiProvider {
         let system = if system_parts.is_empty() {
             None
         } else {
-            Some(Content { role: None, parts: vec![Part { text: system_parts.join("\n\n") }] })
+            Some(Content {
+                role: None,
+                parts: vec![Part {
+                    text: system_parts.join("\n\n"),
+                }],
+            })
         };
 
         self.send(contents, system, model, temperature).await

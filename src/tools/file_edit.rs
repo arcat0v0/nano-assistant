@@ -207,7 +207,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("matches 2 times"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("matches 2 times"));
     }
 
     #[tokio::test]
@@ -239,7 +243,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("must not be empty"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("must not be empty"));
     }
 
     #[tokio::test]
@@ -250,7 +258,8 @@ mod tests {
             .join("SKILL.toml");
 
         let original = tokio::fs::read_to_string(&builtin_skill).await.unwrap();
-        let old_string = r#"description = "ArchLinux official wiki — comprehensive Linux documentation""#;
+        let old_string =
+            r#"description = "ArchLinux official wiki — comprehensive Linux documentation""#;
 
         let tool = FileEditTool::new();
         let result = tool
@@ -263,13 +272,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("builtin skill")
-        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("builtin skill"));
 
         let after = tokio::fs::read_to_string(&builtin_skill).await.unwrap();
         assert_eq!(after, original);

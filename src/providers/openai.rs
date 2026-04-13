@@ -129,9 +129,15 @@ impl Provider for OpenAiProvider {
     ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
-            messages.push(OpenAiMessage { role: "system".into(), content: sys.to_string() });
+            messages.push(OpenAiMessage {
+                role: "system".into(),
+                content: sys.to_string(),
+            });
         }
-        messages.push(OpenAiMessage { role: "user".into(), content: message.to_string() });
+        messages.push(OpenAiMessage {
+            role: "user".into(),
+            content: message.to_string(),
+        });
 
         let request = ChatRequest {
             model: model.to_string(),
@@ -149,10 +155,17 @@ impl Provider for OpenAiProvider {
     ) -> anyhow::Result<String> {
         let api_messages: Vec<OpenAiMessage> = messages
             .iter()
-            .map(|m| OpenAiMessage { role: m.role.clone(), content: m.content.clone() })
+            .map(|m| OpenAiMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
             .collect();
 
-        let request = ChatRequest { model: model.to_string(), messages: api_messages, temperature };
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+        };
         self.post(&request).await
     }
 
@@ -176,7 +189,10 @@ impl Provider for OpenAiProvider {
     ) -> BoxStream<'static, anyhow::Result<StreamChunk>> {
         let api_messages: Vec<OpenAiMessage> = messages
             .iter()
-            .map(|m| OpenAiMessage { role: m.role.clone(), content: m.content.clone() })
+            .map(|m| OpenAiMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
             .collect();
 
         let body = serde_json::json!({

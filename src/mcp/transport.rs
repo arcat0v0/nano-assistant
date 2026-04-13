@@ -2,15 +2,15 @@
 
 use std::borrow::Cow;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt;
 
+use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR};
 use crate::config::{McpServerConfig, McpTransport};
-use super::protocol::{INTERNAL_ERROR, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 
 /// Maximum bytes for a single JSON-RPC response.
 const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB

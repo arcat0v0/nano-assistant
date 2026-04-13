@@ -140,10 +140,7 @@ mod tests {
     #[tokio::test]
     async fn captures_exit_code() {
         let tool = ShellTool::new();
-        let result = tool
-            .execute(json!({"command": "false"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"command": "false"})).await.unwrap();
         assert!(!result.success);
     }
 
@@ -167,10 +164,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_command() {
         let tool = ShellTool::new().with_timeout_secs(1);
-        let result = tool
-            .execute(json!({"command": "sleep 10"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"command": "sleep 10"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("timed out"));
     }

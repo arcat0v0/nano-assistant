@@ -30,11 +30,11 @@ pub fn html_to_markdown_with_selector(html: &str, selector: Option<&str>) -> Str
 
     // Common content selectors for wikis and article pages
     let default_selectors = [
-        "#mw-content-text",   // MediaWiki
-        "#content",           // Generic content div
-        "article",            // HTML5 article element
-        "main",               // HTML5 main element
-        ".moin-content",      // MoinMoin wiki
+        "#mw-content-text", // MediaWiki
+        "#content",         // Generic content div
+        "article",          // HTML5 article element
+        "main",             // HTML5 main element
+        ".moin-content",    // MoinMoin wiki
     ];
 
     let all_selectors: Vec<&str> = custom_selectors
@@ -57,13 +57,11 @@ pub fn html_to_markdown_with_selector(html: &str, selector: Option<&str>) -> Str
     if let Ok(body_sel) = Selector::parse("body") {
         if let Some(body) = document.select(&body_sel).next() {
             let inner = body.inner_html();
-            return html2text::from_read(inner.as_bytes(), 120)
-                .unwrap_or_else(|_| inner);
+            return html2text::from_read(inner.as_bytes(), 120).unwrap_or_else(|_| inner);
         }
     }
 
-    html2text::from_read(html.as_bytes(), 120)
-        .unwrap_or_else(|_| html.to_string())
+    html2text::from_read(html.as_bytes(), 120).unwrap_or_else(|_| html.to_string())
 }
 
 /// Fetch a URL and return its content as readable text.
@@ -77,10 +75,7 @@ impl WebFetchTool {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
-            .user_agent(format!(
-                "nano-assistant/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("nano-assistant/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -205,9 +200,7 @@ impl Tool for WebFetchTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Binary content type not supported: {content_type}"
-                )),
+                error: Some(format!("Binary content type not supported: {content_type}")),
             });
         }
 

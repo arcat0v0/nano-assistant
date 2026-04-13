@@ -25,10 +25,7 @@ impl WebSearchTool {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .user_agent(format!(
-                "nano-assistant/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("nano-assistant/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -307,7 +304,10 @@ mod tests {
 
     #[test]
     fn url_decode_handles_common_encodings() {
-        assert_eq!(url_decode("https%3A%2F%2Fexample.com"), "https://example.com");
+        assert_eq!(
+            url_decode("https%3A%2F%2Fexample.com"),
+            "https://example.com"
+        );
         assert_eq!(url_decode("hello+world"), "hello world");
         assert_eq!(url_decode("no%20encoding"), "no encoding");
     }

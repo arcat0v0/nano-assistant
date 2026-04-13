@@ -247,12 +247,30 @@ fn build_self_management_section() -> String {
     let memory_path = crate::platform::current_platform().memory_md_path();
     prompt.push_str(&format!("Your memory file: {}\n", memory_path.display()));
     prompt.push_str("Read and edit to persist info across sessions.\n");
+    prompt.push_str(
+        "After successfully completing meaningful system work, proactively write durable facts to memory so they can be reused later.\n",
+    );
+    prompt.push_str(
+        "Persist completed infrastructure facts such as installed packages, enabled services, configured ports, deployed runtimes, data paths, and chosen operational conventions.\n",
+    );
+    prompt.push_str(
+        "Do not store secrets, API keys, tokens, passwords, or transient command output in memory.\n",
+    );
 
     prompt
 }
 
 fn build_command_execution_section() -> String {
     let mut prompt = String::from("## Command Execution\n\n");
+    prompt.push_str(
+        "Execution comes before narration: for operational tasks, perform the work first, then report the result.\n",
+    );
+    prompt.push_str(
+        "Do not stop at a plan or checklist unless the user explicitly asked for a plan, approval gate, or dry run.\n",
+    );
+    prompt.push_str(
+        "For multi-step tasks, keep acting until the requested end state is reached or a real blocker appears.\n",
+    );
     prompt.push_str("Prefer non-interactive flags over pty_shell:\n");
     prompt.push_str("- `apt install -y`, `pacman --noconfirm`\n");
     prompt.push_str("- `yes | command`, `--batch`, `--non-interactive`\n");
@@ -263,6 +281,9 @@ fn build_command_execution_section() -> String {
     prompt.push_str(
         "On Windows, pty_shell uses interactive stdin/stdout pipes. It works for prompt/response \
          flows, but full-screen terminal UIs may not behave correctly.\n",
+    );
+    prompt.push_str(
+        "Default final reporting style: brief, steward-like, and outcome-focused. Lead with what changed, current status, and any next action. Avoid long narratives unless the user asks for detail.\n",
     );
     prompt
 }
@@ -599,6 +620,8 @@ mod tests {
         assert!(prompt.contains("### Memory Management"));
         assert!(prompt.contains("config.toml"));
         assert!(prompt.contains("MEMORY.md"));
+        assert!(prompt.contains("After successfully completing meaningful system work"));
+        assert!(prompt.contains("Do not store secrets, API keys, tokens, passwords"));
     }
 
     #[test]
@@ -668,6 +691,26 @@ mod tests {
         let prompt = SystemPromptBuilder::build(&ctx);
         assert!(prompt.contains("On Windows, pty_shell uses interactive stdin/stdout pipes"));
         assert!(prompt.contains("full-screen terminal UIs may not behave correctly"));
+    }
+
+    #[test]
+    fn prompt_command_execution_enforces_execution_first_and_brief_reporting() {
+        let ctx = PromptContext {
+            tools: &[],
+            tool_specs: &[],
+            native_tool_calling: false,
+            dispatcher_instructions: "",
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        };
+        let prompt = SystemPromptBuilder::build(&ctx);
+        assert!(prompt.contains("Execution comes before narration"));
+        assert!(
+            prompt.contains("Do not stop at a plan or checklist unless the user explicitly asked")
+        );
+        assert!(prompt
+            .contains("Default final reporting style: brief, steward-like, and outcome-focused"));
     }
 
     #[test]

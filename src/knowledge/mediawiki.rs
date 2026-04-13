@@ -20,10 +20,7 @@ impl MediaWikiSource {
     pub fn new(config: &KnowledgeSourceConfig) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(format!(
-                "nano-assistant/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("nano-assistant/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -115,10 +112,7 @@ fn wikitext_to_text(wikitext: &str) -> String {
         // Convert headings: ===Foo=== → ### Foo
         if trimmed.starts_with("==") && trimmed.ends_with("==") {
             let level = trimmed.chars().take_while(|c| *c == '=').count();
-            let inner = trimmed
-                .trim_start_matches('=')
-                .trim_end_matches('=')
-                .trim();
+            let inner = trimmed.trim_start_matches('=').trim_end_matches('=').trim();
             let prefix = "#".repeat(level.min(6));
             output.push_str(&format!("{prefix} {inner}\n"));
             continue;
@@ -182,7 +176,9 @@ fn convert_inline_markup(line: &str) -> String {
 fn extract_section(wikitext: &str, section_index: &str, sections: &[MwSection]) -> String {
     // Find the target section and the next section at the same or higher level
     let target = sections.iter().find(|s| s.index == section_index);
-    let target_level = target.map(|s| s.level.parse::<usize>().unwrap_or(2)).unwrap_or(2);
+    let target_level = target
+        .map(|s| s.level.parse::<usize>().unwrap_or(2))
+        .unwrap_or(2);
 
     let target_heading = target.map(|s| s.line.as_str()).unwrap_or("");
 
@@ -278,10 +274,7 @@ impl KnowledgeSource for MediaWikiSource {
                             title: r.title.clone(),
                             snippet,
                             page_id: r.pageid.to_string(),
-                            url: format!(
-                                "{}/index.php?curid={}",
-                                self.base_url, r.pageid
-                            ),
+                            url: format!("{}/index.php?curid={}", self.base_url, r.pageid),
                         }
                     })
                     .collect()
@@ -317,10 +310,7 @@ impl KnowledgeSource for MediaWikiSource {
             .parse
             .ok_or_else(|| anyhow::anyhow!("No parse result returned"))?;
 
-        let wikitext = parse
-            .wikitext
-            .map(|w| w.content)
-            .unwrap_or_default();
+        let wikitext = parse.wikitext.map(|w| w.content).unwrap_or_default();
 
         let section_names: Vec<String> = parse
             .sections

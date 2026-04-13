@@ -22,10 +22,7 @@ impl WebSource {
     pub fn new(config: &KnowledgeSourceConfig) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(format!(
-                "nano-assistant/{}",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(format!("nano-assistant/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| Client::new());
 

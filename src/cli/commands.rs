@@ -573,6 +573,7 @@ mod tests {
     use crate::config::schema::Config;
     use crate::security::SecurityMode;
     use clap::Parser;
+    use serial_test::serial;
 
     fn parse_chat(args: &[&str]) -> CliArgs {
         let mut full = vec!["na", "chat"];
@@ -746,9 +747,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(home_env)]
     async fn load_or_create_memory_md_creates_file() {
         let dir = tempfile::tempdir().unwrap();
         let memory_path = dir.path().join(".config/nano-assistant/MEMORY.md");
+        let saved_home = std::env::var_os("HOME");
 
         std::env::set_var("HOME", dir.path());
         let path = memory_md_path();
@@ -759,10 +762,14 @@ mod tests {
         assert!(memory_path.exists());
         assert!(content.unwrap().contains("# System Information"));
 
-        std::env::remove_var("HOME");
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[tokio::test]
+    #[serial(home_env)]
     async fn memory_md_lifecycle_read_existing_returns_content() {
         let dir = tempfile::tempdir().unwrap();
         let memory_dir = dir.path().join(".config").join("nano-assistant");
@@ -770,10 +777,14 @@ mod tests {
         let memory_path = memory_dir.join("MEMORY.md");
         let test_content = "# System Information\n\nTest content.";
         std::fs::write(&memory_path, &test_content).unwrap();
+        let saved_home = std::env::var_os("HOME");
 
         std::env::set_var("HOME", dir.path());
         let content = load_or_create_memory_md().await;
-        std::env::remove_var("HOME");
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
 
         assert_eq!(content, Some(test_content.to_string()));
     }

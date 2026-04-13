@@ -39,7 +39,10 @@ struct ContentBlock {
 impl AnthropicProvider {
     pub fn new(api_key: Option<&str>) -> Self {
         Self {
-            api_key: api_key.map(str::trim).filter(|k| !k.is_empty()).map(ToString::to_string),
+            api_key: api_key
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(ToString::to_string),
             base_url: "https://api.anthropic.com".to_string(),
             max_tokens: 4096,
         }
@@ -118,7 +121,10 @@ impl Provider for AnthropicProvider {
             model: model.to_string(),
             max_tokens: self.max_tokens,
             system: system_prompt.map(ToString::to_string),
-            messages: vec![AnthropicMessage { role: "user".into(), content: message.to_string() }],
+            messages: vec![AnthropicMessage {
+                role: "user".into(),
+                content: message.to_string(),
+            }],
             temperature,
         };
         self.post(&request).await
@@ -142,15 +148,29 @@ impl Provider for AnthropicProvider {
                 }
                 "tool" => {
                     let text = format!("<tool_result>\n{}\n</tool_result>", msg.content);
-                    let last_is_user = if let Some(m) = anth_messages.last() { m.role == "user" } else { false };
-                    if last_is_user {
-                        anth_messages.last_mut().unwrap().content.push_str(&format!("\n\n{text}"));
+                    let last_is_user = if let Some(m) = anth_messages.last() {
+                        m.role == "user"
                     } else {
-                        anth_messages.push(AnthropicMessage { role: "user".into(), content: text });
+                        false
+                    };
+                    if last_is_user {
+                        anth_messages
+                            .last_mut()
+                            .unwrap()
+                            .content
+                            .push_str(&format!("\n\n{text}"));
+                    } else {
+                        anth_messages.push(AnthropicMessage {
+                            role: "user".into(),
+                            content: text,
+                        });
                     }
                 }
                 _ => {
-                    anth_messages.push(AnthropicMessage { role: msg.role.clone(), content: msg.content.clone() });
+                    anth_messages.push(AnthropicMessage {
+                        role: msg.role.clone(),
+                        content: msg.content.clone(),
+                    });
                 }
             }
         }

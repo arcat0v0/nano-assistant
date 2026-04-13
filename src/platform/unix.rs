@@ -1,6 +1,6 @@
 //! Unix (Linux / macOS) platform implementation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{Platform, PtyProcess};
 
@@ -8,23 +8,43 @@ pub struct UnixPlatform;
 
 impl UnixPlatform {
     fn home_dir(&self) -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from)
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
+    }
+
+    fn expand_home_path(home: Option<&Path>, path: &str) -> PathBuf {
+        if let Some(rest) = path.strip_prefix("~/") {
+            if let Some(home) = home {
+                return home.join(rest);
+            }
+        }
+        PathBuf::from(path)
+    }
+
+    fn config_dir_from_home(home: Option<&Path>) -> PathBuf {
+        home.map(|path| path.join(".config").join("nano-assistant"))
+            .unwrap_or_else(|| std::env::temp_dir().join("nano-assistant"))
+    }
+
+    fn agents_skills_dir_from_home(home: Option<&Path>) -> PathBuf {
+        home.map(|path| path.join(".agents").join("skills"))
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("nano-assistant")
+                    .join(".agents")
+                    .join("skills")
+            })
     }
 }
 
 impl Platform for UnixPlatform {
     fn config_dir(&self) -> PathBuf {
-        if let Some(home) = self.home_dir() {
-            return home.join(".config").join("nano-assistant");
-        }
-        PathBuf::from("~/.config/nano-assistant")
+        Self::config_dir_from_home(self.home_dir().as_deref())
     }
 
     fn agents_skills_dir(&self) -> PathBuf {
-        if let Some(home) = self.home_dir() {
-            return home.join(".agents").join("skills");
-        }
-        PathBuf::from("~/.agents/skills")
+        Self::agents_skills_dir_from_home(self.home_dir().as_deref())
     }
 
     fn shell_command(&self) -> (&'static str, &'static str) {
@@ -32,12 +52,7 @@ impl Platform for UnixPlatform {
     }
 
     fn expand_tilde(&self, path: &str) -> PathBuf {
-        if let Some(rest) = path.strip_prefix("~/") {
-            if let Some(home) = self.home_dir() {
-                return home.join(rest);
-            }
-        }
-        PathBuf::from(path)
+        Self::expand_home_path(self.home_dir().as_deref(), path)
     }
 
     fn spawn_pty(&self, command: &str) -> Result<Box<dyn PtyProcess>, std::io::Error> {
@@ -56,12 +71,19 @@ impl Platform for UnixPlatform {
         // dup the slave fd for stdout and stderr so each Stdio owns its own fd
         let slave_out = unsafe { libc::dup(slave_raw) };
         if slave_out < 0 {
-            unsafe { libc::close(slave_raw); libc::close(master_raw); }
+            unsafe {
+                libc::close(slave_raw);
+                libc::close(master_raw);
+            }
             return Err(std::io::Error::last_os_error());
         }
         let slave_err = unsafe { libc::dup(slave_raw) };
         if slave_err < 0 {
-            unsafe { libc::close(slave_raw); libc::close(slave_out); libc::close(master_raw); }
+            unsafe {
+                libc::close(slave_raw);
+                libc::close(slave_out);
+                libc::close(master_raw);
+            }
             return Err(std::io::Error::last_os_error());
         }
 
@@ -193,6 +215,7 @@ impl PtyProcess for UnixPtyProcess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn config_dir_contains_nano_assistant() {
@@ -223,22 +246,22 @@ mod tests {
     }
 
     #[test]
+    #[serial(home_env)]
     fn expand_tilde_with_home_prefix() {
-        // Guard: ensure HOME is set (parallel tests may unset it).
-        if std::env::var_os("HOME").is_none() {
+        let saved_home = std::env::var_os("HOME");
+        if saved_home.is_none() {
             std::env::set_var("HOME", "/tmp");
         }
         let p = UnixPlatform;
         let expanded = p.expand_tilde("~/Documents/test");
         let s = expanded.to_string_lossy();
-        assert!(
-            s.contains("Documents/test"),
-            "tilde not expanded: {s}"
-        );
-        assert!(
-            !s.starts_with('~'),
-            "tilde should be resolved: {s}"
-        );
+        assert!(s.contains("Documents/test"), "tilde not expanded: {s}");
+        assert!(!s.starts_with('~'), "tilde should be resolved: {s}");
+
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
@@ -256,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(home_env)]
     fn default_methods_derive_from_config_dir() {
         let p = UnixPlatform;
         let config = p.config_dir();
@@ -263,5 +287,30 @@ mod tests {
         assert_eq!(p.memory_md_path(), config.join("MEMORY.md"));
         assert_eq!(p.skills_dir(), config.join("skills"));
         assert_eq!(p.memory_dir(), config.join("memory"));
+    }
+
+    #[test]
+    #[serial(home_env)]
+    fn unix_paths_do_not_fall_back_to_literal_tilde() {
+        let saved_home = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+
+        let p = UnixPlatform;
+        let config_dir = p.config_dir();
+        let skills_dir = p.agents_skills_dir();
+        let expanded = p.expand_tilde("~/Documents/test");
+
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        for path in [config_dir, skills_dir, expanded] {
+            assert!(
+                !path.starts_with("~"),
+                "path should not use a literal tilde fallback: {}",
+                path.display()
+            );
+        }
     }
 }

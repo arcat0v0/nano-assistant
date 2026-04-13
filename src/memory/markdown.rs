@@ -66,7 +66,7 @@ impl MarkdownMemory {
 
         for line in content.lines() {
             if line.starts_with("## ") {
-                        if in_section && !current_key.is_empty() {
+                if in_section && !current_key.is_empty() {
                     entries.push(MemoryEntry {
                         id: current_id.clone(),
                         key: current_key.clone(),
@@ -255,11 +255,7 @@ impl Memory for MarkdownMemory {
         let mut entries = Self::parse_entries(&content);
 
         if let Some(sid) = session_id {
-            entries.retain(|e| {
-                e.session_id
-                    .as_deref()
-                    .is_some_and(|s| s == sid)
-            });
+            entries.retain(|e| e.session_id.as_deref().is_some_and(|s| s == sid));
         }
 
         let query_lower = query.to_lowercase();
@@ -302,8 +298,7 @@ impl Memory for MarkdownMemory {
         let entries = Self::parse_entries(&content);
 
         let original_len = entries.len();
-        let updated_entries: Vec<&MemoryEntry> =
-            entries.iter().filter(|e| e.key != key).collect();
+        let updated_entries: Vec<&MemoryEntry> = entries.iter().filter(|e| e.key != key).collect();
 
         if updated_entries.len() == original_len {
             return Ok(false);
@@ -378,9 +373,14 @@ mod tests {
     #[tokio::test]
     async fn test_add_and_get() {
         let (_tmp, mem) = temp_memory();
-        mem.add("lang", "User prefers Rust", MemoryCategory::Core, Some("s1"))
-            .await
-            .unwrap();
+        mem.add(
+            "lang",
+            "User prefers Rust",
+            MemoryCategory::Core,
+            Some("s1"),
+        )
+        .await
+        .unwrap();
 
         let entry = mem.get("lang").await.unwrap();
         assert!(entry.is_some());
@@ -441,9 +441,14 @@ mod tests {
     #[tokio::test]
     async fn test_query_by_key() {
         let (_tmp, mem) = temp_memory();
-        mem.add("nginx", "How to install nginx", MemoryCategory::Conversation, None)
-            .await
-            .unwrap();
+        mem.add(
+            "nginx",
+            "How to install nginx",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
         mem.add("docker", "Docker setup", MemoryCategory::Conversation, None)
             .await
             .unwrap();
@@ -546,9 +551,14 @@ mod tests {
     #[tokio::test]
     async fn test_file_is_valid_markdown() {
         let (_tmp, mem) = temp_memory();
-        mem.add("nginx", "User asked about nginx", MemoryCategory::Conversation, Some("s1"))
-            .await
-            .unwrap();
+        mem.add(
+            "nginx",
+            "User asked about nginx",
+            MemoryCategory::Conversation,
+            Some("s1"),
+        )
+        .await
+        .unwrap();
 
         let content = fs::read_to_string(&mem.path).await.unwrap();
         assert!(content.starts_with("# Nano-Assistant Memory\n"));
@@ -572,7 +582,10 @@ mod tests {
         .unwrap();
 
         let entry = mem.get("note").await.unwrap().unwrap();
-        assert_eq!(entry.category, MemoryCategory::Custom("project".to_string()));
+        assert_eq!(
+            entry.category,
+            MemoryCategory::Custom("project".to_string())
+        );
     }
 
     #[tokio::test]

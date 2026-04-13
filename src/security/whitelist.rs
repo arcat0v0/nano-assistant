@@ -6,7 +6,9 @@ pub fn check_whitelist(command: &str, whitelist: &[String]) -> SecurityDecision 
         return SecurityDecision::Deny("whitelist is empty — no commands allowed".into());
     }
 
-    let matched = whitelist.iter().any(|pattern| match_command(pattern, command));
+    let matched = whitelist
+        .iter()
+        .any(|pattern| match_command(pattern, command));
 
     if matched {
         SecurityDecision::Allow
@@ -101,8 +103,14 @@ mod tests {
     #[test]
     fn wildcard_in_middle() {
         assert!(match_command("systemctl * nginx", "systemctl status nginx"));
-        assert!(match_command("systemctl * nginx", "systemctl restart nginx"));
-        assert!(!match_command("systemctl * nginx", "systemctl status apache2"));
+        assert!(match_command(
+            "systemctl * nginx",
+            "systemctl restart nginx"
+        ));
+        assert!(!match_command(
+            "systemctl * nginx",
+            "systemctl status apache2"
+        ));
     }
 
     #[test]
@@ -113,8 +121,14 @@ mod tests {
 
     #[test]
     fn glob_token_matching() {
-        assert!(match_command("systemctl status *", "systemctl status nginx"));
-        assert!(match_command("systemctl status *", "systemctl status mysql"));
+        assert!(match_command(
+            "systemctl status *",
+            "systemctl status nginx"
+        ));
+        assert!(match_command(
+            "systemctl status *",
+            "systemctl status mysql"
+        ));
         assert!(match_command("cat /etc/*", "cat /etc/hosts"));
         assert!(match_command("cat /etc/*", "cat /etc/passwd"));
         assert!(!match_command("cat /etc/*", "cat /var/log/syslog"));
@@ -130,13 +144,19 @@ mod tests {
         let wl = vec!["ls".into(), "docker *".into()];
         assert_eq!(check_whitelist("ls", &wl), SecurityDecision::Allow);
         assert_eq!(check_whitelist("docker ps", &wl), SecurityDecision::Allow);
-        assert_eq!(check_whitelist("docker run hello", &wl), SecurityDecision::Allow);
+        assert_eq!(
+            check_whitelist("docker run hello", &wl),
+            SecurityDecision::Allow
+        );
     }
 
     #[test]
     fn whitelist_check_denies_non_matching() {
         let wl = vec!["ls".into()];
-        assert!(matches!(check_whitelist("rm", &wl), SecurityDecision::Deny(_)));
+        assert!(matches!(
+            check_whitelist("rm", &wl),
+            SecurityDecision::Deny(_)
+        ));
     }
 
     #[test]

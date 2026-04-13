@@ -19,12 +19,10 @@ impl WindowsPlatform {
     }
 
     fn appdata_dir(&self) -> Option<PathBuf> {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .or_else(|| {
-                self.home_dir()
-                    .map(|home| home.join("AppData").join("Roaming"))
-            })
+        std::env::var_os("APPDATA").map(PathBuf::from).or_else(|| {
+            self.home_dir()
+                .map(|home| home.join("AppData").join("Roaming"))
+        })
     }
 
     fn expand_home_path(home: Option<&Path>, path: &str) -> PathBuf {
@@ -196,9 +194,7 @@ mod tests {
         let dir = p.config_dir();
         let s = dir.to_string_lossy();
         assert!(
-            s.contains("AppData")
-                && s.contains("Roaming")
-                && s.ends_with("nano-assistant"),
+            s.contains("AppData") && s.contains("Roaming") && s.ends_with("nano-assistant"),
             "unexpected config_dir: {s}"
         );
     }
@@ -248,10 +244,7 @@ mod tests {
         let second = proc.read().await.unwrap();
         assert!(second.contains("Hello nano"));
 
-        let status = proc
-            .wait(std::time::Duration::from_secs(1))
-            .await
-            .unwrap();
+        let status = proc.wait(std::time::Duration::from_secs(1)).await.unwrap();
         assert_eq!(status, Some(0));
     }
 }

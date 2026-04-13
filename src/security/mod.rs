@@ -100,7 +100,10 @@ impl SecurityManager {
         }
     }
 
-    pub fn from_config_with_override(config: &SecurityConfig, cli_mode: Option<SecurityMode>) -> Self {
+    pub fn from_config_with_override(
+        config: &SecurityConfig,
+        cli_mode: Option<SecurityMode>,
+    ) -> Self {
         let mode = cli_mode.unwrap_or_else(|| config.mode.parse().unwrap_or_default());
         Self {
             mode,
@@ -118,7 +121,9 @@ impl SecurityManager {
     }
 
     fn extract_command(args: &serde_json::Value) -> Option<String> {
-        args.get("command").and_then(|v| v.as_str()).map(String::from)
+        args.get("command")
+            .and_then(|v| v.as_str())
+            .map(String::from)
     }
 
     pub fn check(&self, args: &serde_json::Value) -> SecurityDecision {
@@ -128,9 +133,7 @@ impl SecurityManager {
             SecurityMode::Whitelist => {
                 let command = match Self::extract_command(args) {
                     Some(cmd) => cmd,
-                    None => {
-                        return SecurityDecision::Deny("no command found in args".into())
-                    }
+                    None => return SecurityDecision::Deny("no command found in args".into()),
                 };
                 whitelist::check_whitelist(&command, &self.whitelist)
             }
@@ -164,7 +167,10 @@ pub struct SecureTool {
 
 impl SecureTool {
     pub fn new(tool: Box<dyn Tool>, manager: Arc<SecurityManager>) -> Self {
-        Self { inner: tool, manager }
+        Self {
+            inner: tool,
+            manager,
+        }
     }
 
     pub fn inner(&self) -> &dyn Tool {
@@ -204,10 +210,22 @@ mod tests {
 
     #[test]
     fn mode_from_str_valid() {
-        assert_eq!("direct".parse::<SecurityMode>().unwrap(), SecurityMode::Direct);
-        assert_eq!("confirm".parse::<SecurityMode>().unwrap(), SecurityMode::Confirm);
-        assert_eq!("whitelist".parse::<SecurityMode>().unwrap(), SecurityMode::Whitelist);
-        assert_eq!("DIRECT".parse::<SecurityMode>().unwrap(), SecurityMode::Direct);
+        assert_eq!(
+            "direct".parse::<SecurityMode>().unwrap(),
+            SecurityMode::Direct
+        );
+        assert_eq!(
+            "confirm".parse::<SecurityMode>().unwrap(),
+            SecurityMode::Confirm
+        );
+        assert_eq!(
+            "whitelist".parse::<SecurityMode>().unwrap(),
+            SecurityMode::Whitelist
+        );
+        assert_eq!(
+            "DIRECT".parse::<SecurityMode>().unwrap(),
+            SecurityMode::Direct
+        );
     }
 
     #[test]
@@ -252,8 +270,7 @@ mod tests {
 
     #[test]
     fn check_whitelist_denies_non_matching() {
-        let mgr = SecurityManager::new(SecurityMode::Whitelist)
-            .with_whitelist(vec!["ls".into()]);
+        let mgr = SecurityManager::new(SecurityMode::Whitelist).with_whitelist(vec!["ls".into()]);
         let args = serde_json::json!({"command": "rm -rf /"});
         assert!(matches!(mgr.check(&args), SecurityDecision::Deny(_)));
     }
@@ -306,8 +323,8 @@ mod tests {
 
     #[tokio::test]
     async fn whitelist_mode_blocks_denied_command() {
-        let mgr = SecurityManager::new(SecurityMode::Whitelist)
-            .with_whitelist(vec!["echo *".into()]);
+        let mgr =
+            SecurityManager::new(SecurityMode::Whitelist).with_whitelist(vec!["echo *".into()]);
         let tool = crate::tools::shell::ShellTool::new();
         let result = mgr
             .execute(&tool, serde_json::json!({"command": "rm -rf /"}))
@@ -319,8 +336,8 @@ mod tests {
 
     #[tokio::test]
     async fn whitelist_mode_allows_matching_command() {
-        let mgr = SecurityManager::new(SecurityMode::Whitelist)
-            .with_whitelist(vec!["echo *".into()]);
+        let mgr =
+            SecurityManager::new(SecurityMode::Whitelist).with_whitelist(vec!["echo *".into()]);
         let tool = crate::tools::shell::ShellTool::new();
         let result = mgr
             .execute(&tool, serde_json::json!({"command": "echo safe"}))
@@ -349,8 +366,7 @@ mod tests {
     #[tokio::test]
     async fn secure_tool_whitelist_blocks() {
         let mgr = Arc::new(
-            SecurityManager::new(SecurityMode::Whitelist)
-                .with_whitelist(vec!["echo *".into()]),
+            SecurityManager::new(SecurityMode::Whitelist).with_whitelist(vec!["echo *".into()]),
         );
         let inner: Box<dyn Tool> = Box::new(crate::tools::shell::ShellTool::new());
         let secure = SecureTool::new(inner, mgr);
@@ -372,8 +388,7 @@ mod tests {
             }
         }
 
-        let mgr = SecurityManager::new(SecurityMode::Confirm)
-            .with_confirmer(Arc::new(DenyAll));
+        let mgr = SecurityManager::new(SecurityMode::Confirm).with_confirmer(Arc::new(DenyAll));
         let tool = crate::tools::shell::ShellTool::new();
         let result = mgr
             .execute(&tool, serde_json::json!({"command": "echo hello"}))
@@ -393,8 +408,7 @@ mod tests {
             }
         }
 
-        let mgr = SecurityManager::new(SecurityMode::Confirm)
-            .with_confirmer(Arc::new(AllowAll));
+        let mgr = SecurityManager::new(SecurityMode::Confirm).with_confirmer(Arc::new(AllowAll));
         let tool = crate::tools::shell::ShellTool::new();
         let result = mgr
             .execute(&tool, serde_json::json!({"command": "echo yes"}))

@@ -47,7 +47,12 @@ impl ResponseMessage {
 }
 
 impl CompatibleProvider {
-    pub fn new(name: &str, default_base_url: &str, api_key: Option<&str>, custom_url: Option<&str>) -> Self {
+    pub fn new(
+        name: &str,
+        default_base_url: &str,
+        api_key: Option<&str>,
+        custom_url: Option<&str>,
+    ) -> Self {
         let base_url = custom_url
             .map(|u| u.trim_end_matches('/').to_string())
             .unwrap_or_else(|| default_base_url.trim_end_matches('/').to_string());
@@ -64,7 +69,11 @@ impl CompatibleProvider {
             })
             .filter(|k| !k.is_empty());
 
-        Self { name: name.to_string(), base_url, api_key: key }
+        Self {
+            name: name.to_string(),
+            base_url,
+            api_key: key,
+        }
     }
 
     fn client(&self) -> reqwest::Client {
@@ -77,8 +86,16 @@ impl CompatibleProvider {
 
     fn chat_completions_url(&self) -> String {
         let has_endpoint = reqwest::Url::parse(&self.base_url)
-            .map(|url| url.path().trim_end_matches('/').ends_with("/chat/completions"))
-            .unwrap_or_else(|_| self.base_url.trim_end_matches('/').ends_with("/chat/completions"));
+            .map(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            })
+            .unwrap_or_else(|_| {
+                self.base_url
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            });
 
         if has_endpoint {
             self.base_url.clone()
@@ -89,7 +106,10 @@ impl CompatibleProvider {
 
     async fn post(&self, request: &ChatRequest) -> anyhow::Result<String> {
         let key = self.api_key.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("{} API key not set. Set the appropriate env var or edit config.toml.", self.name)
+            anyhow::anyhow!(
+                "{} API key not set. Set the appropriate env var or edit config.toml.",
+                self.name
+            )
         })?;
 
         let url = self.chat_completions_url();
@@ -128,11 +148,21 @@ impl Provider for CompatibleProvider {
     ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
-            messages.push(OpenAiMessage { role: "system".into(), content: sys.to_string() });
+            messages.push(OpenAiMessage {
+                role: "system".into(),
+                content: sys.to_string(),
+            });
         }
-        messages.push(OpenAiMessage { role: "user".into(), content: message.to_string() });
+        messages.push(OpenAiMessage {
+            role: "user".into(),
+            content: message.to_string(),
+        });
 
-        let request = ChatRequest { model: model.to_string(), messages, temperature };
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+        };
         self.post(&request).await
     }
 
@@ -144,10 +174,17 @@ impl Provider for CompatibleProvider {
     ) -> anyhow::Result<String> {
         let api_messages: Vec<OpenAiMessage> = messages
             .iter()
-            .map(|m| OpenAiMessage { role: m.role.clone(), content: m.content.clone() })
+            .map(|m| OpenAiMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
             .collect();
 
-        let request = ChatRequest { model: model.to_string(), messages: api_messages, temperature };
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+        };
         self.post(&request).await
     }
 }

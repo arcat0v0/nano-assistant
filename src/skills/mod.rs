@@ -14,12 +14,30 @@ pub mod testing;
 const NA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("database-admin", include_str!("../../skills/database-admin/SKILL.md")),
-    ("server-security", include_str!("../../skills/server-security/SKILL.md")),
-    ("container-orchestration", include_str!("../../skills/container-orchestration/SKILL.md")),
-    ("arch-wiki", include_str!("../../skills/arch-wiki/SKILL.toml")),
-    ("debian-wiki", include_str!("../../skills/debian-wiki/SKILL.toml")),
-    ("redhat-wiki", include_str!("../../skills/redhat-wiki/SKILL.toml")),
+    (
+        "database-admin",
+        include_str!("../../skills/database-admin/SKILL.md"),
+    ),
+    (
+        "server-security",
+        include_str!("../../skills/server-security/SKILL.md"),
+    ),
+    (
+        "container-orchestration",
+        include_str!("../../skills/container-orchestration/SKILL.md"),
+    ),
+    (
+        "arch-wiki",
+        include_str!("../../skills/arch-wiki/SKILL.toml"),
+    ),
+    (
+        "debian-wiki",
+        include_str!("../../skills/debian-wiki/SKILL.toml"),
+    ),
+    (
+        "redhat-wiki",
+        include_str!("../../skills/redhat-wiki/SKILL.toml"),
+    ),
 ];
 
 // ─── ClawhHub constants ────────────────────────────────────────────────
@@ -1209,6 +1227,7 @@ pub fn parse_knowledge_source_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     #[test]
@@ -1437,10 +1456,8 @@ command = "echo hello"
 
     #[test]
     fn builtin_knowledge_sources_include_linux_wikis() {
-        let names: std::collections::HashSet<String> = load_builtin_skills()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let names: std::collections::HashSet<String> =
+            load_builtin_skills().into_iter().map(|s| s.name).collect();
 
         assert!(names.contains("arch-wiki"));
         assert!(names.contains("debian-wiki"));
@@ -1481,15 +1498,21 @@ command = "echo hello"
     }
 
     #[test]
+    #[serial(home_env)]
     fn init_skills_creates_readme() {
         let dir = tempfile::tempdir().unwrap();
         // Override skills_dir for test by using a custom config
         let skills_path = dir.path().join("skills");
+        let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", dir.path());
         // We can't easily override skills_dir() in tests since it reads HOME env var
         // but we can test the function creates the right structure
         let _ = std::fs::create_dir_all(&skills_path);
         // Just verify the function exists and the dir logic is correct
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
         assert!(true);
     }
 
@@ -1508,11 +1531,7 @@ command = "echo hello"
     fn load_skills_from_directory_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("nonexistent");
-        let skills = load_skills_from_directory(
-            &fake,
-            false,
-            SkillSource::UserDir(fake.clone()),
-        );
+        let skills = load_skills_from_directory(&fake, false, SkillSource::UserDir(fake.clone()));
         assert!(skills.is_empty());
     }
 

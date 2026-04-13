@@ -63,7 +63,10 @@ impl SystemInfo {
         md.push('\n');
 
         md.push_str("## Hardware\n\n");
-        md.push_str(&format!("- **CPU**: {} ({})\n", self.cpu_cores, self.cpu_model));
+        md.push_str(&format!(
+            "- **CPU**: {} ({})\n",
+            self.cpu_cores, self.cpu_model
+        ));
         if !self.gpu_model.is_empty() {
             md.push_str(&format!("- **GPU**: {}\n", self.gpu_model));
         }
@@ -132,7 +135,11 @@ impl SystemInfo {
             let mut tools: Vec<_> = self.installed_tools.iter().collect();
             tools.sort_by_key(|(k, _)| *k);
             for (name, info) in tools {
-                let version = if info.version.is_empty() { "?" } else { &info.version };
+                let version = if info.version.is_empty() {
+                    "?"
+                } else {
+                    &info.version
+                };
                 if info.path.is_empty() {
                     let _ = writeln!(out, "  {}={}", name, version);
                 } else {
@@ -153,42 +160,91 @@ impl SystemInfo {
 /// Tools to detect via `--version`.
 const TOOLS_TO_DETECT: &[&str] = &[
     // Languages & Runtimes
-    "node", "npm", "npx", "pnpm", "yarn", "bun", "bunx", "deno",
-    "python3", "python", "pip", "pip3", "uv", "uvx", "pipx", "conda",
-    "go", "java", "javac",
-    "ruby", "gem",
-    "php", "perl",
-    "rustc", "cargo",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "bunx",
+    "deno",
+    "python3",
+    "python",
+    "pip",
+    "pip3",
+    "uv",
+    "uvx",
+    "pipx",
+    "conda",
+    "go",
+    "java",
+    "javac",
+    "ruby",
+    "gem",
+    "php",
+    "perl",
+    "rustc",
+    "cargo",
     "dotnet",
-    "swift", "clang",
+    "swift",
+    "clang",
     // Package Managers
     "brew",
-    "apt", "dnf", "pacman",
+    "apt",
+    "dnf",
+    "pacman",
     // Databases
-    "postgres", "mysql", "sqlite3",
-    "redis-cli", "mongosh",
+    "postgres",
+    "mysql",
+    "sqlite3",
+    "redis-cli",
+    "mongosh",
     // Container & Orchestration
-    "docker", "docker-compose", "podman",
-    "kubectl", "helm", "nerdctl",
-    "terraform", "ansible",
+    "docker",
+    "docker-compose",
+    "podman",
+    "kubectl",
+    "helm",
+    "nerdctl",
+    "terraform",
+    "ansible",
     // Build Tools
-    "make", "cmake",
-    "gcc", "g++",
+    "make",
+    "cmake",
+    "gcc",
+    "g++",
     "zig",
     // Version Managers
-    "nvm", "pyenv", "volta", "fnm", "rustup", "sdk",
+    "nvm",
+    "pyenv",
+    "volta",
+    "fnm",
+    "rustup",
+    "sdk",
     // CLI Utilities
     "git",
-    "curl", "wget",
-    "jq", "yq",
-    "vim", "nvim", "nano",
-    "tmux", "screen",
+    "curl",
+    "wget",
+    "jq",
+    "yq",
+    "vim",
+    "nvim",
+    "nano",
+    "tmux",
+    "screen",
     "fzf",
-    "bat", "eza", "fd", "rg",
-    "starship", "zoxide",
-    "htop", "btop",
-    "ssh", "rsync",
-    "tar", "zip",
+    "bat",
+    "eza",
+    "fd",
+    "rg",
+    "starship",
+    "zoxide",
+    "htop",
+    "btop",
+    "ssh",
+    "rsync",
+    "tar",
+    "zip",
     "lsof",
     "code",
     // Misc Dev Tools
@@ -366,7 +422,16 @@ pub async fn detect() -> SystemInfo {
     )
     .await;
 
-    let gpu_model = run_cmd("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader", "--no-nvml-init"], "").await;
+    let gpu_model = run_cmd(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name",
+            "--format=csv,noheader",
+            "--no-nvml-init",
+        ],
+        "",
+    )
+    .await;
     let gpu_model = if gpu_model.is_empty() {
         run_shell(
             "lspci 2>/dev/null | grep -i 'vga\\|3d\\|display' | head -1 | sed 's/.*: //'",
@@ -376,7 +441,9 @@ pub async fn detect() -> SystemInfo {
     } else {
         gpu_model
     };
-    let gpu_model = gpu_model.trim_start_matches("VGA compatible controller: ").to_string();
+    let gpu_model = gpu_model
+        .trim_start_matches("VGA compatible controller: ")
+        .to_string();
     let gpu_model = gpu_model.trim_start_matches("3D controller: ").to_string();
 
     let virtualization = tokio::process::Command::new("systemd-detect-virt")
@@ -417,11 +484,8 @@ pub async fn detect() -> SystemInfo {
             .unwrap_or_else(|| "?".to_string())
     };
 
-    let disk_total_gb = run_shell(
-        "df --output=size / 2>/dev/null | tail -1 | tr -d ' '",
-        "?",
-    )
-    .await;
+    let disk_total_gb =
+        run_shell("df --output=size / 2>/dev/null | tail -1 | tr -d ' '", "?").await;
     let disk_total_gb = disk_total_gb
         .parse::<u64>()
         .ok()
@@ -461,22 +525,119 @@ mod tests {
 
     fn sample_system_info() -> SystemInfo {
         let mut tools = HashMap::new();
-        tools.insert("git".to_string(), ToolInfo { version: "git version 2.43.0".to_string(), path: "/usr/bin/git".to_string() });
-        tools.insert("node".to_string(), ToolInfo { version: "v20.10.0".to_string(), path: "/usr/local/bin/node".to_string() });
-        tools.insert("cargo".to_string(), ToolInfo { version: "cargo 1.74.0".to_string(), path: "/home/user/.cargo/bin/cargo".to_string() });
-        tools.insert("python3".to_string(), ToolInfo { version: "Python 3.12.1".to_string(), path: "/usr/bin/python3".to_string() });
-        tools.insert("docker".to_string(), ToolInfo { version: "Docker version 24.0.7".to_string(), path: "/usr/bin/docker".to_string() });
-        tools.insert("go".to_string(), ToolInfo { version: "go version go1.21.5".to_string(), path: "/usr/local/go/bin/go".to_string() });
-        tools.insert("rustc".to_string(), ToolInfo { version: "rustc 1.74.0".to_string(), path: "/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc".to_string() });
-        tools.insert("npm".to_string(), ToolInfo { version: "10.2.3".to_string(), path: "/usr/local/bin/npm".to_string() });
-        tools.insert("pip".to_string(), ToolInfo { version: "pip 23.3.2".to_string(), path: "/home/user/.local/bin/pip".to_string() });
-        tools.insert("ruby".to_string(), ToolInfo { version: "ruby 3.3.0".to_string(), path: "/usr/bin/ruby".to_string() });
-        tools.insert("java".to_string(), ToolInfo { version: "openjdk 21.0.1".to_string(), path: "/usr/bin/java".to_string() });
-        tools.insert("uv".to_string(), ToolInfo { version: "uv 0.1.0".to_string(), path: "/home/user/.local/bin/uv".to_string() });
-        tools.insert("npx".to_string(), ToolInfo { version: "10.2.3".to_string(), path: "/usr/local/bin/npx".to_string() });
-        tools.insert("nvm".to_string(), ToolInfo { version: "0.39.7".to_string(), path: "".to_string() });
-        tools.insert("podman".to_string(), ToolInfo { version: "podman version 4.9.0".to_string(), path: "/usr/bin/podman".to_string() });
-        tools.insert("postgres".to_string(), ToolInfo { version: "psql 16.1".to_string(), path: "/usr/bin/psql".to_string() });
+        tools.insert(
+            "git".to_string(),
+            ToolInfo {
+                version: "git version 2.43.0".to_string(),
+                path: "/usr/bin/git".to_string(),
+            },
+        );
+        tools.insert(
+            "node".to_string(),
+            ToolInfo {
+                version: "v20.10.0".to_string(),
+                path: "/usr/local/bin/node".to_string(),
+            },
+        );
+        tools.insert(
+            "cargo".to_string(),
+            ToolInfo {
+                version: "cargo 1.74.0".to_string(),
+                path: "/home/user/.cargo/bin/cargo".to_string(),
+            },
+        );
+        tools.insert(
+            "python3".to_string(),
+            ToolInfo {
+                version: "Python 3.12.1".to_string(),
+                path: "/usr/bin/python3".to_string(),
+            },
+        );
+        tools.insert(
+            "docker".to_string(),
+            ToolInfo {
+                version: "Docker version 24.0.7".to_string(),
+                path: "/usr/bin/docker".to_string(),
+            },
+        );
+        tools.insert(
+            "go".to_string(),
+            ToolInfo {
+                version: "go version go1.21.5".to_string(),
+                path: "/usr/local/go/bin/go".to_string(),
+            },
+        );
+        tools.insert(
+            "rustc".to_string(),
+            ToolInfo {
+                version: "rustc 1.74.0".to_string(),
+                path: "/home/user/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc"
+                    .to_string(),
+            },
+        );
+        tools.insert(
+            "npm".to_string(),
+            ToolInfo {
+                version: "10.2.3".to_string(),
+                path: "/usr/local/bin/npm".to_string(),
+            },
+        );
+        tools.insert(
+            "pip".to_string(),
+            ToolInfo {
+                version: "pip 23.3.2".to_string(),
+                path: "/home/user/.local/bin/pip".to_string(),
+            },
+        );
+        tools.insert(
+            "ruby".to_string(),
+            ToolInfo {
+                version: "ruby 3.3.0".to_string(),
+                path: "/usr/bin/ruby".to_string(),
+            },
+        );
+        tools.insert(
+            "java".to_string(),
+            ToolInfo {
+                version: "openjdk 21.0.1".to_string(),
+                path: "/usr/bin/java".to_string(),
+            },
+        );
+        tools.insert(
+            "uv".to_string(),
+            ToolInfo {
+                version: "uv 0.1.0".to_string(),
+                path: "/home/user/.local/bin/uv".to_string(),
+            },
+        );
+        tools.insert(
+            "npx".to_string(),
+            ToolInfo {
+                version: "10.2.3".to_string(),
+                path: "/usr/local/bin/npx".to_string(),
+            },
+        );
+        tools.insert(
+            "nvm".to_string(),
+            ToolInfo {
+                version: "0.39.7".to_string(),
+                path: "".to_string(),
+            },
+        );
+        tools.insert(
+            "podman".to_string(),
+            ToolInfo {
+                version: "podman version 4.9.0".to_string(),
+                path: "/usr/bin/podman".to_string(),
+            },
+        );
+        tools.insert(
+            "postgres".to_string(),
+            ToolInfo {
+                version: "psql 16.1".to_string(),
+                path: "/usr/bin/psql".to_string(),
+            },
+        );
 
         SystemInfo {
             os_name: "Ubuntu".to_string(),
@@ -658,7 +819,10 @@ VERSION_ID="24.04""#;
             tools.insert(
                 format!("tool_{i}"),
                 ToolInfo {
-                    version: format!("version_{}_with_a_very_long_string_that_goes_on_and_on_and_on", i),
+                    version: format!(
+                        "version_{}_with_a_very_long_string_that_goes_on_and_on_and_on",
+                        i
+                    ),
                     path: format!("/usr/bin/tool_{}", i),
                 },
             );
@@ -754,7 +918,11 @@ VERSION_ID="24.04""#;
             );
         }
         let prompt = info.format_for_prompt();
-        assert!(prompt.len() <= 2000, "prompt is {} chars, should be ≤2000", prompt.len());
+        assert!(
+            prompt.len() <= 2000,
+            "prompt is {} chars, should be ≤2000",
+            prompt.len()
+        );
     }
 
     #[test]
@@ -772,21 +940,30 @@ VERSION_ID="24.04""#;
         let rt = tokio::runtime::Runtime::new().unwrap();
         let (version, path) = rt.block_on(detect_single_tool("git"));
         if version.is_some() {
-            assert!(path.is_some(), "if version found, path should also be found");
+            assert!(
+                path.is_some(),
+                "if version found, path should also be found"
+            );
         }
     }
 
     #[test]
     fn format_as_markdown_includes_tool_path() {
         let mut tools = HashMap::new();
-        tools.insert("node".to_string(), ToolInfo {
-            version: "20.0.0".to_string(),
-            path: "/usr/local/bin/node".to_string(),
-        });
-        tools.insert("nvm".to_string(), ToolInfo {
-            version: "0.39.0".to_string(),
-            path: "".to_string(),
-        });
+        tools.insert(
+            "node".to_string(),
+            ToolInfo {
+                version: "20.0.0".to_string(),
+                path: "/usr/local/bin/node".to_string(),
+            },
+        );
+        tools.insert(
+            "nvm".to_string(),
+            ToolInfo {
+                version: "0.39.0".to_string(),
+                path: "".to_string(),
+            },
+        );
         let info = SystemInfo {
             os_name: "Linux".to_string(),
             os_version: "1.0".to_string(),
@@ -809,11 +986,18 @@ VERSION_ID="24.04""#;
         };
         let md = info.format_as_markdown();
         assert!(md.contains("/usr/local/bin/node"), "should show tool path");
-        assert!(md.contains("- **nvm**: 0.39.0"), "should show version without path when path is empty");
+        assert!(
+            md.contains("- **nvm**: 0.39.0"),
+            "should show version without path when path is empty"
+        );
     }
 
     #[test]
     fn detect_installed_tools_has_many_entries() {
-        assert!(TOOLS_TO_DETECT.len() >= 40, "should detect at least 40 tools, got {}", TOOLS_TO_DETECT.len());
+        assert!(
+            TOOLS_TO_DETECT.len() >= 40,
+            "should detect at least 40 tools, got {}",
+            TOOLS_TO_DETECT.len()
+        );
     }
 }

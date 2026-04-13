@@ -1,8 +1,8 @@
-pub mod types;
 pub mod mediawiki;
 pub mod moinmoin;
-pub mod web;
 pub mod tool;
+pub mod types;
+pub mod web;
 
 use async_trait::async_trait;
 use std::sync::Arc;

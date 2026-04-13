@@ -121,7 +121,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_skill_tool(name: &str, kind: &str, command: &str, args: HashMap<String, String>) -> SkillTool {
+    fn make_skill_tool(
+        name: &str,
+        kind: &str,
+        command: &str,
+        args: HashMap<String, String>,
+    ) -> SkillTool {
         SkillTool {
             name: name.to_string(),
             description: format!("{} tool", name),
@@ -142,12 +147,14 @@ mod tests {
     fn url_parameter_substitution() {
         let mut args = HashMap::new();
         args.insert("user".to_string(), "GitHub username".to_string());
-        let tool = make_skill_tool("profile", "http", "https://api.example.com/users/{{user}}", args);
-        let ht = SkillHttpTool::new("demo", &tool);
-        assert_eq!(
-            ht.url_template(),
-            "https://api.example.com/users/{{user}}"
+        let tool = make_skill_tool(
+            "profile",
+            "http",
+            "https://api.example.com/users/{{user}}",
+            args,
         );
+        let ht = SkillHttpTool::new("demo", &tool);
+        assert_eq!(ht.url_template(), "https://api.example.com/users/{{user}}");
     }
 
     #[test]
@@ -168,16 +175,18 @@ mod tests {
     fn parameters_schema_includes_args() {
         let mut args = HashMap::new();
         args.insert("query".to_string(), "Search query".to_string());
-        let tool = make_skill_tool("search", "http", "https://api.example.com/search?q={{query}}", args);
+        let tool = make_skill_tool(
+            "search",
+            "http",
+            "https://api.example.com/search?q={{query}}",
+            args,
+        );
         let ht = SkillHttpTool::new("demo", &tool);
         let schema = ht.parameters_schema();
 
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["query"]["type"], "string");
-        assert_eq!(
-            schema["properties"]["query"]["description"],
-            "Search query"
-        );
+        assert_eq!(schema["properties"]["query"]["description"], "Search query");
     }
 
     #[test]

@@ -44,7 +44,7 @@ struct ResponseMessage {
 }
 
 fn base64url_encode(data: &[u8]) -> String {
-    use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
     URL_SAFE_NO_PAD.encode(data)
 }
 
@@ -82,7 +82,10 @@ impl GlmProvider {
 
         let header_json = r#"{"alg":"HS256","typ":"JWT","sign_type":"SIGN"}"#;
         let header_b64 = base64url_encode(header_json.as_bytes());
-        let payload_json = format!(r#"{{"api_key":"{}","exp":{},"timestamp":{}}}"#, self.api_key_id, exp_ms, now_ms);
+        let payload_json = format!(
+            r#"{{"api_key":"{}","exp":{},"timestamp":{}}}"#,
+            self.api_key_id, exp_ms, now_ms
+        );
         let payload_b64 = base64url_encode(payload_json.as_bytes());
         let signing_input = format!("{header_b64}.{payload_b64}");
 
@@ -145,11 +148,21 @@ impl Provider for GlmProvider {
     ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
-            messages.push(GlmMessage { role: "system".into(), content: sys.to_string() });
+            messages.push(GlmMessage {
+                role: "system".into(),
+                content: sys.to_string(),
+            });
         }
-        messages.push(GlmMessage { role: "user".into(), content: message.to_string() });
+        messages.push(GlmMessage {
+            role: "user".into(),
+            content: message.to_string(),
+        });
 
-        let request = ChatRequest { model: model.to_string(), messages, temperature };
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+        };
         self.post(&request).await
     }
 
@@ -161,10 +174,17 @@ impl Provider for GlmProvider {
     ) -> anyhow::Result<String> {
         let api_messages: Vec<GlmMessage> = messages
             .iter()
-            .map(|m| GlmMessage { role: m.role.clone(), content: m.content.clone() })
+            .map(|m| GlmMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
             .collect();
 
-        let request = ChatRequest { model: model.to_string(), messages: api_messages, temperature };
+        let request = ChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+        };
         self.post(&request).await
     }
 }

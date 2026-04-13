@@ -136,9 +136,9 @@ impl Tool for PtyShellTool {
 
         // Spawn PTY
         let platform = crate::platform::current_platform();
-        let mut pty = platform.spawn_pty(command).map_err(|e| {
-            anyhow::anyhow!("Failed to spawn PTY: {}", e)
-        })?;
+        let mut pty = platform
+            .spawn_pty(command)
+            .map_err(|e| anyhow::anyhow!("Failed to spawn PTY: {}", e))?;
 
         let deadline = Instant::now() + overall_timeout;
         let mut collected = String::new();
@@ -270,7 +270,11 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(result.output.contains("hello_pty"), "output: {}", result.output);
+        assert!(
+            result.output.contains("hello_pty"),
+            "output: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
