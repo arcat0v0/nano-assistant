@@ -75,6 +75,10 @@ mod tests {
 
     #[test]
     fn expand_tilde_with_home_prefix() {
+        // Guard: ensure HOME is set (parallel tests may unset it).
+        if std::env::var_os("HOME").is_none() {
+            std::env::set_var("HOME", "/tmp");
+        }
         let p = UnixPlatform;
         let expanded = p.expand_tilde("~/Documents/test");
         let s = expanded.to_string_lossy();
