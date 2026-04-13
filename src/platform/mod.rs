@@ -8,6 +8,19 @@ mod windows;
 
 use std::path::PathBuf;
 
+/// A spawned PTY process.
+#[async_trait::async_trait]
+pub trait PtyProcess: Send {
+    /// Read available output from PTY. Empty string = EOF.
+    async fn read(&mut self) -> Result<String, std::io::Error>;
+    /// Write data to PTY stdin.
+    async fn write(&mut self, data: &str) -> Result<(), std::io::Error>;
+    /// Connect PTY directly to user's terminal for secure input (passwords).
+    async fn passthrough_stdin(&mut self) -> Result<(), std::io::Error>;
+    /// Wait for process with timeout. Returns exit code.
+    async fn wait(&mut self, timeout: std::time::Duration) -> Result<Option<i32>, std::io::Error>;
+}
+
 /// Platform-specific operations: config paths, shell commands, path expansion.
 pub trait Platform: Send + Sync {
     /// Root configuration directory (e.g. `~/.config/nano-assistant/`).
@@ -42,6 +55,9 @@ pub trait Platform: Send + Sync {
 
     /// Expand a leading `~` in a path to the user's home directory.
     fn expand_tilde(&self, path: &str) -> PathBuf;
+
+    /// Spawn an interactive command in a PTY.
+    fn spawn_pty(&self, command: &str) -> Result<Box<dyn PtyProcess>, std::io::Error>;
 }
 
 /// Return the platform implementation for the current OS.

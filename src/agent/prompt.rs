@@ -44,7 +44,9 @@ impl SystemPromptBuilder {
 
         let self_management = build_self_management_section();
 
-        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety, &self_management] {
+        let command_exec = build_command_execution_section();
+
+        for section in [&datetime, &system_info, &tools, &skills, &deferred, &protocol, &safety, &self_management, &command_exec] {
             if section.trim().is_empty() {
                 continue;
             }
@@ -184,6 +186,16 @@ fn build_self_management_section() -> String {
     prompt.push_str(&format!("Your memory file: {}\n", memory_path.display()));
     prompt.push_str("Read and edit to persist info across sessions.\n");
 
+    prompt
+}
+
+fn build_command_execution_section() -> String {
+    let mut prompt = String::from("## Command Execution\n\n");
+    prompt.push_str("Prefer non-interactive flags over pty_shell:\n");
+    prompt.push_str("- `apt install -y`, `pacman --noconfirm`\n");
+    prompt.push_str("- `yes | command`, `--batch`, `--non-interactive`\n");
+    prompt.push_str("Only use `pty_shell` when no non-interactive option exists.\n");
+    prompt.push_str("For passwords, use `__USER_INPUT__` — collected from terminal, never sent to AI.\n");
     prompt
 }
 

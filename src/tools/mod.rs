@@ -9,6 +9,7 @@ pub mod skill_tool;
 pub mod skill_http;
 pub mod web_fetch;
 pub mod web_search;
+pub mod pty_shell;
 
 pub use traits::{Tool, ToolResult, ToolSpec};
 
@@ -23,5 +24,6 @@ pub fn default_tools() -> Vec<Box<dyn Tool>> {
         Box::new(content_search::ContentSearchTool::new()),
         Box::new(web_fetch::WebFetchTool::new()),
         Box::new(web_search::WebSearchTool::new()),
+        Box::new(pty_shell::PtyShellTool::new()),
     ]
 }
