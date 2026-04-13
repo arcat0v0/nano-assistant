@@ -316,6 +316,8 @@ mod tests {
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            is_builtin: false,
+            source: None,
         }];
         let ctx = PromptContext {
             tools: &[],

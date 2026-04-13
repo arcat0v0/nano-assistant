@@ -11,6 +11,14 @@ use zip::ZipArchive;
 pub mod audit;
 pub mod testing;
 
+const NA_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const BUILTIN_SKILLS: &[(&str, &str)] = &[
+    ("database-admin", include_str!("../../skills/database-admin/SKILL.md")),
+    ("server-security", include_str!("../../skills/server-security/SKILL.md")),
+    ("container-orchestration", include_str!("../../skills/container-orchestration/SKILL.md")),
+];
+
 // ─── ClawhHub constants ────────────────────────────────────────────────
 pub const CLAWHUB_DOMAIN: &str = "clawhub.ai";
 pub const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
@@ -35,6 +43,10 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    #[serde(skip)]
+    pub is_builtin: bool,
+    #[serde(skip)]
+    pub source: Option<SkillSource>,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -81,6 +93,25 @@ pub struct SkillMarkdownMeta {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkillSource {
+    Builtin,
+    UserDir(PathBuf),
+    SkillsSh,
+    ExtraPath(PathBuf),
+}
+
+impl std::fmt::Display for SkillSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkillSource::Builtin => write!(f, "builtin"),
+            SkillSource::UserDir(p) => write!(f, "{}", p.display()),
+            SkillSource::SkillsSh => write!(f, "~/.agents/skills/"),
+            SkillSource::ExtraPath(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
 fn default_version() -> String {
     "0.1.0".to_string()
 }
@@ -114,12 +145,43 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
 
 // ─── Loading ──────────────────────────────────────────────────────────
 
+/// Load the builtin skills that are embedded in the binary via include_str!().
+fn load_builtin_skills() -> Vec<Skill> {
+    let mut skills = Vec::new();
+    for (name, content) in BUILTIN_SKILLS {
+        let parsed = parse_skill_markdown(content);
+        skills.push(Skill {
+            name: parsed.meta.name.unwrap_or_else(|| name.to_string()),
+            description: parsed
+                .meta
+                .description
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| extract_description(&parsed.body)),
+            version: NA_VERSION.to_string(),
+            author: parsed.meta.author,
+            tags: parsed.meta.tags,
+            tools: Vec::new(),
+            prompts: vec![parsed.body],
+            location: None,
+            is_builtin: true,
+            source: Some(SkillSource::Builtin),
+        });
+    }
+    skills
+}
+
 /// Public entry point: load all skills from configured directories.
-/// Scans in priority order:
+/// Builtin skills are loaded first and protected from being overridden.
+/// Then scans filesystem in priority order:
 /// 1. Primary skills dir (~/.config/nano-assistant/skills/ or custom)
 /// 2. ~/.agents/skills/ (hardcoded, for skills.sh compatibility)
 /// 3. Any extra_paths from config
 pub fn load_skills(config: &crate::config::SkillsConfig) -> Vec<Skill> {
+    // 1. Load builtins first
+    let builtins = load_builtin_skills();
+    let builtin_names: HashSet<String> = builtins.iter().map(|s| s.name.clone()).collect();
+
+    // 2. Load filesystem skills
     let primary = match &config.skills_dir {
         Some(dir) => PathBuf::from(dir),
         None => skills_dir(),
@@ -141,7 +203,22 @@ pub fn load_skills(config: &crate::config::SkillsConfig) -> Vec<Skill> {
     }
 
     let dir_refs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
-    load_skills_multi(&dir_refs, config.allow_scripts)
+    let fs_skills = load_skills_multi(&dir_refs, config.allow_scripts);
+
+    // 3. Combine: builtins first, then non-colliding filesystem skills
+    let mut all_skills = builtins;
+    for skill in fs_skills {
+        if builtin_names.contains(&skill.name) {
+            tracing::warn!(
+                "skipping filesystem skill '{}' — name conflicts with builtin skill",
+                skill.name,
+            );
+        } else {
+            all_skills.push(skill);
+        }
+    }
+
+    all_skills
 }
 
 /// Get the ~/.agents/skills/ directory path (skills.sh default install location).
@@ -155,7 +232,12 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 /// Load all skills from a directory (no open-skills, no workspace wrapping).
-pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+/// The `source` parameter tags each loaded skill with its origin.
+pub fn load_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+    source: SkillSource,
+) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -195,14 +277,16 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         let manifest_path = path.join("SKILL.toml");
         let md_path = path.join("SKILL.md");
 
+        let mut skill_opt = None;
         if manifest_path.exists() {
-            if let Ok(skill) = load_skill_toml(&manifest_path) {
-                skills.push(skill);
-            }
+            skill_opt = load_skill_toml(&manifest_path).ok();
         } else if md_path.exists() {
-            if let Ok(skill) = load_skill_md(&md_path, &path) {
-                skills.push(skill);
-            }
+            skill_opt = load_skill_md(&md_path, &path).ok();
+        }
+
+        if let Some(mut skill) = skill_opt {
+            skill.source = Some(source.clone());
+            skills.push(skill);
         }
     }
 
@@ -216,8 +300,16 @@ pub fn load_skills_multi(dirs: &[&Path], allow_scripts: bool) -> Vec<Skill> {
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut all_skills: Vec<Skill> = Vec::new();
 
+    let agents_dir = agents_skills_dir();
+
     for dir in dirs {
-        let dir_skills = load_skills_from_directory(dir, allow_scripts);
+        let source = if *dir == agents_dir.as_path() {
+            SkillSource::SkillsSh
+        } else {
+            SkillSource::UserDir(dir.to_path_buf())
+        };
+
+        let dir_skills = load_skills_from_directory(dir, allow_scripts, source);
         for skill in dir_skills {
             if seen_names.insert(skill.name.clone()) {
                 all_skills.push(skill);
@@ -248,6 +340,8 @@ pub fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
+        is_builtin: false,
+        source: None,
     })
 }
 
@@ -274,6 +368,8 @@ pub fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
+        is_builtin: false,
+        source: None,
     })
 }
 
@@ -1161,6 +1257,8 @@ command = "echo hello"
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            is_builtin: false,
+            source: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("<available_skills>"));
@@ -1183,6 +1281,8 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
+            is_builtin: false,
+            source: None,
         }];
         let prompt = skills_to_prompt(&skills);
         assert!(prompt.contains("<name>xml&lt;skill&gt;</name>"));
@@ -1247,7 +1347,11 @@ command = "echo hello"
     #[test]
     fn load_skills_from_directory_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let skills = load_skills_from_directory(dir.path(), false);
+        let skills = load_skills_from_directory(
+            dir.path(),
+            false,
+            SkillSource::UserDir(dir.path().to_path_buf()),
+        );
         assert!(skills.is_empty());
     }
 
@@ -1255,7 +1359,11 @@ command = "echo hello"
     fn load_skills_from_directory_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("nonexistent");
-        let skills = load_skills_from_directory(&fake, false);
+        let skills = load_skills_from_directory(
+            &fake,
+            false,
+            SkillSource::UserDir(fake.clone()),
+        );
         assert!(skills.is_empty());
     }
 
@@ -1263,7 +1371,11 @@ command = "echo hello"
     fn load_skills_from_directory_ignores_files() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("not-a-skill.txt"), "hello").unwrap();
-        let skills = load_skills_from_directory(dir.path(), false);
+        let skills = load_skills_from_directory(
+            dir.path(),
+            false,
+            SkillSource::UserDir(dir.path().to_path_buf()),
+        );
         assert!(skills.is_empty());
     }
 }

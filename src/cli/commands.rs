@@ -373,16 +373,37 @@ async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> 
                 println!();
                 println!("  Or install: na skills install <source>");
             } else {
+                // Compute column widths
+                let name_width = skills.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
+                let version_width = skills.iter().map(|s| s.version.len()).max().unwrap_or(7).max(7);
+
                 println!("Installed skills ({}):", skills.len());
                 println!();
+                println!(
+                    "  {:<name_w$}  {:<ver_w$}  SOURCE",
+                    "NAME", "VERSION",
+                    name_w = name_width,
+                    ver_w = version_width,
+                );
+                println!(
+                    "  {:<name_w$}  {:<ver_w$}  ------",
+                    "----", "-------",
+                    name_w = name_width,
+                    ver_w = version_width,
+                );
                 for skill in &skills {
-                    println!("  {} v{} — {}", skill.name, skill.version, skill.description);
-                    if !skill.tools.is_empty() {
-                        println!("    Tools: {}", skill.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "));
-                    }
-                    if !skill.tags.is_empty() {
-                        println!("    Tags:  {}", skill.tags.join(", "));
-                    }
+                    let source_str = match &skill.source {
+                        Some(src) => src.to_string(),
+                        None => "unknown".to_string(),
+                    };
+                    println!(
+                        "  {:<name_w$}  {:<ver_w$}  {}",
+                        skill.name,
+                        skill.version,
+                        source_str,
+                        name_w = name_width,
+                        ver_w = version_width,
+                    );
                 }
             }
             println!();
