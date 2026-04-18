@@ -5,13 +5,17 @@ use std::sync::Arc;
 
 use crate::agent::turn_streamed_to_stdout;
 use crate::agent::Agent;
-use crate::config::schema::{default_config_path, Config};
+use crate::config::schema::default_config_path;
+use crate::config::{load_config_or_default, Config};
+use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
 use crate::providers::Provider;
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use crate::tools;
 use anyhow::Context;
 
 use super::CliArgs;
+use super::HubSubcommand;
+use super::IdentitySubcommand;
 use super::SkillsSubcommand;
 
 struct CliArgsInner {
@@ -54,12 +58,14 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             run_chat(inner).await
         }
         Some(super::Commands::Skills { action }) => handle_skills_command(action).await,
+        Some(super::Commands::Hub { action }) => handle_hub_command(action).await,
+        Some(super::Commands::Identity { action }) => handle_identity_command(action).await,
         None => {
             let config_path = default_config_path();
-            let config = load_config(&config_path);
+            let config = load_config_or_default(&config_path);
             let security_mode = SecurityMode::Direct;
             let streaming = config.behavior.streaming;
-            let provider = build_provider(&config)?;
+            let provider = build_provider(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             run_interactive(
                 provider,
@@ -80,7 +86,8 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
         return open_config_editor(config_path);
     }
 
-    let mut config = load_config(&args.config_path.clone().unwrap_or_else(default_config_path));
+    let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
+    let mut config = load_config_or_default(&config_path);
     let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
     config.behavior.debug = resolve_debug_mode(args.debug, &config);
     let streaming = config.behavior.streaming;
@@ -94,14 +101,13 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
 
     match args.prompt_text() {
         Some(prompt) => {
-            let provider = build_provider(&config)?;
+            let provider = build_provider(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             let agent = build_agent(provider, &config, security_mode, None, system_info);
-            run_single(agent, &prompt, streaming).await
+            run_single(agent, &prompt, streaming, &config, &config_path).await
         }
         None => {
-            let provider = build_provider(&config)?;
-            let config_path = args.config_path.unwrap_or_else(default_config_path);
+            let provider = build_provider(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             run_interactive(
                 provider,
@@ -113,30 +119,6 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
             )
             .await
         }
-    }
-}
-
-fn load_config(path: &std::path::Path) -> Config {
-    if path.exists() {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "[cli] warning: failed to read config {}: {e}",
-                    path.display()
-                );
-                return Config::default();
-            }
-        };
-        match toml::from_str(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("[cli] warning: failed to parse config: {e}");
-                Config::default()
-            }
-        }
-    } else {
-        Config::default()
     }
 }
 
@@ -165,7 +147,23 @@ fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
         .or_else(|| env_vars.iter().find_map(|v| std::env::var(v).ok()))
 }
 
-fn build_provider(config: &Config) -> anyhow::Result<Arc<dyn Provider>> {
+fn build_provider(config: &Config, config_path: &Path) -> anyhow::Result<Arc<dyn Provider>> {
+    if model_routes_via_hub(config) {
+        let hub_client = HubClient::new(config_path.to_path_buf(), config.clone())?;
+        return Ok(Arc::new(crate::providers::hub::HubProvider::new(
+            hub_client,
+        )));
+    }
+
+    if config
+        .provider
+        .model
+        .as_deref()
+        .is_some_and(|model| model.starts_with("free/"))
+    {
+        anyhow::bail!("free/* models require [hub].enabled = true or NANA_HUB_DISABLED unset");
+    }
+
     let provider_name = config.provider.provider.as_deref().unwrap_or("openai");
 
     let base_url = config.provider.api_url.as_deref();
@@ -301,7 +299,13 @@ fn build_agent(
     )
 }
 
-async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
+async fn run_single(
+    mut agent: Agent,
+    prompt: &str,
+    streaming: bool,
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<()> {
     let ctrl_c_handle = spawn_immediate_ctrl_c_exit();
 
     if streaming {
@@ -312,6 +316,7 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
                 crate::console::format_tool_summary(result.tool_calls_count)
             );
         }
+        render_post_response_ad(config, config_path).await;
         ctrl_c_handle.abort();
         Ok(())
     } else {
@@ -331,6 +336,9 @@ async fn run_single(mut agent: Agent, prompt: &str, streaming: bool) -> anyhow::
                 Err(e)
             }
         };
+        if result.is_ok() {
+            render_post_response_ad(config, config_path).await;
+        }
         ctrl_c_handle.abort();
         result
     }
@@ -349,7 +357,7 @@ async fn run_interactive(
         .parent()
         .unwrap_or(Path::new("."))
         .join("history.txt");
-    crate::tui::run_tui(agent, streaming, history_path).await
+    crate::tui::run_tui(agent, streaming, history_path, config.clone(), config_path).await
 }
 
 fn spawn_immediate_ctrl_c_exit() -> tokio::task::JoinHandle<()> {
@@ -373,6 +381,14 @@ fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
 # api_key = "sk-..."
 # api_url = ""
 # temperature = 0.7
+
+[hub]
+# url = "https://hub.nana.dev"
+# enabled = true
+# machine_id = ""
+# identity_path = "~/.config/nano-assistant/identity.key"
+# auto_register = true
+# ad_display = "inline"  # inline | banner | minimal | none
 
 [memory]
 # enabled = true
@@ -411,9 +427,115 @@ fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_hub_command(command: HubSubcommand) -> anyhow::Result<()> {
+    match command {
+        HubSubcommand::Status { config_path } => {
+            let config_path = config_path.unwrap_or_else(default_config_path);
+            let config = load_config_or_default(&config_path);
+            let client = HubClient::new(config_path.clone(), config)?;
+            let resolved = client.resolved_config().await;
+
+            println!("hub url: {}", resolved.url);
+            println!("enabled: {}", resolved.enabled);
+            println!("identity: {}", resolved.identity_path.display());
+            println!(
+                "machine_id: {}",
+                resolved.machine_id.as_deref().unwrap_or("(not registered)")
+            );
+            println!("auto_register: {}", resolved.auto_register);
+            println!("ad_display: {}", resolved.ad_display);
+
+            if resolved.enabled && resolved.machine_id.is_some() {
+                match client.quota_status().await {
+                    Ok(quota) => {
+                        println!();
+                        println!("status: {}", quota.status);
+                        println!(
+                            "quota: rpm {}/{} | tpm {}/{} | daily {}/{} | concurrent {}/{}",
+                            quota.usage.rpm_current,
+                            quota.limits.rpm,
+                            quota.usage.tpm_current,
+                            quota.limits.tpm,
+                            quota.usage.daily_used,
+                            quota.limits.daily,
+                            quota.usage.concurrent_current,
+                            quota.limits.concurrent
+                        );
+                        println!(
+                            "daily remaining: {} | reset daily @ {}",
+                            quota.usage.daily_remaining, quota.reset_at.daily
+                        );
+                    }
+                    Err(error) => {
+                        println!();
+                        println!("quota: unavailable");
+                        println!("reason: {error}");
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        HubSubcommand::Register { config_path } => {
+            let config_path = config_path.unwrap_or_else(default_config_path);
+            let config = load_config_or_default(&config_path);
+            let client = HubClient::new(config_path, config)?;
+            let registration = client.register_machine(true).await?;
+            println!("registered machine_id: {}", registration.machine_id);
+            println!("issued_at: {}", registration.issued_at);
+            Ok(())
+        }
+        HubSubcommand::Disable { config_path } => {
+            let config_path = config_path.unwrap_or_else(default_config_path);
+            let config = load_config_or_default(&config_path);
+            let client = HubClient::new(config_path, config)?;
+            client.disable().await?;
+            println!("hub disabled in config");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_identity_command(command: IdentitySubcommand) -> anyhow::Result<()> {
+    match command {
+        IdentitySubcommand::Export { path, config_path } => {
+            let config_path = config_path.unwrap_or_else(default_config_path);
+            let config = load_config_or_default(&config_path);
+            let client = HubClient::new(config_path, config)?;
+            let export = client.export_identity(&path).await?;
+            println!("identity exported to {}", path.display());
+            if let Some(machine_id) = export.machine_id.as_deref() {
+                println!("machine_id: {machine_id}");
+            }
+            Ok(())
+        }
+        IdentitySubcommand::Import { path, config_path } => {
+            let config_path = config_path.unwrap_or_else(default_config_path);
+            let config = load_config_or_default(&config_path);
+            let client = HubClient::new(config_path, config)?;
+            let import = client.import_identity(&path).await?;
+            println!("identity imported from {}", path.display());
+            if let Some(machine_id) = import.machine_id.as_deref() {
+                println!("machine_id restored: {machine_id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn render_post_response_ad(config: &Config, config_path: &Path) {
+    if !model_routes_via_hub(config) {
+        return;
+    }
+
+    if let Err(error) = maybe_render_ad(config_path.to_path_buf(), "inline_after_response").await {
+        eprintln!("[hub] ad fetch skipped: {error}");
+    }
+}
+
 async fn handle_skills_command(command: SkillsSubcommand) -> anyhow::Result<()> {
     let config_path = default_config_path();
-    let config = load_config(&config_path);
+    let config = load_config_or_default(&config_path);
 
     match command {
         SkillsSubcommand::List => {
@@ -609,7 +731,7 @@ mod tests {
     #[test]
     fn load_config_nonexistent_returns_default() {
         let path = std::path::Path::new("/tmp/does_not_exist_na_test_config_99999.toml");
-        let config = load_config(path);
+        let config = load_config_or_default(path);
         assert_eq!(config.provider.provider, Some("openai".to_string()));
         assert_eq!(config.provider.model, Some("gpt-4o-mini".to_string()));
         assert_eq!(config.provider.temperature, 0.7);
@@ -625,7 +747,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("bad_config.toml");
         std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
-        let config = load_config(&config_path);
+        let config = load_config_or_default(&config_path);
         assert_eq!(config.provider.provider, Some("openai".to_string()));
         assert_eq!(config.provider.model, Some("gpt-4o-mini".to_string()));
         assert_eq!(config.provider.temperature, 0.7);
@@ -684,6 +806,31 @@ mod tests {
                 assert!(matches!(action, SkillsSubcommand::List));
             }
             _ => panic!("expected Skills command"),
+        }
+    }
+
+    #[test]
+    fn cli_hub_subcommand_parses() {
+        let args = CliArgs::parse_from(["na", "hub", "status"]);
+        match args.command {
+            Some(crate::cli::Commands::Hub { action }) => {
+                assert!(matches!(action, HubSubcommand::Status { .. }));
+            }
+            _ => panic!("expected Hub command"),
+        }
+    }
+
+    #[test]
+    fn cli_identity_export_subcommand_parses() {
+        let args = CliArgs::parse_from(["na", "identity", "export", "/tmp/id.json"]);
+        match args.command {
+            Some(crate::cli::Commands::Identity { action }) => match action {
+                IdentitySubcommand::Export { path, .. } => {
+                    assert_eq!(path, std::path::PathBuf::from("/tmp/id.json"));
+                }
+                _ => panic!("expected identity export command"),
+            },
+            _ => panic!("expected Identity command"),
         }
     }
 

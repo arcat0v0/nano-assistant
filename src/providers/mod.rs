@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod compatible;
 pub mod gemini;
 pub mod glm;
+pub mod hub;
 pub mod openai;
 pub mod traits;
 

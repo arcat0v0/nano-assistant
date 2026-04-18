@@ -5,6 +5,8 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use crate::agent::{turn_streamed_to_stdout, Agent};
+use crate::config::schema::Config;
+use crate::hub::{maybe_render_ad, model_routes_via_hub};
 
 const PROMPT: &str = "❯ ";
 
@@ -12,8 +14,11 @@ pub async fn run_tui(
     mut agent: Agent,
     streaming: bool,
     history_path: PathBuf,
+    config: Config,
+    config_path: PathBuf,
 ) -> anyhow::Result<()> {
     print_welcome();
+    render_startup_ad(&config, &config_path).await;
 
     let mut editor = DefaultEditor::new()?;
     load_history(&mut editor, &history_path);
@@ -50,7 +55,7 @@ pub async fn run_tui(
                         continue;
                     }
                     InlineCommandResult::Prompt(prompt) => {
-                        run_prompt(&mut agent, prompt, streaming).await?;
+                        run_prompt(&mut agent, prompt, streaming, &config, &config_path).await?;
                     }
                 }
             }
@@ -69,7 +74,13 @@ pub async fn run_tui(
     Ok(())
 }
 
-async fn run_prompt(agent: &mut Agent, prompt: &str, streaming: bool) -> anyhow::Result<()> {
+async fn run_prompt(
+    agent: &mut Agent,
+    prompt: &str,
+    streaming: bool,
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<()> {
     if streaming {
         let result = turn_streamed_to_stdout(agent, prompt).await?;
         if result.tool_calls_count > 0 {
@@ -78,6 +89,7 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, streaming: bool) -> anyhow:
                 crate::console::format_tool_summary(result.tool_calls_count)
             );
         }
+        render_inline_ad(config, config_path).await;
     } else {
         match agent.turn(prompt).await {
             Ok(result) => {
@@ -88,6 +100,7 @@ async fn run_prompt(agent: &mut Agent, prompt: &str, streaming: bool) -> anyhow:
                         crate::console::format_tool_summary(result.tool_calls_count)
                     );
                 }
+                render_inline_ad(config, config_path).await;
             }
             Err(e) => {
                 eprintln!("[cli] error: {e:#}");
@@ -202,6 +215,26 @@ fn dim(text: &str) -> String {
 
 fn warn(text: &str) -> String {
     format!("\x1b[33m{text}\x1b[0m")
+}
+
+async fn render_inline_ad(config: &Config, config_path: &Path) {
+    if !model_routes_via_hub(config) {
+        return;
+    }
+
+    if let Err(error) = maybe_render_ad(config_path.to_path_buf(), "inline_after_response").await {
+        eprintln!("[hub] ad fetch skipped: {error}");
+    }
+}
+
+async fn render_startup_ad(config: &Config, config_path: &Path) {
+    if !model_routes_via_hub(config) {
+        return;
+    }
+
+    if let Err(error) = maybe_render_ad(config_path.to_path_buf(), "startup").await {
+        eprintln!("[hub] startup ad skipped: {error}");
+    }
 }
 
 async fn rescan_system_info() -> anyhow::Result<usize> {

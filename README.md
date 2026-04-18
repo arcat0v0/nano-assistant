@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **7 个 LLM Provider**: OpenAI、Anthropic、Gemini、GLM、Ollama，以及 DeepSeek/Kimi/Qwen 等兼容模式
+- **Hub 免费模型接入**: `free/*` 模型可自动走 `nana-hub`，支持 machine 注册、签名请求、配额查询与身份迁移
 - **8 个内置工具**: shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search
 - **MCP 协议支持**: 通过 MCP (Model Context Protocol) 接入外部工具服务器（Exa、Context7、Grep.app 等），支持 Stdio/HTTP/SSE 三种传输，延迟加载节省上下文
 - **skills.sh 生态兼容**: 自动扫描 `~/.agents/skills/`，直接使用 skills.sh 社区生态中的 skill
@@ -253,6 +254,14 @@ api_url = ""                 # 自定义 API 地址（留空使用默认地址�
 temperature = 0.7            # 温度参数（0.0 - 2.0）
 timeout_secs = 120           # 请求超时时间（秒）
 
+[hub]
+url = "https://hub.nana.dev" # free/* 模型使用的 hub 基址
+enabled = true               # 是否启用 hub 路由
+machine_id = ""              # 已注册后会自动写回
+identity_path = "~/.config/nano-assistant/identity.key"
+auto_register = true         # 首次使用 free/* 时自动注册 machine
+ad_display = "inline"        # inline | minimal | none
+
 [memory]
 enabled = true               # 是否启用持久化记忆
 max_messages = 100           # 最大保留的对话消息数
@@ -290,6 +299,39 @@ provider = "ollama"
 api_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 api_key = "sk-..."
+```
+
+### Hub 免费模型与 identity
+
+当 `model = "free/*"` 时，nano-assistant 会自动把请求路由到 `nana-hub`，而不是直接走你本地配置的上游 provider。
+
+```toml
+[provider]
+provider = "openai"
+model = "free/mock-chat"
+
+[hub]
+url = "https://hub.nana.dev"
+enabled = true
+identity_path = "~/.config/nano-assistant/identity.key"
+auto_register = true
+ad_display = "inline"
+```
+
+- 首次使用 `free/*` 模型时，会自动生成本地 ed25519 identity，并向 hub 注册 machine
+- `free/*` 仅在 `[hub].enabled = true` 且未设置 `NANA_HUB_DISABLED=1` 时可用
+- hub 无广告或广告接口不可达时，广告展示会静默跳过，不影响回答
+- 其他普通模型名仍按原有 provider 配置直连，不经过 hub
+
+常用命令：
+
+```bash
+na hub status
+na hub register
+na hub disable
+
+na identity export ./identity.json
+na identity import ./identity.json
 ```
 
 ### 安全模式说明
@@ -337,6 +379,9 @@ whitelist = [
 | `ANTHROPIC_API_KEY` | Anthropic 专用 API Key | `sk-ant-...` |
 | `GEMINI_API_KEY` | Gemini 专用 API Key | `AI...` |
 | `GLM_API_KEY` | GLM 专用 API Key | `...` |
+| `NANA_HUB_URL` | 覆盖 `[hub].url` | `https://hub.example.com` |
+| `NANA_HUB_DISABLED` | 临时禁用 hub 路由（`1` / `true`） | `1` |
+| `NANA_IDENTITY_PATH` | 覆盖 identity 文件路径 | `/tmp/nana-identity.key` |
 | `EDITOR` | `na --config` 使用的编辑器 | `vim` |
 
 ## 内置工具

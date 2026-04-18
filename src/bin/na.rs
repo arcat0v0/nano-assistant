@@ -14,10 +14,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             // Global flags (--help/--version) or "skills" subcommand must not
             // fall through to the chat-mode backward-compat path.
-            if raw
-                .get(1)
-                .is_some_and(|s| is_bare_global_flag(s) || s == "skills")
-            {
+            if raw.get(1).is_some_and(|s| {
+                is_bare_global_flag(s) || matches!(s.as_str(), "skills" | "hub" | "identity")
+            }) {
                 eprintln!("{e}");
                 std::process::exit(e.exit_code());
             }

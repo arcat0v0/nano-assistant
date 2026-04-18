@@ -13,6 +13,36 @@ pub enum SkillsSubcommand {
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
+pub enum HubSubcommand {
+    Status {
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
+    Register {
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
+    Disable {
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum IdentitySubcommand {
+    Export {
+        path: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
+    Import {
+        path: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
 pub enum Commands {
     #[command(trailing_var_arg = true)]
     Chat {
@@ -32,6 +62,14 @@ pub enum Commands {
     Skills {
         #[command(subcommand)]
         action: SkillsSubcommand,
+    },
+    Hub {
+        #[command(subcommand)]
+        action: HubSubcommand,
+    },
+    Identity {
+        #[command(subcommand)]
+        action: IdentitySubcommand,
     },
 }
 

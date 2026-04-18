@@ -70,6 +70,8 @@ directories = "5"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Logging
 tracing = { version = "0.1", features = ["log"] }

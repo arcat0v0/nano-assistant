@@ -4,11 +4,11 @@
 //!
 //! Priority: CLI flag > environment variable > config file
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Top-level configuration loaded from `config.toml`.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
     /// Provider configuration (API key, model selection, etc.)
     #[serde(default)]
@@ -33,9 +33,13 @@ pub struct Config {
     /// MCP server configuration.
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Hub configuration for `free/*` models and ad delivery.
+    #[serde(default)]
+    pub hub: HubConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     /// API key for the selected provider.
     /// Can be overridden by NA_API_KEY environment variable.
@@ -88,7 +92,7 @@ fn default_temperature() -> f64 {
 }
 
 /// Memory backend configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryConfig {
     /// Enable conversation memory. Default: true.
     #[serde(default = "default_true")]
@@ -122,7 +126,7 @@ fn default_max_messages() -> usize {
 }
 
 /// Security configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
     /// Autonomy level: "manual", "review", "auto". Default: "review".
     #[serde(default = "default_autonomy_level")]
@@ -167,7 +171,7 @@ fn default_autonomy_level() -> String {
 }
 
 /// Behavior configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BehaviorConfig {
     /// Maximum tool-call iterations per user message. Default: 10.
     #[serde(default = "default_max_iterations")]
@@ -206,7 +210,7 @@ fn default_max_iterations() -> usize {
     10
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SkillsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -236,7 +240,7 @@ impl Default for SkillsConfig {
 }
 
 /// MCP transport protocol.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     #[default]
@@ -246,7 +250,7 @@ pub enum McpTransport {
 }
 
 /// Configuration for a single MCP server.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct McpServerConfig {
     /// Server name, used as tool name prefix.
     pub name: String,
@@ -281,7 +285,7 @@ pub struct McpServerConfig {
 }
 
 /// MCP (Model Context Protocol) configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
     /// Enable MCP server connections. Default: false.
     #[serde(default)]
@@ -304,6 +308,63 @@ impl Default for McpConfig {
             servers: Vec::new(),
         }
     }
+}
+
+/// Hub routing configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HubConfig {
+    /// Hub base URL for `free/*` models.
+    #[serde(default = "default_hub_url")]
+    pub url: String,
+
+    /// Whether hub routing is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Registered machine identifier assigned by the hub.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+
+    /// Local identity file path.
+    #[serde(default = "default_identity_path")]
+    pub identity_path: String,
+
+    /// Whether the client may auto-register on first use.
+    #[serde(default = "default_true")]
+    pub auto_register: bool,
+
+    /// Ad display mode: inline | banner | minimal | none.
+    #[serde(default = "default_ad_display")]
+    pub ad_display: String,
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self {
+            url: default_hub_url(),
+            enabled: true,
+            machine_id: None,
+            identity_path: default_identity_path(),
+            auto_register: true,
+            ad_display: default_ad_display(),
+        }
+    }
+}
+
+fn default_hub_url() -> String {
+    "https://hub.nana.dev".to_string()
+}
+
+fn default_identity_path() -> String {
+    crate::platform::current_platform()
+        .config_dir()
+        .join("identity.key")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn default_ad_display() -> String {
+    "inline".to_string()
 }
 
 /// Environment variable prefix for configuration overrides.
@@ -342,6 +403,12 @@ mod tests {
         assert!(config.skills.enabled);
         assert!(!config.skills.allow_scripts);
         assert!(config.skills.skills_dir.is_none());
+        assert_eq!(config.hub.url, "https://hub.nana.dev");
+        assert!(config.hub.enabled);
+        assert!(config.hub.machine_id.is_none());
+        assert!(config.hub.auto_register);
+        assert_eq!(config.hub.ad_display, "inline");
+        assert!(config.hub.identity_path.ends_with("identity.key"));
     }
 
     #[test]
@@ -380,6 +447,17 @@ mod tests {
         assert!(b.streaming);
         assert!(b.verbose_errors);
         assert!(b.explain_tools);
+    }
+
+    #[test]
+    fn hub_config_default() {
+        let hub = HubConfig::default();
+        assert_eq!(hub.url, "https://hub.nana.dev");
+        assert!(hub.enabled);
+        assert!(hub.machine_id.is_none());
+        assert!(hub.auto_register);
+        assert_eq!(hub.ad_display, "inline");
+        assert!(hub.identity_path.ends_with("identity.key"));
     }
 
     #[test]
