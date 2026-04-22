@@ -223,18 +223,36 @@ async fn load_or_create_memory_md() -> Option<String> {
     let path = memory_md_path();
 
     if path.exists() {
-        return std::fs::read_to_string(&path).ok();
+        let content = std::fs::read_to_string(&path).ok()?;
+        if let Some(system_info) =
+            crate::memory::MarkdownMemory::extract_system_info_markdown(&content)
+        {
+            return Some(system_info);
+        }
+
+        let info = crate::system_info::detect().await;
+        let content = crate::memory::MarkdownMemory::upsert_system_info_markdown(
+            &content,
+            &info.format_as_markdown(),
+        );
+
+        return if std::fs::write(&path, &content).is_ok() {
+            crate::memory::MarkdownMemory::extract_system_info_markdown(&content)
+        } else {
+            None
+        };
     }
 
     let info = crate::system_info::detect().await;
-    let content = info.format_as_markdown();
+    let content =
+        crate::memory::MarkdownMemory::upsert_system_info_markdown("", &info.format_as_markdown());
 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
     if std::fs::write(&path, &content).is_ok() {
-        Some(content)
+        crate::memory::MarkdownMemory::extract_system_info_markdown(&content)
     } else {
         None
     }
@@ -280,11 +298,9 @@ fn build_agent(
     }
 
     let memory: Option<Arc<dyn crate::memory::Memory>> = if config.memory.enabled {
-        let memory_dir = default_config_path()
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("memory");
-        Some(Arc::new(crate::memory::MarkdownMemory::new(memory_dir)))
+        Some(Arc::new(crate::memory::MarkdownMemory::new(
+            memory_md_path(),
+        )))
     } else {
         None
     };
@@ -888,7 +904,8 @@ mod tests {
         let path = memory_md_path();
         let path_str = path.to_string_lossy();
         assert!(
-            path_str.contains(".config/nano-assistant/MEMORY.md"),
+            path_str.ends_with("/nano-assistant/MEMORY.md")
+                || path_str.ends_with("\\nano-assistant\\MEMORY.md"),
             "path was: {path_str}"
         );
     }
@@ -899,19 +916,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let memory_path = dir.path().join(".config/nano-assistant/MEMORY.md");
         let saved_home = std::env::var_os("HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
 
         std::env::set_var("HOME", dir.path());
+        std::env::remove_var("XDG_CONFIG_HOME");
         let path = memory_md_path();
         assert_eq!(path, memory_path);
 
         let content = load_or_create_memory_md().await;
         assert!(content.is_some());
         assert!(memory_path.exists());
-        assert!(content.unwrap().contains("# System Information"));
+        let content = content.unwrap();
+        assert!(content.contains("### System"));
+        let written = std::fs::read_to_string(&memory_path).unwrap();
+        assert!(written.contains("# Nano-Assistant Memory"));
+        assert!(written.contains("## System Information"));
 
         match saved_home {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
+        }
+        match saved_xdg {
+            Some(xdg) => std::env::set_var("XDG_CONFIG_HOME", xdg),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
     }
 
@@ -922,18 +949,25 @@ mod tests {
         let memory_dir = dir.path().join(".config").join("nano-assistant");
         std::fs::create_dir_all(&memory_dir).unwrap();
         let memory_path = memory_dir.join("MEMORY.md");
-        let test_content = "# System Information\n\nTest content.";
+        let test_content =
+            "# Nano-Assistant Memory\n\n<!-- SYSTEM_INFO_START -->\n## System Information\n\n### System\n\nTest content.\n<!-- SYSTEM_INFO_END -->\n";
         std::fs::write(&memory_path, &test_content).unwrap();
         let saved_home = std::env::var_os("HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
 
         std::env::set_var("HOME", dir.path());
+        std::env::remove_var("XDG_CONFIG_HOME");
         let content = load_or_create_memory_md().await;
         match saved_home {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+        match saved_xdg {
+            Some(xdg) => std::env::set_var("XDG_CONFIG_HOME", xdg),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
-        assert_eq!(content, Some(test_content.to_string()));
+        assert_eq!(content, Some("### System\n\nTest content.".to_string()));
     }
 
     #[tokio::test]

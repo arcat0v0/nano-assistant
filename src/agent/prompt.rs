@@ -254,6 +254,17 @@ fn build_self_management_section() -> String {
         "Persist completed infrastructure facts such as installed packages, enabled services, configured ports, deployed runtimes, data paths, and chosen operational conventions.\n",
     );
     prompt.push_str(
+        "Preserve the existing `## System Information` block. Append durable memories instead of overwriting that section.\n",
+    );
+    prompt.push_str(
+        "When writing memory entries, use this exact markdown shape so future turns can query them:\n\
+         `## 2026-04-22 12:00:00 - core`\n\
+         `- **Key**: nginx-install`\n\
+         `- **Content**: nginx 1.30.0 installed via pacman; service disabled; config at /etc/nginx/nginx.conf`\n\
+         `- **Category**: core`\n\
+         `- **Session**: none`\n",
+    );
+    prompt.push_str(
         "Do not store secrets, API keys, tokens, passwords, or transient command output in memory.\n",
     );
 
@@ -559,7 +570,7 @@ mod tests {
             deferred_tool_names: &[],
         };
         let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(!prompt.contains("## System Information"));
+        assert!(!prompt.contains("## System Information\n\n### "));
     }
 
     #[test]

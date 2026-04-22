@@ -239,8 +239,12 @@ async fn render_startup_ad(config: &Config, config_path: &Path) {
 
 async fn rescan_system_info() -> anyhow::Result<usize> {
     let info = crate::system_info::detect().await;
-    let content = info.format_as_markdown();
     let path = crate::cli::commands::memory_md_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = crate::memory::MarkdownMemory::upsert_system_info_markdown(
+        &existing,
+        &info.format_as_markdown(),
+    );
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

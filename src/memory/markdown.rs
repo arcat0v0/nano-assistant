@@ -17,6 +17,10 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::fs;
 
+const DOCUMENT_HEADER: &str = "# Nano-Assistant Memory\n\n";
+const SYSTEM_INFO_START: &str = "<!-- SYSTEM_INFO_START -->";
+const SYSTEM_INFO_END: &str = "<!-- SYSTEM_INFO_END -->";
+
 /// Markdown-based memory backend.
 ///
 /// Uses a single Markdown file as persistent storage. Entries are
@@ -28,6 +32,124 @@ pub struct MarkdownMemory {
 impl MarkdownMemory {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    fn strip_document_header(content: &str) -> &str {
+        let trimmed = content.trim();
+        if let Some(rest) = trimmed.strip_prefix("# Nano-Assistant Memory") {
+            rest.trim_start_matches('\n').trim_start()
+        } else {
+            trimmed
+        }
+    }
+
+    fn demote_system_info_headings(content: &str) -> String {
+        let mut out = String::new();
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("## ") {
+                out.push_str("### ");
+                out.push_str(rest);
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        out.trim().to_string()
+    }
+
+    pub fn normalize_system_info_markdown(markdown: &str) -> String {
+        let trimmed = markdown.trim();
+        let body = if let Some(rest) = trimmed.strip_prefix("# System Information") {
+            rest.trim_start_matches('\n').trim_start()
+        } else if let Some(rest) = trimmed.strip_prefix("## System Information") {
+            rest.trim_start_matches('\n').trim_start()
+        } else {
+            trimmed
+        };
+
+        Self::demote_system_info_headings(body)
+    }
+
+    fn system_info_block_range(content: &str) -> Option<(usize, usize)> {
+        let start = content.find(SYSTEM_INFO_START)?;
+        let after_start = start + SYSTEM_INFO_START.len();
+        let end_rel = content[after_start..].find(SYSTEM_INFO_END)?;
+        let end = after_start + end_rel + SYSTEM_INFO_END.len();
+        Some((start, end))
+    }
+
+    pub fn extract_system_info_markdown(content: &str) -> Option<String> {
+        if let Some((start, end)) = Self::system_info_block_range(content) {
+            let after_start = start + SYSTEM_INFO_START.len();
+            let before_end = end - SYSTEM_INFO_END.len();
+            let block = content[after_start..before_end].trim();
+            return Some(Self::normalize_system_info_markdown(block));
+        }
+
+        let trimmed = content.trim();
+        if trimmed.starts_with("# System Information")
+            || trimmed.starts_with("## System Information")
+        {
+            return Some(Self::normalize_system_info_markdown(trimmed));
+        }
+
+        None
+    }
+
+    fn entries_to_markdown<'a, I>(entries: I) -> String
+    where
+        I: IntoIterator<Item = &'a MemoryEntry>,
+    {
+        let mut out = String::new();
+        for entry in entries {
+            out.push_str(&Self::format_entry(entry));
+            out.push('\n');
+        }
+        out.trim().to_string()
+    }
+
+    fn compose_document(system_info: Option<&str>, tail: Option<&str>) -> String {
+        let mut out = String::from(DOCUMENT_HEADER);
+
+        if let Some(system_info) = system_info.filter(|s| !s.trim().is_empty()) {
+            out.push_str(SYSTEM_INFO_START);
+            out.push('\n');
+            out.push_str("## System Information\n\n");
+            out.push_str(system_info.trim());
+            out.push('\n');
+            out.push_str(SYSTEM_INFO_END);
+        }
+
+        if let Some(tail) = tail.filter(|s| !s.trim().is_empty()) {
+            if !out.ends_with("\n\n") {
+                out.push_str("\n\n");
+            }
+            out.push_str(tail.trim());
+            out.push('\n');
+        }
+
+        out
+    }
+
+    pub fn upsert_system_info_markdown(content: &str, system_info_markdown: &str) -> String {
+        let normalized = Self::normalize_system_info_markdown(system_info_markdown);
+
+        if let Some((_, end)) = Self::system_info_block_range(content) {
+            let tail = content[end..].trim();
+            return Self::compose_document(Some(&normalized), Some(tail));
+        }
+
+        let trimmed = content.trim();
+        if trimmed.starts_with("# System Information")
+            || trimmed.starts_with("## System Information")
+        {
+            let entries = Self::parse_entries(trimmed);
+            let tail = Self::entries_to_markdown(entries.iter());
+            return Self::compose_document(Some(&normalized), Some(&tail));
+        }
+
+        let tail = Self::strip_document_header(trimmed);
+        Self::compose_document(Some(&normalized), Some(tail))
     }
 
     fn now_timestamp() -> String {
@@ -140,8 +262,7 @@ impl MarkdownMemory {
 
     async fn ensure_header(&self) -> anyhow::Result<()> {
         if !self.path.exists() {
-            let header = "# Nano-Assistant Memory\n\n";
-            self.write_file(header).await?;
+            self.write_file(DOCUMENT_HEADER).await?;
         }
         Ok(())
     }
@@ -240,6 +361,16 @@ impl Memory for MarkdownMemory {
 
         self.ensure_header().await?;
         let mut file_content = self.read_file().await?;
+        if file_content.trim().is_empty() {
+            file_content = DOCUMENT_HEADER.to_string();
+        }
+        if !file_content.ends_with("\n\n") {
+            if file_content.ends_with('\n') {
+                file_content.push('\n');
+            } else {
+                file_content.push_str("\n\n");
+            }
+        }
         file_content.push_str(&Self::format_entry(&entry));
         file_content.push('\n');
         self.write_file(&file_content).await
@@ -304,12 +435,9 @@ impl Memory for MarkdownMemory {
             return Ok(false);
         }
 
-        // Rebuild file
-        let mut new_content = String::from("# Nano-Assistant Memory\n\n");
-        for entry in updated_entries {
-            new_content.push_str(&Self::format_entry(entry));
-            new_content.push('\n');
-        }
+        let system_info = Self::extract_system_info_markdown(&content);
+        let entries_md = Self::entries_to_markdown(updated_entries.iter().copied());
+        let new_content = Self::compose_document(system_info.as_deref(), Some(&entries_md));
 
         self.write_file(&new_content).await?;
         Ok(true)
@@ -567,6 +695,93 @@ mod tests {
         assert!(content.contains("- **Content**: User asked about nginx"));
         assert!(content.contains("- **Category**: conversation"));
         assert!(content.contains("- **Session**: s1"));
+    }
+
+    #[test]
+    fn test_normalize_system_info_markdown_demotes_headings() {
+        let content = "# System Information\n\n## System\n\n- **OS**: Arch Linux\n";
+        let normalized = MarkdownMemory::normalize_system_info_markdown(content);
+        assert!(!normalized.contains("# System Information"));
+        assert!(normalized.contains("### System"));
+        assert!(normalized.contains("**OS**: Arch Linux"));
+    }
+
+    #[test]
+    fn test_upsert_system_info_markdown_preserves_existing_entries() {
+        let entry = MemoryEntry {
+            id: "id-1".into(),
+            key: "nginx".into(),
+            content: "nginx installed via pacman".into(),
+            category: MemoryCategory::Core,
+            timestamp: "2026-04-22 12:00:00".into(),
+            session_id: None,
+            score: None,
+        };
+        let existing = format!(
+            "{DOCUMENT_HEADER}{}\n",
+            MarkdownMemory::format_entry(&entry)
+        );
+        let updated = MarkdownMemory::upsert_system_info_markdown(
+            &existing,
+            "# System Information\n\n## System\n\n- **OS**: Arch Linux\n",
+        );
+
+        assert!(updated.contains(SYSTEM_INFO_START));
+        assert!(updated.contains("## System Information"));
+        assert!(updated.contains("### System"));
+        assert!(updated.contains("- **Key**: nginx"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_preserves_system_info_block() {
+        let (_tmp, mem) = temp_memory();
+        let with_system = MarkdownMemory::upsert_system_info_markdown(
+            "",
+            "# System Information\n\n## System\n\n- **OS**: Arch Linux\n",
+        );
+        fs::write(&mem.path, with_system).await.unwrap();
+
+        mem.add("k1", "Keep this", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.add("k2", "Delete this", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let removed = mem.delete("k2").await.unwrap();
+        assert!(removed);
+
+        let content = fs::read_to_string(&mem.path).await.unwrap();
+        assert!(content.contains("## System Information"));
+        assert!(content.contains("### System"));
+        assert!(content.contains("- **Key**: k1"));
+        assert!(!content.contains("- **Key**: k2"));
+    }
+
+    #[tokio::test]
+    async fn test_query_ignores_system_info_sections() {
+        let (_tmp, mem) = temp_memory();
+        let with_system = MarkdownMemory::upsert_system_info_markdown(
+            "",
+            "# System Information\n\n## System\n\n- **OS**: Arch Linux\n",
+        );
+        fs::write(&mem.path, with_system).await.unwrap();
+
+        mem.add(
+            "nginx",
+            "Nginx configured on port 80",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = mem.query("Arch Linux", 10, None).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = mem.query("nginx", 10, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "nginx");
     }
 
     #[tokio::test]

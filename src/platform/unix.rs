@@ -13,6 +13,13 @@ impl UnixPlatform {
             .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
     }
 
+    fn config_home_dir(&self) -> Option<PathBuf> {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| self.home_dir().map(|home| home.join(".config")))
+    }
+
     fn expand_home_path(home: Option<&Path>, path: &str) -> PathBuf {
         if let Some(rest) = path.strip_prefix("~/") {
             if let Some(home) = home {
@@ -22,8 +29,9 @@ impl UnixPlatform {
         PathBuf::from(path)
     }
 
-    fn config_dir_from_home(home: Option<&Path>) -> PathBuf {
-        home.map(|path| path.join(".config").join("nano-assistant"))
+    fn config_dir_from_base(config_home: Option<&Path>) -> PathBuf {
+        config_home
+            .map(|path| path.join("nano-assistant"))
             .unwrap_or_else(|| std::env::temp_dir().join("nano-assistant"))
     }
 
@@ -40,7 +48,7 @@ impl UnixPlatform {
 
 impl Platform for UnixPlatform {
     fn config_dir(&self) -> PathBuf {
-        Self::config_dir_from_home(self.home_dir().as_deref())
+        Self::config_dir_from_base(self.config_home_dir().as_deref())
     }
 
     fn agents_skills_dir(&self) -> PathBuf {
@@ -291,9 +299,35 @@ mod tests {
 
     #[test]
     #[serial(home_env)]
+    fn config_dir_prefers_xdg_config_home() {
+        let saved_home = std::env::var_os("HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+
+        std::env::set_var("HOME", "/tmp/home-test");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test");
+
+        let p = UnixPlatform;
+        let config = p.config_dir();
+
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_xdg {
+            Some(xdg) => std::env::set_var("XDG_CONFIG_HOME", xdg),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+
+        assert_eq!(config, PathBuf::from("/tmp/xdg-test/nano-assistant"));
+    }
+
+    #[test]
+    #[serial(home_env)]
     fn unix_paths_do_not_fall_back_to_literal_tilde() {
         let saved_home = std::env::var_os("HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
         std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CONFIG_HOME");
 
         let p = UnixPlatform;
         let config_dir = p.config_dir();
@@ -303,6 +337,10 @@ mod tests {
         match saved_home {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
+        }
+        match saved_xdg {
+            Some(xdg) => std::env::set_var("XDG_CONFIG_HOME", xdg),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
         for path in [config_dir, skills_dir, expanded] {
