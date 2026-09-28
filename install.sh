@@ -1,53 +1,62 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-INSTALL_DIR="$HOME/.local/bin"
-CONFIG_DIR="$HOME/.config/nano-assistant"
+REPO="arcat0v0/nano-assistant"
+BASE_URL="${NA_BASE_URL:-https://github.com/$REPO/releases}"
+VERSION="${NA_VERSION:-latest}"
+INSTALL_DIR="${NA_INSTALL_DIR:-$HOME/.local/bin}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nano-assistant"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 
-echo "Installing nano-assistant..."
+info() { printf '==> %s\n' "$*"; }
+fatal() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# Check if cargo is installed
-if ! command -v cargo &> /dev/null; then
-    echo "Error: cargo is not installed. Please install Rust first: https://rustup.rs/"
-    exit 1
+[ "$(uname -s)" = "Linux" ] || fatal "this installer only supports Linux; see https://github.com/$REPO for other platforms"
+
+case "$(uname -m)" in
+    x86_64 | amd64) ARCH="x86_64" ;;
+    aarch64 | arm64) ARCH="aarch64" ;;
+    *) fatal "unsupported architecture: $(uname -m)" ;;
+esac
+
+ARTIFACT="na-$ARCH-linux-musl.tar.gz"
+
+if [ "$VERSION" = "latest" ]; then
+    DOWNLOAD_URL="$BASE_URL/latest/download/$ARTIFACT"
+    CHECKSUM_URL="$BASE_URL/latest/download/$ARTIFACT.sha256"
+else
+    TAG="v${VERSION#v}"
+    DOWNLOAD_URL="$BASE_URL/download/$TAG/$ARTIFACT"
+    CHECKSUM_URL="$BASE_URL/download/$TAG/$ARTIFACT.sha256"
 fi
 
-# Check if we're in the right directory
-if [ ! -f "Cargo.toml" ]; then
-    echo "Error: Cargo.toml not found. Please run this script from the project directory."
-    exit 1
-fi
+fetch() {
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget > /dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        fatal "curl or wget is required"
+    fi
+}
 
-# Build the project
-echo "Building project..."
-if ! cargo build --release; then
-    echo "Error: Build failed."
-    exit 1
-fi
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
 
-# Check if binary exists
-BINARY="target/release/na"
-if [ ! -f "$BINARY" ]; then
-    echo "Error: Binary not found at $BINARY"
-    exit 1
-fi
+info "Downloading nano-assistant ($VERSION, linux-$ARCH)..."
+fetch "$DOWNLOAD_URL" "$TMP_DIR/$ARTIFACT" || fatal "download failed: $DOWNLOAD_URL"
+fetch "$CHECKSUM_URL" "$TMP_DIR/$ARTIFACT.sha256" || fatal "checksum download failed: $CHECKSUM_URL"
 
-# Create install directory if it doesn't exist
+command -v sha256sum > /dev/null 2>&1 || fatal "sha256sum is required (install coreutils)"
+(cd "$TMP_DIR" && sha256sum -c "$ARTIFACT.sha256" > /dev/null 2>&1) || fatal "checksum verification failed"
+
+tar xzf "$TMP_DIR/$ARTIFACT" -C "$TMP_DIR"
 mkdir -p "$INSTALL_DIR"
+install -m 0755 "$TMP_DIR/na" "$INSTALL_DIR/na"
+info "Installed $INSTALL_DIR/na"
 
-# Copy binary and create symlink
-echo "Installing to $INSTALL_DIR..."
-cp "$BINARY" "$INSTALL_DIR/na"
-ln -sf "$INSTALL_DIR/na" "$INSTALL_DIR/nano-assistant"
-chmod +x "$INSTALL_DIR/na"
-
-# Create config directory
 mkdir -p "$CONFIG_DIR"
-
-# Create default config if it doesn't exist
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Creating default config at $CONFIG_FILE..."
     cat > "$CONFIG_FILE" << 'EOF'
 [provider]
 provider = "openai"
@@ -65,44 +74,38 @@ whitelist = ["ls", "cat", "grep", "echo", "pwd", "cd"]
 streaming = true
 max_iterations = 10
 EOF
+    info "Created default config at $CONFIG_FILE"
 fi
 
-# Add ~/.local/bin to PATH in shell rc files
-add_to_path() {
-    local rc_file="$1"
-    local path_entry='export PATH="$HOME/.local/bin:$PATH"'
-    
-    if [ -f "$rc_file" ]; then
-        if ! grep -q '~/.local/bin' "$rc_file" && ! grep -q '$HOME/.local/bin' "$rc_file"; then
-            echo "" >> "$rc_file"
-            echo "# Added by nano-assistant installer" >> "$rc_file"
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc_file"
-            echo "Added PATH to $rc_file"
+ensure_path() {
+    case ":$PATH:" in
+        *":$INSTALL_DIR:"*) return 0 ;;
+    esac
+    local line="export PATH=\"$INSTALL_DIR:\$PATH\""
+    local configured=0
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+        [ -f "$rc" ] || continue
+        if grep -qF "$INSTALL_DIR" "$rc"; then
+            configured=1
+        else
+            printf '\n%s\n' "$line" >> "$rc"
+            info "Added $INSTALL_DIR to PATH in $rc"
+            configured=1
         fi
+    done
+    if [ "$configured" -eq 1 ]; then
+        info "Restart your shell or run: $line"
     else
-        echo "" >> "$rc_file"
-        echo "# Added by nano-assistant installer" >> "$rc_file"
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc_file"
-        echo "Created $rc_file with PATH configuration"
+        info "Not on PATH, add manually: $line"
     fi
 }
+ensure_path
 
-# Update shell rc files
-for rc_file in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    if [ -f "$rc_file" ]; then
-        add_to_path "$rc_file"
-    fi
-done
+info "Verifying installation..."
+"$INSTALL_DIR/na" --version > /dev/null 2>&1 || fatal "installed binary failed to run"
+"$INSTALL_DIR/na" --version
 
-echo ""
-echo "Installation complete!"
-echo ""
-echo "Usage:"
-echo "  na \"list all docker containers\"  # Single command mode"
-echo "  na                           # Interactive REPL mode"
-echo "  na --config                  # Open config file in editor"
-echo ""
-echo "Make sure ~/.local/bin is in your PATH. Run:"
-echo "  source ~/.bashrc  # or ~/.zshrc"
-echo "Or add this line to your shell config:"
-echo '  export PATH="$HOME/.local/bin:$PATH"'
+printf '\n'
+info "Done. Set your API key to get started:"
+printf '  export NA_API_KEY="sk-..."\n'
+printf '  na --config\n'

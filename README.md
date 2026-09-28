@@ -18,49 +18,43 @@
 
 ## 安装
 
-### 平台说明
-
-- Linux / macOS：完整支持当前工具集
-- Windows：支持配置、普通命令执行、以及问答式交互命令
-- Windows 限制：`pty_shell` 在 Windows 上当前走 stdin/stdout 管道，不是原生 ConPTY；安装器提示、确认、密码输入这类场景可用，复杂全屏 TUI 程序可能表现不完整
-
-### Windows 安装与使用
-
-推荐优先使用预编译二进制。下载 `na-x86_64-pc-windows-msvc.zip` 后解压，并把 `na.exe` 放到一个固定目录，例如 `%USERPROFILE%\\bin`。
-
-PowerShell 示例：
-
-```powershell
-$BinDir = "$env:USERPROFILE\bin"
-New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
-Copy-Item .\na.exe "$BinDir\na.exe" -Force
-
-# 当前 PowerShell 会话临时生效
-$env:Path = "$BinDir;$env:Path"
-
-na --version
-na --help
-```
-
-如果要长期生效，把 `%USERPROFILE%\bin` 加到用户级 `Path`。配置文件默认位于 `%APPDATA%\nano-assistant\config.toml`，记忆文件位于 `%APPDATA%\nano-assistant\MEMORY.md`。
-
-### 方式一：下载预编译二进制（推荐）
-
-从 [GitHub Releases](https://github.com/arcat0v0/nano-assistant/releases) 下载对应平台的压缩包：
+### 方式一：一键安装脚本（Linux 服务器，推荐）
 
 ```bash
-# 下载最新版本（Linux x86_64）
-curl -sL https://github.com/arcat0v0/nano-assistant/releases/latest/download/na-x86_64-linux-gnu.tar.gz | tar xz
-
-# 移动到 PATH 目录
-mv na ~/.local/bin/
-chmod +x ~/.local/bin/na
-
-# 确保 ~/.local/bin 在 PATH 中
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh | bash
 ```
 
-### 方式二：从源码编译
+脚本自动完成：架构检测（x86_64 / aarch64）、下载静态 musl 链接的二进制（不依赖系统 glibc 版本，新老发行版均可运行）、SHA256 校验、安装到 `~/.local/bin`、生成默认配置、并将安装目录写入 shell rc 文件的 PATH。
+
+可选环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `NA_VERSION` | `latest` | 安装指定版本，例如 `NA_VERSION=0.3.2` |
+| `NA_INSTALL_DIR` | `~/.local/bin` | 自定义安装目录 |
+| `NA_BASE_URL` | GitHub Releases | 自定义下载源（镜像或离线测试） |
+
+### 方式二：手动下载预编译二进制
+
+[GitHub Releases](https://github.com/arcat0v0/nano-assistant/releases) 提供的资产：
+
+| 资产 | 适用平台 |
+|------|----------|
+| `na-x86_64-linux-musl.tar.gz` | Linux x86_64（静态链接，推荐） |
+| `na-aarch64-linux-musl.tar.gz` | Linux ARM64（静态链接） |
+| `na-x86_64-linux-gnu.tar.gz` | Linux x86_64（动态链接 glibc，需较新发行版） |
+
+每个资产都附带 `.sha256` 校验文件。示例：
+
+```bash
+curl -sLO https://github.com/arcat0v0/nano-assistant/releases/latest/download/na-x86_64-linux-musl.tar.gz
+curl -sLO https://github.com/arcat0v0/nano-assistant/releases/latest/download/na-x86_64-linux-musl.tar.gz.sha256
+sha256sum -c na-x86_64-linux-musl.tar.gz.sha256
+tar xzf na-x86_64-linux-musl.tar.gz
+install -m 0755 na ~/.local/bin/na
+```
+
+### 方式三：从源码编译
 
 需要 [Rust 工具链](https://rustup.rs/)：
 
@@ -71,16 +65,15 @@ cargo build --release
 cp target/release/na ~/.local/bin/
 ```
 
-Windows 上从源码编译时，使用 `x86_64-pc-windows-msvc` 工具链并在 PowerShell 中执行：
+### 平台说明
 
-```powershell
-git clone https://github.com/arcat0v0/nano-assistant.git
-cd nano-assistant
-cargo build --release
+- Linux x86_64 / aarch64：完整支持，提供预编译二进制与一键安装脚本
+- macOS：从源码编译（方式三）
+- Windows：当前无法通过编译（`cargo check --target x86_64-pc-windows-msvc` 失败），暂不提供安装产物
 
-# 生成的二进制
-.\target\release\na.exe
-```
+### 发布新版本（维护者）
+
+在仓库 Actions 页面手动触发 **Release** workflow，选择 `patch` / `minor` / `major`：自动递增 `Cargo.toml` 版本号并提交、创建 `vX.Y.Z` tag、构建全部平台产物（含 SHA256 校验文件）并发布 GitHub Release。也可以手动 `git tag vX.Y.Z && git push origin vX.Y.Z` 触发发布（跳过自动递增，要求 `Cargo.toml` 版本与 tag 一致）。
 
 ### 验证安装
 
