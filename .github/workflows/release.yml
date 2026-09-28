@@ -41,7 +41,14 @@ jobs:
       - name: Use pushed tag
         id: resolve
         if: github.event_name == 'push'
-        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          current=$(awk -F'"' '/^\[/{p=($0=="[package]")} p && /^version = /{print $2;exit}' Cargo.toml)
+          if [ "v$current" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${current}"
+            exit 1
+          fi
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Bump version, commit and tag
         id: bump
