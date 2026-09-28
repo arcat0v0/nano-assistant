@@ -200,8 +200,8 @@ mod tests {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
         let tool = ToolSearchTool::new_multi(
             vec![
-                make_deferred_set(vec![make_stub("fs__read", "Read a file")]).await,
-                make_deferred_set(vec![make_stub("db__query", "Query database")]).await,
+                make_deferred_set(vec![make_stub("mcp__fs__read", "Read a file")]).await,
+                make_deferred_set(vec![make_stub("mcp__db__query", "Query database")]).await,
             ],
             Arc::clone(&activated),
         );
@@ -210,26 +210,26 @@ mod tests {
             .call(&mut context, serde_json::json!({"query": "read"}))
             .await
             .unwrap();
-        assert!(output.contains("fs__read"));
-        assert!(!output.contains("db__query"));
-        assert!(activated.lock().is_activated("fs__read"));
-        assert!(!activated.lock().is_activated("db__query"));
+        assert!(output.contains("mcp__fs__read"));
+        assert!(!output.contains("mcp__db__query"));
+        assert!(activated.lock().is_activated("mcp__fs__read"));
+        assert!(!activated.lock().is_activated("mcp__db__query"));
 
         let output = tool
             .call(
                 &mut context,
-                serde_json::json!({"query": "select:db__query,missing"}),
+                serde_json::json!({"query": "select:mcp__db__query,missing"}),
             )
             .await
             .unwrap();
-        assert!(output.contains("db__query"));
+        assert!(output.contains("mcp__db__query"));
         assert!(output.contains("Not found: missing"));
-        assert!(activated.lock().is_activated("db__query"));
+        assert!(activated.lock().is_activated("mcp__db__query"));
         assert_eq!(activated.lock().tool_names().len(), 2);
 
         tool.call(
             &mut context,
-            serde_json::json!({"query": "select:fs__read"}),
+            serde_json::json!({"query": "select:mcp__fs__read"}),
         )
         .await
         .unwrap();
@@ -239,13 +239,13 @@ mod tests {
     #[tokio::test]
     async fn search_serializes_tool_descriptions_as_json() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("fs__read", "Read \"quoted\" paths")]).await,
+            make_deferred_set(vec![make_stub("mcp__fs__read", "Read \"quoted\" paths")]).await,
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
         let output = tool
             .call(
                 &mut ToolContext::new(),
-                serde_json::json!({"query": "select:fs__read"}),
+                serde_json::json!({"query": "select:mcp__fs__read"}),
             )
             .await
             .unwrap();

@@ -65,15 +65,15 @@ mod tests {
             description: Some("Read a file".into()),
             input_schema: schema.clone(),
         };
-        let dynamic = McpToolWrapper::new("fs__read".into(), def, registry).into_dynamic();
+        let dynamic = McpToolWrapper::new("mcp__fs__read".into(), def, registry).into_dynamic();
         let definition = dynamic.definition();
-        assert_eq!(definition.name, "fs__read");
+        assert_eq!(definition.name, "mcp__fs__read");
         assert_eq!(definition.description, "Read a file");
         assert_eq!(definition.parameters, schema);
 
         let tools = ToolSet::from_dynamic_tools(vec![dynamic]);
         let result = tools
-            .execute("fs__read", "{}", &mut ToolContext::new())
+            .execute("mcp__fs__read", "{}", &mut ToolContext::new())
             .await;
         assert!(result.is_error());
         assert!(result

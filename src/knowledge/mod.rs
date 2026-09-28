@@ -102,7 +102,7 @@ mod tests {
         let source = create_source(&config);
         let tools = source_to_tools(source);
         assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0].name(), "wiki.search");
-        assert_eq!(tools[1].name(), "wiki.read");
+        assert_eq!(tools[0].name(), "knowledge__wiki__search");
+        assert_eq!(tools[1].name(), "knowledge__wiki__read");
     }
 }

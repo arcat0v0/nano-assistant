@@ -77,6 +77,11 @@ struct LocalMcp {
 
 impl LocalMcp {
     fn start() -> Self {
+        Self::start_with_tool("echo")
+    }
+
+    fn start_with_tool(tool_name: &str) -> Self {
+        let tool_name = tool_name.to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
@@ -116,7 +121,7 @@ impl LocalMcp {
                         json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
                     }
                     "tools/list" => {
-                        json!({"tools":[{"name":"echo","description":"Echoes a message from the local fixture","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]})
+                        json!({"tools":[{"name":tool_name,"description":"Echoes a message from the local fixture","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]})
                     }
                     "tools/call" => {
                         json!({"content":[{"type":"text","text":"MCP returned the requested marker"}]})
@@ -805,6 +810,82 @@ async fn cli_memory_survives_history_clear_while_conversation_resets() {
 }
 
 #[test]
+fn cli_sends_provider_safe_dynamic_names_and_dispatches_the_selected_skill() {
+    let temp = tempfile::tempdir().unwrap();
+    let skills_dir = temp.path().join("skills");
+    let skill_dir = skills_dir.join("fixture");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.toml"),
+        "[skill]\nname = \"fixture.skill\"\ndescription = \"Local test skill\"\n\n[[tools]]\nname = \"echo-message\"\ndescription = \"Returns a marker\"\nkind = \"shell\"\ncommand = \"printf 'skill backend marker'\"\n",
+    ).unwrap();
+
+    let tool_name = "skill__fixture_2eskill__echo_2dmessage";
+    let endpoint = ScriptedEndpoint::start_with_check(
+        vec![
+            completion(None, vec![tool_call("call_skill", tool_name, json!({}))]),
+            completion(Some("Skill completed."), vec![]),
+        ],
+        move |_, request| {
+            let tools = request["tools"]
+                .as_array()
+                .expect("missing tool definitions");
+            let names: Vec<&str> = tools
+                .iter()
+                .map(|tool| {
+                    tool["function"]["name"]
+                        .as_str()
+                        .expect("missing function name")
+                })
+                .collect();
+            assert!(
+                names.contains(&tool_name),
+                "skill tool not registered: {names:?}"
+            );
+            assert!(
+                names.contains(&"knowledge__arch_2dwiki__search"),
+                "builtin knowledge tools not registered: {names:?}"
+            );
+            assert!(
+                names.iter().all(|name| {
+                    !name.is_empty()
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                        })
+                }),
+                "DeepSeek rejected a function name: {names:?}"
+            );
+        },
+    );
+    let path = config(
+        temp.path(),
+        &endpoint.url,
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        original.replace(
+            "[skills]\nenabled = false",
+            &format!(
+                "[skills]\nenabled = true\nallow_scripts = true\nskills_dir = {:?}",
+                skills_dir.display().to_string()
+            ),
+        ),
+    )
+    .unwrap();
+    let output = run_cli(temp.path(), &path, None, Some("Use the skill tool"));
+    let requests = endpoint.finish();
+    assert_success(&output);
+    assert!(tool_result(&requests[1], "call_skill")
+        .to_string()
+        .contains("skill backend marker"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Skill completed."));
+}
+
+#[test]
 fn cli_discovers_activates_and_uses_local_mcp_tool() {
     let temp = tempfile::tempdir().unwrap();
     let mcp = LocalMcp::start();
@@ -814,14 +895,14 @@ fn cli_discovers_activates_and_uses_local_mcp_tool() {
             vec![tool_call(
                 "call_search",
                 "tool_search",
-                json!({"query":"select:demo__echo"}),
+                json!({"query":"select:mcp__demo__echo"}),
             )],
         ),
         completion(
             None,
             vec![tool_call(
                 "call_mcp",
-                "demo__echo",
+                "mcp__demo__echo",
                 json!({"text":"MCP input marker"}),
             )],
         ),
@@ -852,7 +933,7 @@ fn cli_discovers_activates_and_uses_local_mcp_tool() {
         .contains("The MCP tool returned the requested marker."));
     assert!(tool_result(&requests[1], "call_search")
         .to_string()
-        .contains("demo__echo"));
+        .contains("mcp__demo__echo"));
     assert_eq!(mcp_requests[3]["params"]["name"], "echo");
     assert_eq!(
         mcp_requests[3]["params"]["arguments"]["text"],
@@ -861,6 +942,83 @@ fn cli_discovers_activates_and_uses_local_mcp_tool() {
     assert!(tool_result(&requests[2], "call_mcp")
         .to_string()
         .contains("MCP returned the requested marker"));
+}
+
+#[test]
+fn cli_dispatches_escaped_mcp_name_to_original_backend_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let mcp = LocalMcp::start_with_tool("echo.action_1");
+    let tool_name = "mcp__demo_5fa_2eb__echo_2eaction_5f1";
+    let endpoint = ScriptedEndpoint::start_with_check(
+        vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "call_search",
+                    "tool_search",
+                    json!({"query":format!("select:{tool_name}")}),
+                )],
+            ),
+            completion(
+                None,
+                vec![tool_call(
+                    "call_mcp",
+                    tool_name,
+                    json!({"text":"escaped MCP marker"}),
+                )],
+            ),
+            completion(Some("Escaped MCP tool completed."), vec![]),
+        ],
+        move |step, request| {
+            if step == 2 {
+                let names: Vec<_> = request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["function"]["name"].as_str().unwrap())
+                    .collect();
+                assert!(names.contains(&tool_name));
+                assert!(names.iter().all(|name| {
+                    name.bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+                }));
+            }
+        },
+    );
+    let path = config(
+        temp.path(),
+        &endpoint.url,
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[mcp]\nenabled = true\ndeferred_loading = true\n\n[[mcp.servers]]\nname = \"demo_a.b\"\ntransport = \"http\"\nurl = \"{}\"\n",
+                mcp.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = run_cli(temp.path(), &path, None, Some("Use the MCP tool"));
+    let requests = endpoint.finish();
+    let mcp_requests = mcp.finish();
+    assert_success(&output);
+    assert!(tool_result(&requests[1], "call_search")
+        .to_string()
+        .contains(tool_name));
+    assert!(tool_result(&requests[2], "call_mcp")
+        .to_string()
+        .contains("MCP returned the requested marker"));
+    assert_eq!(mcp_requests[3]["params"]["name"], "echo.action_1");
+    assert_eq!(
+        mcp_requests[3]["params"]["arguments"]["text"],
+        "escaped MCP marker"
+    );
 }
 
 #[test]
@@ -898,14 +1056,14 @@ fn cli_file_edits_reload_mcp_with_relative_or_absolute_config_paths() {
                 vec![tool_call(
                     "call_search_reload",
                     "tool_search",
-                    json!({"query":"select:demo__echo"}),
+                    json!({"query":"select:mcp__demo__echo"}),
                 )],
             ),
             completion(
                 None,
                 vec![tool_call(
                     "call_mcp_reload",
-                    "demo__echo",
+                    "mcp__demo__echo",
                     json!({"text":"MCP reload marker"}),
                 )],
             ),
@@ -952,7 +1110,7 @@ fn cli_file_edits_reload_mcp_with_relative_or_absolute_config_paths() {
             .contains("assistant.toml"));
         assert!(tool_result(&requests[3], "call_search_reload")
             .to_string()
-            .contains("demo__echo"));
+            .contains("mcp__demo__echo"));
         assert!(tool_result(&requests[4], "call_mcp_reload")
             .to_string()
             .contains("MCP returned the requested marker"));
@@ -966,7 +1124,7 @@ fn cli_file_edits_reload_mcp_with_relative_or_absolute_config_paths() {
         assert_eq!(
             registered
                 .iter()
-                .filter(|tool| tool["function"]["name"] == "demo__echo")
+                .filter(|tool| tool["function"]["name"] == "mcp__demo__echo")
                 .count(),
             1
         );
@@ -1309,4 +1467,18 @@ fn cli_model_save_changes_default_for_next_process() {
     assert!(std::fs::read_to_string(path)
         .unwrap()
         .contains("default = \"second\""));
+}
+
+#[test]
+fn tui_without_configured_default_key_can_enter_model_onboarding() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("assistant.toml");
+    std::fs::write(
+        &path,
+        "[provider]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\n[skills]\nenabled = false\n\n[memory]\nenabled = false\n",
+    )
+    .unwrap();
+    let output = run_cli(temp.path(), &path, Some("/help\n/exit\n"), None);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("/model add"));
 }

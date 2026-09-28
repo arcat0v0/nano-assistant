@@ -117,7 +117,11 @@ impl RuntimeState {
                 let mut connected = Vec::new();
                 let mut failed = Vec::new();
                 for server in configs {
-                    let prefix = format!("{}__", server.name);
+                    let prefix = crate::tools::provider_name::dynamic_tool_name(
+                        crate::tools::provider_name::ToolNamespace::Mcp,
+                        &server.name,
+                        "",
+                    );
                     let names: Vec<String> = registry
                         .tool_names()
                         .into_iter()

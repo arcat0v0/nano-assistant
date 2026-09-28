@@ -2966,15 +2966,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest",
-]
-
-[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4703,7 +4694,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "glob",
- "hmac",
  "html2text",
  "libc",
  "nix 0.29.0",

@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- **7 个 LLM Provider**: OpenAI、Anthropic、Gemini、GLM、Ollama，以及 DeepSeek/Kimi/Qwen 等兼容模式
+- **内置模型提供商**: OpenAI、Anthropic、Gemini、GLM、Ollama、DeepSeek、Kimi、MiMo、Qwen，以及自定义兼容接口；交互向导可在线列出模型
 - **Hub 免费模型接入**: `free/*` 模型可自动走 `nana-hub`，支持 machine 注册、签名请求、配额查询与身份迁移
 - **9 个内置工具**: shell、pty_shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search
 - **MCP 协议支持**: 通过 MCP (Model Context Protocol) 接入外部工具服务器（Exa、Context7、Grep.app 等），支持 Stdio/HTTP/SSE 三种传输，延迟加载节省上下文
@@ -138,11 +138,15 @@ Type your prompt and press Enter. Type `exit`, `quit`, or Ctrl+D to quit.
 |------|------|
 | `exit` / `quit` | 退出交互模式 |
 | `clear` | 清除当前对话历史 |
-| `/model` | 查看当前模型及已配置的模型档案 |
+| `/model` | 在终端中打开模型操作菜单：查看档案、切换模型、添加提供商或返回 |
 | `/model <档案名>` | 在当前对话中切换模型，保留对话历史与工具状态 |
 | `/model <档案名> --save` | 切换并保存为下次启动的默认模型 |
+| `/model add` | 选择内置提供商，从其在线目录选择模型并保存本地档案 |
+| `/model add deepseek` | 直接进入指定提供商的模型添加向导 |
 | `Ctrl+D` | 退出交互模式 |
 | `Ctrl+C` | 中断当前正在执行的请求 |
+
+在交互终端输入 `/` 会显示命令候选，按 `↑` / `↓` 选择，按 `→` 补全当前候选，按回车执行；例如输入 `/m` 后按 `→` 可补全为 `/model`。在 `/model` 菜单中用 `↑` / `↓` 选择档案、`Add provider` 或 `Back`，回车执行；切换档案时会询问是否保存为默认值。菜单内输入 `q` 可返回。标准输入为管道时，`/model` 仍只列出档案，不进入按键菜单。
 
 ## 使用教程
 
@@ -201,6 +205,8 @@ na -v "查看当前目录"
 na model add local --provider ollama --model llama3:8b
 na model add work --provider anthropic --model '<你的模型 ID>' --api-key-env ANTHROPIC_API_KEY
 na model list
+na model discover deepseek
+na model discover qwen
 na model use local
 na --profile work "解释这段代码"
 na --model llama3:8b "总结这个文件"
@@ -209,7 +215,11 @@ na model use default
 na model remove work
 ```
 
-`na model use` 修改以后启动的默认档案；`--profile` 和 `--model` 仅对当前进程生效。`--model` 使用当前默认档案的 provider 和 API 地址；同时指定 `--provider` 时必须指定 `--model`，切换到新 provider 不会继承原档案的密钥或地址。交互模式输入 `/model` 可查看档案，`/model work` 只切换本次会话，`/model work --save` 才保存默认值；切换失败会继续使用原模型。`na model list` 列出的是本地档案，不代表上游模型实时可用。切换后原有对话继续传给新模型，因此两边都需要支持当前使用的原生工具调用；若模型不兼容可用 `/clear` 开始新对话。
+`na model use` 修改以后启动的默认档案；`--profile` 和 `--model` 仅对当前进程生效。`--model` 使用当前默认档案的 provider 和 API 地址；同时指定 `--provider` 时必须指定 `--model`，切换到新 provider 不会继承原档案的密钥或地址。交互模式输入 `/model` 可打开模型菜单，也可以继续直接输入 `/model work` 只切换本次会话，`/model work --save` 才保存默认值；切换失败会继续使用原模型。`na model list` 列出的是本地档案，不代表上游模型实时可用。切换后原有对话继续传给新模型，因此两边都需要支持当前使用的原生工具调用；若模型不兼容可用 `/clear` 开始新对话。
+
+首次使用也可以直接运行 `na`，输入 `/model add`，按提示选 DeepSeek、Kimi、GLM、MiMo 或 Qwen，再选择在线模型、档案名及是否保存为默认值；即使原 `[provider]` 尚未设置密钥，也能进入向导。提前在当前进程环境中设置对应 API Key；向导只读取并保存**环境变量名**，不会让你输入或把密钥写入配置。任一步输入 `q`、`cancel` 或 `/cancel` 可放弃；在线查询或切换失败不会覆盖当前模型或写入新档案。也可用 `na model discover <provider>` 单独查询当前目录，`--api-url` 指定自定义聊天 API 基址，`--api-key-env` 指定密钥变量名。目录查询需要网络及可用密钥，不是离线内置型号清单。
+
+GLM 优先尝试账户模型接口；若官方默认接口返回 404/405，则改用 Z.AI 官方实时发布的价格表中的文本模型名称（不是账户授权清单），选择后仍可能因权限受限而无法调用。Qwen 目录按千问且支持函数调用的模型分页获取；其聊天与模型目录为同一地域下的两个不同 API 路径，换地域时要同时选用对应地域的 `--api-url` 和 API Key。旧 GLM JWT 传输已切换为官方 Bearer API Key，请为现有 GLM 档案检查密钥类型。
 
 `--api-key-env` 保存环境变量名称而非密钥内容；启动前给该变量赋值，可通过受控环境注入密钥。未指定时沿用对应 provider 的环境变量及 `NA_API_KEY` 回退；不同档案不会继承旧 `[provider].api_key`。`--config-path` 对聊天和模型管理命令均可用，例如 `na model --config-path ./my-config.toml list`。
 
@@ -317,20 +327,23 @@ explain_tools = true         # 是否在系统提示中包含工具使用说明
 | OpenAI | `openai` | 默认 Provider |
 | Anthropic | `anthropic` | Claude 系列 |
 | Google Gemini | `gemini` | Gemini 系列 |
-| 智谱 GLM | `glm` | GLM-4 系列，使用 JWT 认证 |
+| 智谱 GLM | `glm` | Z.AI 官方 Bearer API Key；默认 `https://api.z.ai/api/paas/v4` |
 | Ollama (本地) | `ollama` | 本地模型，默认 `http://localhost:11434/v1` |
-| DeepSeek | `ollama` | 通过兼容模式，需设置 `api_url` |
-| Kimi (月之暗面) | `ollama` | 通过兼容模式，需设置 `api_url` |
-| Qwen (通义千问) | `ollama` | 通过兼容模式，需设置 `api_url` |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY`，默认 `https://api.deepseek.com` |
+| Kimi (月之暗面) | `kimi` | `MOONSHOT_API_KEY`，默认 `https://api.moonshot.cn/v1` |
+| 小米 MiMo | `mimo` | `MIMO_API_KEY`，使用官方 `api-key` 请求头 |
+| Qwen (通义千问) | `qwen` | `DASHSCOPE_API_KEY`，默认新加坡兼容接口 |
 
-使用兼容模式时的配置示例（以 DeepSeek 为例）：
+使用内置提供商的配置示例：
 
 ```toml
-[provider]
-provider = "ollama"
-api_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
-api_key = "sk-..."
+[models]
+default = "deepseek"
+
+[models.profiles.deepseek]
+provider = "deepseek"
+model = "<从在线目录选择的模型 ID>"
+api_key_env = "DEEPSEEK_API_KEY"
 ```
 
 ### Hub 免费模型与 identity
@@ -413,6 +426,10 @@ whitelist = [
 | `ANTHROPIC_API_KEY` | Anthropic 专用 API Key | `sk-ant-...` |
 | `GEMINI_API_KEY` | Gemini 专用 API Key | `AI...` |
 | `GLM_API_KEY` | GLM 专用 API Key | `...` |
+| `DEEPSEEK_API_KEY` | DeepSeek 专用 API Key | 在进程环境中设置 |
+| `MOONSHOT_API_KEY` | Kimi 专用 API Key | 在进程环境中设置 |
+| `MIMO_API_KEY` | 小米 MiMo 专用 API Key | 在进程环境中设置 |
+| `DASHSCOPE_API_KEY` | Qwen 专用 API Key | 在进程环境中设置 |
 | `NANA_HUB_URL` | 覆盖 `[hub].url` | `https://hub.example.com` |
 | `NANA_HUB_DISABLED` | 临时禁用 hub 路由（`1` / `true`） | `1` |
 | `NANA_IDENTITY_PATH` | 覆盖 identity 文件路径 | `/tmp/nana-identity.key` |

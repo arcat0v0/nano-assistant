@@ -18,6 +18,7 @@ use tokio::time::{timeout, Duration};
 use super::protocol::{JsonRpcRequest, McpToolDef, McpToolsListResult, MCP_PROTOCOL_VERSION};
 use super::transport::{create_transport, McpTransportConn};
 use crate::config::McpServerConfig;
+use crate::tools::provider_name::{dynamic_tool_name, ToolNamespace};
 
 /// Timeout for receiving a response from an MCP server during init/list.
 /// Prevents a hung server from blocking the daemon indefinitely.
@@ -227,7 +228,8 @@ impl McpRegistry {
                     let tools = server.tools().await;
                     for tool in &tools {
                         // Prefix prevents name collisions across servers
-                        let prefixed = format!("{}__{}", config.name, tool.name);
+                        let prefixed =
+                            dynamic_tool_name(ToolNamespace::Mcp, &config.name, &tool.name);
                         tool_index.insert(prefixed, (server_idx, tool.name.clone()));
                     }
                     servers.push(server);
@@ -298,8 +300,8 @@ mod tests {
 
     #[test]
     fn tool_name_prefix_format() {
-        let prefixed = format!("{}__{}", "filesystem", "read_file");
-        assert_eq!(prefixed, "filesystem__read_file");
+        let prefixed = dynamic_tool_name(ToolNamespace::Mcp, "filesystem", "read_file");
+        assert_eq!(prefixed, "mcp__filesystem__read_5ffile");
     }
 
     #[tokio::test]
@@ -388,7 +390,7 @@ mod tests {
         let registry = McpRegistry::connect_all(&[])
             .await
             .expect("connect_all should succeed");
-        let result = registry.get_tool_def("nonexistent__tool").await;
+        let result = registry.get_tool_def("mcp__nonexistent__tool").await;
         assert!(result.is_none());
     }
 
@@ -398,7 +400,7 @@ mod tests {
             .await
             .expect("connect_all should succeed");
         let err = registry
-            .call_tool("nonexistent__tool", serde_json::json!({}))
+            .call_tool("mcp__nonexistent__tool", serde_json::json!({}))
             .await
             .expect_err("should fail for unknown tool");
         assert!(err.to_string().contains("unknown MCP tool"), "got: {err}");

@@ -3,6 +3,7 @@ pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod glob_search;
+pub(crate) mod provider_name;
 pub mod pty_shell;
 pub mod shell;
 pub mod skill_http;

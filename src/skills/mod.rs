@@ -702,7 +702,7 @@ pub fn skills_to_prompt(skills: &[Skill]) -> String {
             if !registered.is_empty() {
                 let _ = writeln!(
                     prompt,
-                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by the exact name below instead of using shell.\">"
                 );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
@@ -710,7 +710,11 @@ pub fn skills_to_prompt(skills: &[Skill]) -> String {
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}.{}", skill.name, tool.name),
+                        &crate::tools::provider_name::dynamic_tool_name(
+                            crate::tools::provider_name::ToolNamespace::Skill,
+                            &skill.name,
+                            &tool.name,
+                        ),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -1424,7 +1428,7 @@ command = "echo hello"
         assert!(prompt.contains("<description>A test</description>"));
         assert!(prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(prompt.contains("<callable_tools"));
-        assert!(prompt.contains("<name>test.run</name>"));
+        assert!(prompt.contains("<name>skill__test__run</name>"));
     }
 
     #[test]

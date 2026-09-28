@@ -56,6 +56,14 @@ pub enum ModelSubcommand {
         #[arg(long)]
         api_key_env: Option<String>,
     },
+    #[command(about = "List live model IDs for a built-in provider")]
+    Discover {
+        provider: String,
+        #[arg(long, help = "Override the provider API base URL")]
+        api_url: Option<String>,
+        #[arg(long, help = "Name of the environment variable holding the API key")]
+        api_key_env: Option<String>,
+    },
     Remove {
         name: String,
     },
@@ -156,5 +164,49 @@ impl CliArgs {
 
     pub fn is_debug(&self) -> bool {
         matches!(&self.command, Some(Commands::Chat { debug: true, .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_discover_parses_provider_and_optional_endpoint_and_key_env() {
+        let args = CliArgs::parse_from([
+            "na",
+            "model",
+            "discover",
+            "qwen",
+            "--api-url",
+            "http://localhost:8000/compatible-mode/v1",
+            "--api-key-env",
+            "TEST_CATALOG_KEY",
+        ]);
+        assert!(matches!(
+            args.command,
+            Some(Commands::Model {
+                action: ModelSubcommand::Discover {
+                    provider,
+                    api_url: Some(api_url),
+                    api_key_env: Some(api_key_env),
+                },
+                ..
+            }) if provider == "qwen"
+                && api_url == "http://localhost:8000/compatible-mode/v1"
+                && api_key_env == "TEST_CATALOG_KEY"
+        ));
+        let bare = CliArgs::parse_from(["na", "model", "discover", "glm"]);
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Model {
+                action: ModelSubcommand::Discover {
+                    provider,
+                    api_url: None,
+                    api_key_env: None,
+                },
+                ..
+            }) if provider == "glm"
+        ));
     }
 }

@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::provider_name::{dynamic_tool_name, ToolNamespace};
 use crate::skills::SkillTool;
 
 const SHELL_TIMEOUT_SECS: u64 = 60;
@@ -21,7 +22,7 @@ pub struct SkillShellTool {
 
 impl SkillShellTool {
     pub fn new(skill_name: &str, tool: &SkillTool) -> Self {
-        let tool_name = format!("{}.{}", skill_name, tool.name);
+        let tool_name = dynamic_tool_name(ToolNamespace::Skill, skill_name, &tool.name);
         let command = tool.command.clone();
         let args = tool.args.clone();
         Self {
@@ -139,7 +140,7 @@ mod tests {
         let tools = rig::tool::ToolSet::from_dynamic_tools(vec![dynamic]);
         let result = tools
             .execute(
-                "demo.echo",
+                "skill__demo__echo",
                 json!({"msg": "hello world"}).to_string(),
                 &mut rig::tool::ToolContext::default(),
             )

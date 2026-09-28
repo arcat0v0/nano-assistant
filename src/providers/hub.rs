@@ -1,12 +1,9 @@
+use crate::hub::HubClient;
 use bytes::Bytes;
 use futures::StreamExt;
 use rig::http_client::{self, HttpClientExt, LazyBody, MultipartForm, Request, Response};
 use rig::wasm_compat::WasmCompatSend;
 use std::future::Future;
-use std::sync::Arc;
-
-use super::glm::GlmAuth;
-use crate::hub::HubClient;
 
 #[derive(Clone, Default)]
 pub(super) struct AuthenticatedTransport {
@@ -17,7 +14,7 @@ pub(super) struct AuthenticatedTransport {
 #[derive(Clone)]
 enum Authentication {
     Hub(HubClient),
-    Glm(Arc<GlmAuth>),
+    Mimo(String),
     AnthropicOAuth(String),
 }
 
@@ -25,7 +22,7 @@ impl std::fmt::Debug for AuthenticatedTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mode = match self.auth {
             Some(Authentication::Hub(_)) => "hub",
-            Some(Authentication::Glm(_)) => "glm",
+            Some(Authentication::Mimo(_)) => "mimo",
             Some(Authentication::AnthropicOAuth(_)) => "anthropic-oauth",
             None => "unconfigured",
         };
@@ -43,11 +40,11 @@ impl AuthenticatedTransport {
         }
     }
 
-    pub(super) fn glm(key: &str, client: reqwest::Client) -> anyhow::Result<Self> {
-        Ok(Self {
+    pub(super) fn mimo(key: String, client: reqwest::Client) -> Self {
+        Self {
             client,
-            auth: Some(Authentication::Glm(Arc::new(GlmAuth::new(key)?))),
-        })
+            auth: Some(Authentication::Mimo(key)),
+        }
     }
 
     pub(super) fn anthropic_oauth(key: String, client: reqwest::Client) -> Self {
@@ -78,16 +75,13 @@ impl AuthenticatedTransport {
                     .await
                     .map_err(|error| transport_error(error.to_string()))?
             }
-            Some(Authentication::Glm(auth)) => {
-                let token = auth
-                    .token()
-                    .map_err(|error| transport_error(error.to_string()))?;
+            Some(Authentication::Mimo(key)) => {
                 let mut headers = parts.headers;
                 headers.remove(reqwest::header::AUTHORIZATION);
                 self.client
                     .request(parts.method, parts.uri.to_string())
                     .headers(headers)
-                    .bearer_auth(token)
+                    .header("api-key", key.as_str())
                     .body(body)
                     .send()
                     .await

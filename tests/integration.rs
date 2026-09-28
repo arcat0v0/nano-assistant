@@ -290,8 +290,49 @@ command = "https://httpbin.org/get"
 
     let tools = nano_assistant::skills::skills_to_tools(&skills);
     assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0].name(), "test-toml.hello");
-    assert_eq!(tools[1].name(), "test-toml.http_check");
+    assert_eq!(tools[0].name(), "skill__test_2dtoml__hello");
+    assert_eq!(tools[1].name(), "skill__test_2dtoml__http_5fcheck");
+}
+
+#[test]
+fn skill_tool_names_keep_dots_underscores_and_hyphens_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    for (directory, skill_name, tool_name) in [
+        ("one", "a_b", "execute"),
+        ("two", "a.b", "execute"),
+        ("three", "a-b", "execute"),
+        ("four", "a", "b_execute"),
+    ] {
+        let skill_dir = dir.path().join(directory);
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{skill_name}\"\ndescription = \"Fixture\"\n\n[[tools]]\nname = \"{tool_name}\"\ndescription = \"Fixture\"\nkind = \"shell\"\ncommand = \"printf ok\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    let skills = nano_assistant::skills::load_skills_from_directory(
+        dir.path(),
+        false,
+        nano_assistant::skills::SkillSource::UserDir(dir.path().to_path_buf()),
+    );
+    assert_eq!(skills.len(), 4);
+    let mut names: Vec<_> = nano_assistant::skills::skills_to_tools(&skills)
+        .iter()
+        .map(|tool| tool.name().to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "skill__a_2db__execute",
+            "skill__a_2eb__execute",
+            "skill__a_5fb__execute",
+            "skill__a__b_5fexecute",
+        ]
+    );
 }
 
 #[test]

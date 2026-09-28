@@ -1,5 +1,7 @@
-mod glm;
+mod catalog;
 mod hub;
+
+pub use catalog::{builtin_providers, discover_models, preset, ProviderPreset};
 
 use std::path::Path;
 use std::time::Duration;
@@ -129,21 +131,33 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
                 gemini.completion_model(model.strip_prefix("models/").unwrap_or(model)),
             ))
         }
-        "glm" => {
+        "deepseek" | "kimi" | "glm" | "mimo" | "qwen" => {
+            let preset = preset(provider).expect("built-in provider has a preset");
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "GLM_API_KEY"]))
-                .context("GLM API key not set. Set GLM_API_KEY or edit config.toml.")?;
-            let transport = hub::AuthenticatedTransport::glm(&key, client)?;
-            let openai = openai::CompletionsClient::builder()
-                .api_key("glm-signed")
-                .base_url(
-                    base_url
-                        .unwrap_or("https://api.z.ai/api/paas/v4")
-                        .trim_end_matches('/'),
-                )
-                .http_client(transport)
-                .build()?;
-            Ok(ModelHandle::named(provider, openai.completion_model(model)))
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY", preset.api_key_env]))
+                .with_context(|| {
+                    format!(
+                        "{provider} API key not set. Set {} or edit config.toml.",
+                        preset.api_key_env
+                    )
+                })?;
+            let url = base_url.unwrap_or(preset.base_url).trim_end_matches('/');
+            if provider == "mimo" {
+                let transport = hub::AuthenticatedTransport::mimo(key.clone(), client);
+                let openai = openai::CompletionsClient::builder()
+                    .api_key(key)
+                    .base_url(url)
+                    .http_client(transport)
+                    .build()?;
+                Ok(ModelHandle::named(provider, openai.completion_model(model)))
+            } else {
+                let openai = openai::CompletionsClient::builder()
+                    .api_key(key)
+                    .base_url(url)
+                    .http_client(client)
+                    .build()?;
+                Ok(ModelHandle::named(provider, openai.completion_model(model)))
+            }
         }
         "ollama" | "compatible" => {
             let key = profile_key
@@ -162,7 +176,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             Ok(ModelHandle::named(provider, openai.completion_model(model)))
         }
         other => anyhow::bail!(
-            "unknown provider: '{other}'. Valid: openai, anthropic, gemini, glm, ollama, compatible"
+            "unknown provider: '{other}'. Valid: openai, anthropic, gemini, deepseek, kimi, glm, mimo, qwen, ollama, compatible"
         ),
     }
 }

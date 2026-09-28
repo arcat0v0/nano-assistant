@@ -3,6 +3,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::KnowledgeSource;
+use crate::tools::provider_name::{dynamic_tool_name, ToolNamespace};
 
 const MAX_READ_CHARS: usize = 50_000;
 
@@ -15,7 +16,7 @@ pub struct KnowledgeSearchTool {
 
 impl KnowledgeSearchTool {
     pub fn new(source: Arc<Box<dyn KnowledgeSource>>) -> Self {
-        let tool_name = format!("{}.search", source.name());
+        let tool_name = dynamic_tool_name(ToolNamespace::Knowledge, source.name(), "search");
         let tool_description = format!(
             "Search {} for relevant pages. Returns titles, snippets, and page IDs.",
             source.description()
@@ -78,7 +79,7 @@ pub struct KnowledgeReadTool {
 
 impl KnowledgeReadTool {
     pub fn new(source: Arc<Box<dyn KnowledgeSource>>) -> Self {
-        let tool_name = format!("{}.read", source.name());
+        let tool_name = dynamic_tool_name(ToolNamespace::Knowledge, source.name(), "read");
         let tool_description = format!(
             "Read a page from {}. Use page_id from search results. \
              Optionally specify a section name to read only that section.",
@@ -236,10 +237,16 @@ mod tests {
         let tools = super::super::source_to_tools(Box::new(ExampleSource));
         let tools = ToolSet::from_dynamic_tools(tools);
         let mut context = ToolContext::new();
-        let missing_query = tools.execute("wiki.search", "{}", &mut context).await;
+        let missing_query = tools
+            .execute("knowledge__wiki__search", "{}", &mut context)
+            .await;
         assert!(missing_query.is_error_kind(ToolErrorKind::InvalidArgs));
         let search = tools
-            .execute("wiki.search", r#"{"query":"rust","limit":3}"#, &mut context)
+            .execute(
+                "knowledge__wiki__search",
+                r#"{"query":"rust","limit":3}"#,
+                &mut context,
+            )
             .await;
         let results: Vec<super::super::SearchResult> =
             serde_json::from_str(search.output().as_text().unwrap()).unwrap();
@@ -247,7 +254,7 @@ mod tests {
         assert_eq!(results[0].page_id, "42");
         let read = tools
             .execute(
-                "wiki.read",
+                "knowledge__wiki__read",
                 r#"{"page_id":"42","section":"Overview"}"#,
                 &mut context,
             )

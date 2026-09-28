@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::provider_name::{dynamic_tool_name, ToolNamespace};
 use crate::skills::SkillTool;
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
@@ -21,7 +22,7 @@ pub struct SkillHttpTool {
 
 impl SkillHttpTool {
     pub fn new(skill_name: &str, tool: &SkillTool) -> Self {
-        let tool_name = format!("{}.{}", skill_name, tool.name);
+        let tool_name = dynamic_tool_name(ToolNamespace::Skill, skill_name, &tool.name);
         let url = tool.command.clone();
         let args = tool.args.clone();
         Self {

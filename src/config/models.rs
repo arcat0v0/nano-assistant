@@ -113,7 +113,16 @@ fn select_model(
 fn validate_profile(profile: &ModelProfile) -> anyhow::Result<()> {
     if !matches!(
         profile.provider.as_str(),
-        "openai" | "anthropic" | "gemini" | "glm" | "ollama" | "compatible"
+        "openai"
+            | "anthropic"
+            | "gemini"
+            | "deepseek"
+            | "kimi"
+            | "glm"
+            | "mimo"
+            | "qwen"
+            | "ollama"
+            | "compatible"
     ) {
         bail!("unknown model profile provider: '{}'", profile.provider);
     }
@@ -558,6 +567,14 @@ mod tests {
             load_config_or_default(&path).models.default.as_deref(),
             Some("user.private")
         );
+    }
+
+    #[test]
+    fn built_in_vendor_profiles_are_valid_and_unknown_provider_is_rejected() {
+        for provider in ["deepseek", "kimi", "glm", "mimo", "qwen"] {
+            assert!(validate_profile(&profile(provider, "live-model")).is_ok());
+        }
+        assert!(validate_profile(&profile("unlisted-provider", "live-model")).is_err());
     }
 
     #[test]

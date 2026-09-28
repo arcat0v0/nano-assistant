@@ -75,24 +75,13 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         Some(super::Commands::Model {
             config_path,
             action,
-        }) => handle_model_command(config_path.unwrap_or_else(default_config_path), action),
+        }) => handle_model_command(config_path.unwrap_or_else(default_config_path), action).await,
         None => {
             let config_path = default_config_path();
             let catalog = load_config_or_default(&config_path);
             let (config, selected) = resolve_selection(&catalog, None, None, None)?;
             let security_mode = resolve_security_mode(None, &config);
-            let model = crate::providers::build_model(&config, &config_path)?;
-            let system_info = load_or_create_memory_md().await;
-            run_interactive(
-                model,
-                &config,
-                config_path,
-                security_mode,
-                system_info,
-                catalog,
-                selected,
-            )
-            .await
+            run_interactive(config, config_path, security_mode, catalog, selected).await
         }
     }
 }
@@ -137,24 +126,11 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
             .await;
             run_single(agent, &prompt, streaming, &config, &config_path).await
         }
-        None => {
-            let model = crate::providers::build_model(&config, &config_path)?;
-            let system_info = load_or_create_memory_md().await;
-            run_interactive(
-                model,
-                &config,
-                config_path,
-                security_mode,
-                system_info,
-                catalog,
-                selected,
-            )
-            .await
-        }
+        None => run_interactive(config, config_path, security_mode, catalog, selected).await,
     }
 }
 
-fn handle_model_command(
+async fn handle_model_command(
     config_path: std::path::PathBuf,
     action: ModelSubcommand,
 ) -> anyhow::Result<()> {
@@ -198,6 +174,21 @@ fn handle_model_command(
             )?;
             println!("Added model profile {name}");
         }
+        ModelSubcommand::Discover {
+            provider,
+            api_url,
+            api_key_env,
+        } => {
+            for model in crate::providers::discover_models(
+                &provider,
+                api_url.as_deref(),
+                api_key_env.as_deref(),
+            )
+            .await?
+            {
+                println!("{model}");
+            }
+        }
         ModelSubcommand::Use { name } => {
             let (effective, _) = resolve_selection(&config, Some(&name), None, None)?;
             crate::providers::build_model(&effective, &config_path)?;
@@ -233,7 +224,7 @@ pub(crate) fn memory_md_path() -> std::path::PathBuf {
     crate::platform::current_platform().memory_md_path()
 }
 
-async fn load_or_create_memory_md() -> Option<String> {
+pub(crate) async fn load_or_create_memory_md() -> Option<String> {
     let path = memory_md_path();
 
     if path.exists() {
@@ -272,7 +263,7 @@ async fn load_or_create_memory_md() -> Option<String> {
     }
 }
 
-async fn build_agent(
+pub(crate) async fn build_agent(
     model: ModelHandle,
     config: &Config,
     security_mode: SecurityMode,
@@ -373,35 +364,23 @@ async fn run_single(
 }
 
 async fn run_interactive(
-    model: ModelHandle,
-    config: &Config,
+    config: Config,
     config_path: std::path::PathBuf,
     security_mode: SecurityMode,
-    system_info: Option<String>,
     catalog: Config,
     selected: String,
 ) -> anyhow::Result<()> {
-    let agent = build_agent(
-        model,
-        config,
-        security_mode,
-        None,
-        system_info,
-        config_path.clone(),
-    )
-    .await;
     let history_path = config_path
         .parent()
         .unwrap_or(Path::new("."))
         .join("history.txt");
     crate::tui::run_tui(
-        agent,
-        config.behavior.streaming,
-        history_path,
-        config.clone(),
+        config,
         config_path,
         catalog,
         selected,
+        history_path,
+        security_mode,
     )
     .await
 }

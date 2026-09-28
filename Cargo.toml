@@ -71,8 +71,6 @@ uuid = { version = "1", features = ["v4"] }
 # Directories (config path resolution)
 directories = "5"
 
-# HMAC for JWT (GLM provider)
-hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }

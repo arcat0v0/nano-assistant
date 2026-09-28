@@ -21,7 +21,7 @@ use rig::tool::DynamicTool;
 /// information to construct the full [`McpToolWrapper`] on activation.
 #[derive(Debug, Clone)]
 pub struct DeferredMcpToolStub {
-    /// Prefixed name: `<server_name>__<tool_name>`.
+    /// Provider-safe name identifying the originating server and backend tool.
     pub prefixed_name: String,
     /// Human-readable description (extracted from the MCP tool definition).
     pub description: String,
@@ -113,8 +113,9 @@ impl DeferredMcpToolSet {
             .iter()
             .filter_map(|stub| {
                 let haystack = format!(
-                    "{} {}",
+                    "{} {} {}",
                     stub.prefixed_name.to_ascii_lowercase(),
+                    stub.def.name.to_ascii_lowercase(),
                     stub.description.to_ascii_lowercase()
                 );
                 let hits = terms
@@ -224,7 +225,7 @@ mod tests {
 
     #[test]
     fn stub_uses_description_from_def() {
-        let stub = make_stub("fs__read", "Read a file");
+        let stub = make_stub("mcp__fs__read", "Read a file");
         assert_eq!(stub.description, "Read a file");
     }
 
@@ -235,7 +236,7 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
         };
-        let stub = DeferredMcpToolStub::new("srv__mystery".into(), def);
+        let stub = DeferredMcpToolStub::new("mcp__srv__mystery".into(), def);
         assert_eq!(stub.description, "MCP tool");
     }
 
@@ -243,16 +244,16 @@ mod tests {
     async fn deferred_activation_materializes_rig_tool() {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
         let set = DeferredMcpToolSet {
-            stubs: vec![make_stub("fs__read", "Read a file")],
+            stubs: vec![make_stub("mcp__fs__read", "Read a file")],
             registry,
         };
         assert!(set.activate("missing").is_none());
-        let tool = set.activate("fs__read").unwrap();
-        assert_eq!(tool.definition().name, "fs__read");
+        let tool = set.activate("mcp__fs__read").unwrap();
+        assert_eq!(tool.definition().name, "mcp__fs__read");
         let mut activated = ActivatedToolSet::new();
         activated.activate(tool);
-        assert!(activated.is_activated("fs__read"));
-        assert_eq!(activated.tool_names(), vec!["fs__read"]);
+        assert!(activated.is_activated("mcp__fs__read"));
+        assert_eq!(activated.tool_names(), vec!["mcp__fs__read"]);
     }
     #[test]
     fn build_deferred_section_empty_when_no_stubs() {
@@ -271,8 +272,8 @@ mod tests {
     #[test]
     fn build_deferred_section_lists_names() {
         let stubs = vec![
-            make_stub("fs__read_file", "Read a file"),
-            make_stub("git__status", "Git status"),
+            make_stub("mcp__fs__read_5ffile", "Read a file"),
+            make_stub("mcp__git__status", "Git status"),
         ];
         let set = DeferredMcpToolSet {
             stubs,
@@ -285,14 +286,14 @@ mod tests {
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
-        assert!(section.contains("fs__read_file - Read a file"));
-        assert!(section.contains("git__status - Git status"));
+        assert!(section.contains("mcp__fs__read_5ffile - Read a file"));
+        assert!(section.contains("mcp__git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
     }
 
     #[test]
     fn build_deferred_section_includes_tool_search_instruction() {
-        let stubs = vec![make_stub("fs__read_file", "Read a file")];
+        let stubs = vec![make_stub("mcp__fs__read_5ffile", "Read a file")];
         let set = DeferredMcpToolSet {
             stubs,
             registry: std::sync::Arc::new(
@@ -316,9 +317,9 @@ mod tests {
     #[test]
     fn build_deferred_section_multiple_servers() {
         let stubs = vec![
-            make_stub("server_a__list", "List items"),
-            make_stub("server_a__create", "Create item"),
-            make_stub("server_b__query", "Query records"),
+            make_stub("mcp__server_5fa__list", "List items"),
+            make_stub("mcp__server_5fa__create", "Create item"),
+            make_stub("mcp__server_5fb__query", "Query records"),
         ];
         let set = DeferredMcpToolSet {
             stubs,
@@ -330,9 +331,9 @@ mod tests {
             ),
         };
         let section = build_deferred_tools_section(&set);
-        assert!(section.contains("server_a__list"));
-        assert!(section.contains("server_a__create"));
-        assert!(section.contains("server_b__query"));
+        assert!(section.contains("mcp__server_5fa__list"));
+        assert!(section.contains("mcp__server_5fa__create"));
+        assert!(section.contains("mcp__server_5fb__query"));
         assert!(
             section.contains("tool_search"),
             "section must mention tool_search for multi-server setups"
@@ -341,10 +342,12 @@ mod tests {
 
     #[test]
     fn keyword_search_ranks_by_hits() {
+        let mut read = make_stub("mcp__fs__read_5ffile", "Read a file from disk");
+        read.def.name = "read_file".into();
         let stubs = vec![
-            make_stub("fs__read_file", "Read a file from disk"),
-            make_stub("fs__write_file", "Write a file to disk"),
-            make_stub("git__log", "Show git log"),
+            read,
+            make_stub("mcp__fs__write_5ffile", "Write a file to disk"),
+            make_stub("mcp__git__log", "Show git log"),
         ];
         let set = DeferredMcpToolSet {
             stubs,
@@ -356,17 +359,20 @@ mod tests {
             ),
         };
 
-        // "file read" should rank fs__read_file highest (2 hits vs 1)
+        // "file read" should rank the matching tool highest (2 hits vs 1)
         let results = set.search("file read", 5);
         assert!(!results.is_empty());
-        assert_eq!(results[0].prefixed_name, "fs__read_file");
+        assert_eq!(results[0].prefixed_name, "mcp__fs__read_5ffile");
+        let results = set.search("read_file", 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].prefixed_name, "mcp__fs__read_5ffile");
     }
 
     #[test]
     fn get_by_name_returns_correct_stub() {
         let stubs = vec![
-            make_stub("a__one", "Tool one"),
-            make_stub("b__two", "Tool two"),
+            make_stub("mcp__a__one", "Tool one"),
+            make_stub("mcp__b__two", "Tool two"),
         ];
         let set = DeferredMcpToolSet {
             stubs,
@@ -377,15 +383,18 @@ mod tests {
                     .unwrap(),
             ),
         };
-        assert!(set.get_by_name("a__one").is_some());
+        assert!(set.get_by_name("mcp__a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
     }
 
     #[test]
     fn search_across_multiple_servers() {
         let stubs = vec![
-            make_stub("server_a__read_file", "Read a file from disk"),
-            make_stub("server_b__read_config", "Read configuration from database"),
+            make_stub("mcp__server_5fa__read_5ffile", "Read a file from disk"),
+            make_stub(
+                "mcp__server_5fb__read_5fconfig",
+                "Read configuration from database",
+            ),
         ];
         let set = DeferredMcpToolSet {
             stubs,
@@ -404,11 +413,11 @@ mod tests {
         // "file" should match only server_a
         let results = set.search("file", 10);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].prefixed_name, "server_a__read_file");
+        assert_eq!(results[0].prefixed_name, "mcp__server_5fa__read_5ffile");
 
         // "config database" should rank server_b highest (2 hits)
         let results = set.search("config database", 10);
         assert!(!results.is_empty());
-        assert_eq!(results[0].prefixed_name, "server_b__read_config");
+        assert_eq!(results[0].prefixed_name, "mcp__server_5fb__read_5fconfig");
     }
 }
