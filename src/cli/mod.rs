@@ -43,10 +43,30 @@ pub enum IdentitySubcommand {
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
+pub enum ModelSubcommand {
+    List,
+    Add {
+        name: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        api_url: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Use {
+        name: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
 pub enum Commands {
-    #[command(trailing_var_arg = true)]
     Chat {
-        #[arg(trailing_var_arg = true)]
         prompt: Vec<String>,
         #[arg(long, value_name = "MODE")]
         mode: Option<String>,
@@ -58,6 +78,12 @@ pub enum Commands {
         config_path: Option<PathBuf>,
         #[arg(short, long)]
         verbose: bool,
+        #[arg(long, conflicts_with = "model")]
+        profile: Option<String>,
+        #[arg(long, conflicts_with = "profile")]
+        model: Option<String>,
+        #[arg(long, requires = "model")]
+        provider: Option<String>,
     },
     Skills {
         #[command(subcommand)]
@@ -70,6 +96,12 @@ pub enum Commands {
     Identity {
         #[command(subcommand)]
         action: IdentitySubcommand,
+    },
+    Model {
+        #[arg(long, value_name = "PATH")]
+        config_path: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ModelSubcommand,
     },
 }
 

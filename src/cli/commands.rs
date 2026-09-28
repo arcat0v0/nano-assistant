@@ -5,8 +5,11 @@ use std::sync::Arc;
 
 use crate::agent::turn_streamed_to_stdout;
 use crate::agent::Agent;
+use crate::config::models::{
+    add_profile, list_profiles, remove_profile, resolve_selection, set_default_profile,
+};
 use crate::config::schema::default_config_path;
-use crate::config::{load_config_or_default, Config};
+use crate::config::{load_config_or_default, Config, ModelProfile};
 use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use anyhow::Context;
@@ -15,6 +18,7 @@ use rig::agent::model::ModelHandle;
 use super::CliArgs;
 use super::HubSubcommand;
 use super::IdentitySubcommand;
+use super::ModelSubcommand;
 use super::SkillsSubcommand;
 
 struct CliArgsInner {
@@ -24,6 +28,9 @@ struct CliArgsInner {
     config: bool,
     config_path: Option<std::path::PathBuf>,
     verbose: bool,
+    profile: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
 }
 
 impl CliArgsInner {
@@ -45,6 +52,9 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             config,
             config_path,
             verbose,
+            profile,
+            model,
+            provider,
         }) => {
             let inner = CliArgsInner {
                 prompt,
@@ -53,17 +63,24 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 config,
                 config_path,
                 verbose,
+                profile,
+                model,
+                provider,
             };
             run_chat(inner).await
         }
         Some(super::Commands::Skills { action }) => handle_skills_command(action).await,
         Some(super::Commands::Hub { action }) => handle_hub_command(action).await,
         Some(super::Commands::Identity { action }) => handle_identity_command(action).await,
+        Some(super::Commands::Model {
+            config_path,
+            action,
+        }) => handle_model_command(config_path.unwrap_or_else(default_config_path), action),
         None => {
             let config_path = default_config_path();
-            let config = load_config_or_default(&config_path);
+            let catalog = load_config_or_default(&config_path);
+            let (config, selected) = resolve_selection(&catalog, None, None, None)?;
             let security_mode = resolve_security_mode(None, &config);
-            let streaming = config.behavior.streaming;
             let model = crate::providers::build_model(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             run_interactive(
@@ -71,8 +88,9 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 &config,
                 config_path,
                 security_mode,
-                streaming,
                 system_info,
+                catalog,
+                selected,
             )
             .await
         }
@@ -86,7 +104,13 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
     }
 
     let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
-    let mut config = load_config_or_default(&config_path);
+    let catalog = load_config_or_default(&config_path);
+    let (mut config, selected) = resolve_selection(
+        &catalog,
+        args.profile.as_deref(),
+        args.model.as_deref(),
+        args.provider.as_deref(),
+    )?;
     let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
     config.behavior.debug = resolve_debug_mode(args.debug, &config);
     let streaming = config.behavior.streaming;
@@ -121,12 +145,71 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
                 &config,
                 config_path,
                 security_mode,
-                streaming,
                 system_info,
+                catalog,
+                selected,
             )
             .await
         }
     }
+}
+
+fn handle_model_command(
+    config_path: std::path::PathBuf,
+    action: ModelSubcommand,
+) -> anyhow::Result<()> {
+    let config = load_config_or_default(&config_path);
+    match action {
+        ModelSubcommand::List => {
+            let selected = config.models.default.as_deref().unwrap_or("default");
+            let provider = config.provider.provider.as_deref().unwrap_or("openai");
+            let model = config.provider.model.as_deref().unwrap_or("gpt-4o-mini");
+            println!(
+                "{} default  {provider}  {model}",
+                if selected == "default" { "*" } else { " " }
+            );
+            for (name, profile) in list_profiles(&config) {
+                println!(
+                    "{} {name}  {}  {}",
+                    if selected == name { "*" } else { " " },
+                    profile.provider,
+                    profile.model
+                );
+            }
+        }
+        ModelSubcommand::Add {
+            name,
+            provider,
+            model,
+            api_url,
+            api_key_env,
+        } => {
+            add_profile(
+                &config_path,
+                &name,
+                ModelProfile {
+                    provider,
+                    model,
+                    api_url,
+                    api_key_env,
+                    temperature: None,
+                    timeout_secs: None,
+                },
+            )?;
+            println!("Added model profile {name}");
+        }
+        ModelSubcommand::Use { name } => {
+            let (effective, _) = resolve_selection(&config, Some(&name), None, None)?;
+            crate::providers::build_model(&effective, &config_path)?;
+            set_default_profile(&config_path, &name)?;
+            println!("Default model: {name}");
+        }
+        ModelSubcommand::Remove { name } => {
+            remove_profile(&config_path, &name)?;
+            println!("Removed model profile {name}");
+        }
+    }
+    Ok(())
 }
 
 fn resolve_security_mode(mode_override: Option<&str>, config: &Config) -> SecurityMode {
@@ -294,8 +377,9 @@ async fn run_interactive(
     config: &Config,
     config_path: std::path::PathBuf,
     security_mode: SecurityMode,
-    streaming: bool,
     system_info: Option<String>,
+    catalog: Config,
+    selected: String,
 ) -> anyhow::Result<()> {
     let agent = build_agent(
         model,
@@ -310,7 +394,16 @@ async fn run_interactive(
         .parent()
         .unwrap_or(Path::new("."))
         .join("history.txt");
-    crate::tui::run_tui(agent, streaming, history_path, config.clone(), config_path).await
+    crate::tui::run_tui(
+        agent,
+        config.behavior.streaming,
+        history_path,
+        config.clone(),
+        config_path,
+        catalog,
+        selected,
+    )
+    .await
 }
 
 fn spawn_immediate_ctrl_c_exit() -> tokio::task::JoinHandle<()> {
@@ -784,6 +877,24 @@ mod tests {
     fn cli_chat_debug_flag() {
         let args = parse_chat(&["--debug"]);
         assert!(args.is_debug());
+    }
+
+    #[test]
+    fn chat_help_is_not_sent_as_a_model_prompt() {
+        let error = CliArgs::try_parse_from(["na", "chat", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn chat_model_override_and_prompt_are_parsed_together() {
+        let args = parse_chat(&["--model", "llama3:8b", "explain", "the", "result"]);
+        match args.command {
+            Some(super::super::Commands::Chat { model, prompt, .. }) => {
+                assert_eq!(model.as_deref(), Some("llama3:8b"));
+                assert_eq!(prompt, ["explain", "the", "result"]);
+            }
+            _ => panic!("expected chat command"),
+        }
     }
 
     #[test]

@@ -19,8 +19,28 @@ fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
         .or_else(|| config.provider.api_key.clone())
 }
 
+fn profile_key(config: &Config) -> anyhow::Result<Option<String>> {
+    let Some(name) = config.active_profile.as_deref() else {
+        return Ok(None);
+    };
+    let profile = config
+        .models
+        .profiles
+        .get(name)
+        .with_context(|| format!("model profile '{name}' not found"))?;
+    let Some(env_name) = profile.api_key_env.as_deref() else {
+        return Ok(None);
+    };
+    std::env::var(env_name)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Some)
+        .with_context(|| format!("model profile '{name}' requires environment variable {env_name}"))
+}
+
 pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelHandle> {
     let model = config.provider.model.as_deref().unwrap_or("gpt-4o-mini");
+    let profile_key = profile_key(config)?;
     if model_routes_via_hub(config) {
         let resolved = resolve_hub_config(config);
         let client = HubClient::new(config_path.to_path_buf(), config.clone())?;
@@ -49,7 +69,8 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
 
     match provider {
         "openai" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "OPENAI_API_KEY"])
+            let key = profile_key
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "OPENAI_API_KEY"]))
                 .context("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")?;
             let openai = openai::CompletionsClient::builder()
                 .api_key(key)
@@ -63,7 +84,8 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             Ok(ModelHandle::named(provider, openai.completion_model(model)))
         }
         "anthropic" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "ANTHROPIC_API_KEY"])
+            let key = profile_key
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "ANTHROPIC_API_KEY"]))
                 .context("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")?;
             let base = base_url.unwrap_or("https://api.anthropic.com");
             if key.starts_with("sk-ant-oat01-") {
@@ -90,7 +112,8 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             }
         }
         "gemini" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "GEMINI_API_KEY"])
+            let key = profile_key
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "GEMINI_API_KEY"]))
                 .context("Gemini API key not set. Set GEMINI_API_KEY or edit config.toml.")?;
             let base = base_url
                 .unwrap_or("https://generativelanguage.googleapis.com")
@@ -107,7 +130,8 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             ))
         }
         "glm" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "GLM_API_KEY"])
+            let key = profile_key
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "GLM_API_KEY"]))
                 .context("GLM API key not set. Set GLM_API_KEY or edit config.toml.")?;
             let transport = hub::AuthenticatedTransport::glm(&key, client)?;
             let openai = openai::CompletionsClient::builder()
@@ -122,7 +146,8 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             Ok(ModelHandle::named(provider, openai.completion_model(model)))
         }
         "ollama" | "compatible" => {
-            let key = resolve_api_key(config, &["NA_API_KEY"])
+            let key = profile_key
+                .or_else(|| resolve_api_key(config, &["NA_API_KEY"]))
                 .unwrap_or_else(|| "not-required".to_string());
             let default_url = if provider == "ollama" {
                 "http://localhost:11434/v1"
@@ -197,5 +222,42 @@ mod tests {
             resolve_api_key(&config, &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
             Some("config-key")
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn profile_custom_key_missing_rejects_legacy_and_generic_fallback() {
+        let _saved = SavedKeys::new(&["NA_API_KEY", "OPENAI_API_KEY", "MISSING_PROFILE_KEY"]);
+        std::env::set_var("NA_API_KEY", "generic-key");
+        std::env::set_var("OPENAI_API_KEY", "provider-key");
+        std::env::remove_var("MISSING_PROFILE_KEY");
+        let mut config = Config::default();
+        config.provider.api_key = Some("legacy-secret".into());
+        config.models.profiles.insert(
+            "private".into(),
+            crate::config::ModelProfile {
+                provider: "openai".into(),
+                model: "gpt-4o-mini".into(),
+                api_url: None,
+                api_key_env: Some("MISSING_PROFILE_KEY".into()),
+                temperature: None,
+                timeout_secs: None,
+            },
+        );
+        let (effective, _) =
+            crate::config::models::resolve_selection(&config, Some("private"), None, None).unwrap();
+        let error = build_model(&effective, Path::new("config.toml"))
+            .err()
+            .expect("missing profile key should reject model");
+        assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
+
+        std::env::set_var("MISSING_PROFILE_KEY", "");
+        let error = build_model(&effective, Path::new("config.toml"))
+            .err()
+            .expect("empty profile key should reject model");
+        assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
+
+        std::env::set_var("MISSING_PROFILE_KEY", "profile-key");
+        assert!(build_model(&effective, Path::new("config.toml")).is_ok());
     }
 }

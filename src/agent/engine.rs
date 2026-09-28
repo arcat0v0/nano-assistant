@@ -416,13 +416,7 @@ impl Agent {
         state.preamble_dirty = false;
         let preamble = state.preamble.clone();
         let state = Arc::new(Mutex::new(state));
-        let rig = AgentBuilder::from_model_handle(model)
-            .preamble(&preamble)
-            .temperature(config.provider.temperature)
-            .default_max_turns(config.behavior.max_iterations)
-            .add_hook(RuntimeHook(Arc::clone(&state)))
-            .tool_server_handle(handle)
-            .build();
+        let rig = Self::build_rig(model, &config, &state, handle, &preamble);
         Self {
             rig,
             state,
@@ -432,6 +426,35 @@ impl Agent {
             max_turns: config.behavior.max_iterations,
             debug: config.behavior.debug,
         }
+    }
+
+    fn build_rig(
+        model: ModelHandle,
+        config: &Config,
+        state: &Arc<Mutex<RuntimeState>>,
+        handle: ToolServerHandle,
+        preamble: &str,
+    ) -> rig::agent::Agent {
+        AgentBuilder::from_model_handle(model)
+            .preamble(preamble)
+            .temperature(config.provider.temperature)
+            .default_max_turns(config.behavior.max_iterations)
+            .add_hook(RuntimeHook(Arc::clone(state)))
+            .tool_server_handle(handle)
+            .build()
+    }
+
+    pub async fn switch_model(&mut self, model: ModelHandle, config: &Config) {
+        let mut state = self.state.lock().await;
+        let rig = Self::build_rig(
+            model,
+            config,
+            &self.state,
+            state.handle.clone(),
+            &state.preamble,
+        );
+        state.config = config.clone();
+        self.rig = rig;
     }
 
     async fn enriched_prompt(&self, user_message: &str) -> String {

@@ -12,10 +12,9 @@ async fn main() -> anyhow::Result<()> {
     let args = match CliArgs::try_parse() {
         Ok(args) => args,
         Err(e) => {
-            // Global flags (--help/--version) or "skills" subcommand must not
-            // fall through to the chat-mode backward-compat path.
             if raw.get(1).is_some_and(|s| {
-                is_bare_global_flag(s) || matches!(s.as_str(), "skills" | "hub" | "identity")
+                is_bare_global_flag(s)
+                    || matches!(s.as_str(), "skills" | "hub" | "identity" | "model")
             }) {
                 eprintln!("{e}");
                 std::process::exit(e.exit_code());

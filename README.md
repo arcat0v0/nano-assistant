@@ -138,6 +138,9 @@ Type your prompt and press Enter. Type `exit`, `quit`, or Ctrl+D to quit.
 |------|------|
 | `exit` / `quit` | 退出交互模式 |
 | `clear` | 清除当前对话历史 |
+| `/model` | 查看当前模型及已配置的模型档案 |
+| `/model <档案名>` | 在当前对话中切换模型，保留对话历史与工具状态 |
+| `/model <档案名> --save` | 切换并保存为下次启动的默认模型 |
 | `Ctrl+D` | 退出交互模式 |
 | `Ctrl+C` | 中断当前正在执行的请求 |
 
@@ -190,6 +193,26 @@ na -v "查看当前目录"
 # [cli] config loaded, security mode: confirm, debug: false
 ```
 
+### 切换模型
+
+先将常用的 provider、模型 ID 与端点保存为本地档案，然后按需选择。`default` 代表原有 `[provider]` 配置，已有配置无需迁移即可使用：
+
+```bash
+na model add local --provider ollama --model llama3:8b
+na model add work --provider anthropic --model '<你的模型 ID>' --api-key-env ANTHROPIC_API_KEY
+na model list
+na model use local
+na --profile work "解释这段代码"
+na --model llama3:8b "总结这个文件"
+na chat --provider compatible --model '<模型 ID>' "试用一次"
+na model use default
+na model remove work
+```
+
+`na model use` 修改以后启动的默认档案；`--profile` 和 `--model` 仅对当前进程生效。`--model` 使用当前默认档案的 provider 和 API 地址；同时指定 `--provider` 时必须指定 `--model`，切换到新 provider 不会继承原档案的密钥或地址。交互模式输入 `/model` 可查看档案，`/model work` 只切换本次会话，`/model work --save` 才保存默认值；切换失败会继续使用原模型。`na model list` 列出的是本地档案，不代表上游模型实时可用。切换后原有对话继续传给新模型，因此两边都需要支持当前使用的原生工具调用；若模型不兼容可用 `/clear` 开始新对话。
+
+`--api-key-env` 保存环境变量名称而非密钥内容；启动前给该变量赋值，可通过受控环境注入密钥。未指定时沿用对应 provider 的环境变量及 `NA_API_KEY` 回退；不同档案不会继承旧 `[provider].api_key`。`--config-path` 对聊天和模型管理命令均可用，例如 `na model --config-path ./my-config.toml list`。
+
 ### DEBUG 模式
 
 使用 `--debug` 打开运行时调试信息，输出到终端 `stderr`，不会影响正常回答的 `stdout`：
@@ -226,6 +249,8 @@ na --config-path ./my-config.toml "hello"
 
 配置优先级：**CLI 参数 > 环境变量 > 配置文件**
 
+模型优先级：交互会话中的 `/model` > 启动参数 `--profile` / `--model` > `NA_MODEL`（跨 provider 时同时设置 `NA_PROVIDER`）> `[models].default` > `[provider]`。环境覆盖只改变本次进程，不会写入配置文件；配置错误或缺少显式指定的 `api_key_env` 时会报错，而非自动回退到其他模型。档案可选 `temperature`、`timeout_secs`，不配置时使用 provider 的默认值，不继承 `[provider]` 的参数。
+
 ### 自动运行时上下文
 
 每次会话首次构建 system prompt 时，nano-assistant 会自动注入当前运行目录相关上下文，帮助模型理解它当前所在的项目环境：
@@ -238,14 +263,28 @@ na --config-path ./my-config.toml "hello"
 
 ### 完整配置示例
 
+仅在需要自定义端点时填写 `api_url`；省略该字段才会使用 provider 默认地址。
+
 ```toml
 [provider]
 provider = "openai"          # LLM 提供商名称
 model = "gpt-4o-mini"        # 模型名称
 api_key = "sk-..."           # API Key（也可通过 NA_API_KEY 环境变量设置）
-api_url = ""                 # 自定义 API 地址（留空使用默认地址）
 temperature = 0.7            # 温度参数（0.0 - 2.0）
 timeout_secs = 120           # 请求超时时间（秒）
+
+[models]
+default = "work"            # 不配置时继续使用 [provider]
+
+[models.profiles.work]
+provider = "anthropic"
+model = "<你的模型 ID>"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[models.profiles.local]
+provider = "ollama"
+model = "llama3:8b"
+api_url = "http://localhost:11434/v1"
 
 [hub]
 url = "https://hub.nana.dev" # free/* 模型使用的 hub 基址

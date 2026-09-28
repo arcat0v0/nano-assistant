@@ -246,12 +246,19 @@ fn sse(chunks: Vec<Value>) -> (String, String) {
     ("text/event-stream".to_string(), data)
 }
 
-fn run_cli(home: &Path, config_path: &Path, input: Option<&str>, prompt: Option<&str>) -> Output {
+fn run_cli_with_args(
+    home: &Path,
+    config_path: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    prompt: Option<&str>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_na"));
     command
         .arg("chat")
         .arg("--config-path")
         .arg(config_path)
+        .args(args)
         .current_dir(home)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -262,6 +269,8 @@ fn run_cli(home: &Path, config_path: &Path, input: Option<&str>, prompt: Option<
         .env_remove("NA_PROVIDER")
         .env_remove("NA_MODEL")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("NA_TEST_UNSET_SWITCH_KEY")
+        .env_remove("NA_TEST_MISSING_KEY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(prompt) = prompt {
@@ -291,6 +300,10 @@ fn run_cli(home: &Path, config_path: &Path, input: Option<&str>, prompt: Option<
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn run_cli(home: &Path, config_path: &Path, input: Option<&str>, prompt: Option<&str>) -> Output {
+    run_cli_with_args(home, config_path, &[], input, prompt)
 }
 
 fn config(
@@ -958,4 +971,342 @@ fn cli_file_edits_reload_mcp_with_relative_or_absolute_config_paths() {
             1
         );
     }
+}
+
+#[test]
+fn cli_switches_profile_between_turns_without_losing_tool_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let document = temp.path().join("prior.txt");
+    std::fs::write(&document, "retained tool result").unwrap();
+    let first = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "call_prior_read",
+                "file_read",
+                json!({"path":document}),
+            )],
+        ),
+        completion(Some("First model answered."), vec![]),
+    ]);
+    let second = ScriptedEndpoint::start(vec![completion(Some("Second model answered."), vec![])]);
+    let path = config(temp.path(), &first.url, false, false, "mode = \"direct\"");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n",
+                second.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("Read the document\n/model second\nWhat was in it?\n/exit\n"),
+        None,
+    );
+    let first_requests = first.finish();
+    let second_requests = second.finish();
+    assert_success(&output);
+    assert_eq!(first_requests.len(), 2);
+    assert_eq!(second_requests[0]["model"], "second-model");
+    assert!(second_requests[0]
+        .to_string()
+        .contains("First model answered."));
+    assert!(tool_result(&second_requests[0], "call_prior_read")
+        .to_string()
+        .contains("retained tool result"));
+    assert!(second_requests[0]["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "file_read")
+    }));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Second model answered."));
+    assert!(!std::fs::read_to_string(path)
+        .unwrap()
+        .contains("default = \"second\""));
+}
+
+#[test]
+fn cli_failed_switch_keeps_previous_model_and_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let endpoint = ScriptedEndpoint::start(vec![
+        completion(Some("First response."), vec![]),
+        completion(Some("Still on first model."), vec![]),
+    ]);
+    let path = config(
+        temp.path(),
+        &endpoint.url,
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n[models.profiles.broken]\nprovider = \"anthropic\"\nmodel = \"claude-test\"\napi_key_env = \"NA_TEST_UNSET_SWITCH_KEY\"\n")
+        .unwrap();
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("First question\n/model broken\nSecond question\n/exit\n"),
+        None,
+    );
+    let requests = endpoint.finish();
+    assert_success(&output);
+    assert_eq!(requests[1]["model"], "local-test-model");
+    assert!(requests[1].to_string().contains("First response."));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("NA_TEST_UNSET_SWITCH_KEY"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Still on first model."));
+}
+
+#[test]
+fn cli_model_use_saves_default_while_one_shot_override_is_ephemeral() {
+    let temp = tempfile::tempdir().unwrap();
+    let chosen = ScriptedEndpoint::start(vec![
+        completion(Some("Temporary choice."), vec![]),
+        completion(Some("Saved choice."), vec![]),
+    ]);
+    let path = config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n",
+                chosen.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let save = Command::new(env!("CARGO_BIN_EXE_na"))
+        .args(["model", "--config-path"])
+        .arg(&path)
+        .args(["use", "second"])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&save);
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("default = \"second\""));
+    let temporary = run_cli_with_args(
+        temp.path(),
+        &path,
+        &["--model", "temporary-model"],
+        None,
+        Some("Temporary?"),
+    );
+    assert_success(&temporary);
+    let output = run_cli(temp.path(), &path, None, Some("Which model?"));
+    assert_success(&output);
+    let requests = chosen.finish();
+    assert_eq!(requests[0]["model"], "temporary-model");
+    assert_eq!(requests[1]["model"], "second-model");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), saved);
+}
+
+#[test]
+fn cli_profile_missing_credential_does_not_reuse_previous_provider_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n[models.profiles.unconfigured]\nprovider = \"anthropic\"\nmodel = \"claude-test\"\napi_key_env = \"NA_TEST_MISSING_KEY\"\n")
+        .unwrap();
+    let output = run_cli_with_args(
+        temp.path(),
+        &path,
+        &["--profile", "unconfigured"],
+        None,
+        Some("Do not send a request"),
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("NA_TEST_MISSING_KEY"));
+    assert!(!std::fs::read_to_string(path)
+        .unwrap()
+        .contains("default = \"unconfigured\""));
+}
+
+#[test]
+fn cli_added_profile_runs_and_removed_profile_cannot_be_selected() {
+    let temp = tempfile::tempdir().unwrap();
+    let endpoint = ScriptedEndpoint::start(vec![completion(Some("Local profile."), vec![])]);
+    let path = config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    let add = Command::new(env!("CARGO_BIN_EXE_na"))
+        .args(["model", "--config-path"])
+        .arg(&path)
+        .args([
+            "add",
+            "local",
+            "--provider",
+            "compatible",
+            "--model",
+            "custom-local",
+            "--api-url",
+            &endpoint.url,
+        ])
+        .output()
+        .unwrap();
+    assert_success(&add);
+    let response = run_cli_with_args(
+        temp.path(),
+        &path,
+        &["--profile", "local"],
+        None,
+        Some("Use configured model"),
+    );
+    assert_success(&response);
+    assert_eq!(endpoint.finish()[0]["model"], "custom-local");
+    let remove = Command::new(env!("CARGO_BIN_EXE_na"))
+        .args(["model", "--config-path"])
+        .arg(&path)
+        .args(["remove", "local"])
+        .output()
+        .unwrap();
+    assert_success(&remove);
+    let missing = run_cli_with_args(
+        temp.path(),
+        &path,
+        &["--profile", "local"],
+        None,
+        Some("Must not reach a model"),
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("local"));
+}
+
+#[test]
+fn cli_streamed_turn_uses_switched_model_and_keeps_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = ScriptedEndpoint::start(vec![stream_completion("First streamed reply.")]);
+    let second = ScriptedEndpoint::start(vec![stream_completion("Second streamed reply.")]);
+    let path = config(temp.path(), &first.url, true, false, "mode = \"direct\"");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-stream-model\"\napi_url = \"{}\"\n",
+                second.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("First streamed turn\n/model second\nSecond streamed turn\n/exit\n"),
+        None,
+    );
+    assert_success(&output);
+    assert_eq!(first.finish()[0]["model"], "local-test-model");
+    let second_request = second.finish().remove(0);
+    assert_eq!(second_request["model"], "second-stream-model");
+    assert!(second_request.to_string().contains("First streamed reply."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Second streamed reply."));
+}
+
+#[test]
+fn cli_can_switch_back_to_legacy_default_in_same_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = ScriptedEndpoint::start(vec![
+        completion(Some("First reply."), vec![]),
+        completion(Some("Back to first."), vec![]),
+    ]);
+    let second = ScriptedEndpoint::start(vec![completion(Some("Second reply."), vec![])]);
+    let path = config(temp.path(), &first.url, false, false, "mode = \"direct\"");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n",
+                second.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("First turn\n/model second\nSecond turn\n/model default\nThird turn\n/exit\n"),
+        None,
+    );
+    assert_success(&output);
+    let first_requests = first.finish();
+    let second_requests = second.finish();
+    assert_eq!(second_requests[0]["model"], "second-model");
+    assert_eq!(first_requests[1]["model"], "local-test-model");
+    assert!(first_requests[1].to_string().contains("Second reply."));
+}
+
+#[test]
+fn cli_model_save_changes_default_for_next_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let chosen = ScriptedEndpoint::start(vec![
+        completion(Some("Current session."), vec![]),
+        completion(Some("Next session."), vec![]),
+    ]);
+    let path = config(
+        temp.path(),
+        "http://127.0.0.1:1/v1",
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!(
+                "\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n",
+                chosen.url
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let first = run_cli(
+        temp.path(),
+        &path,
+        Some("/model second --save\nFirst question\n/exit\n"),
+        None,
+    );
+    assert_success(&first);
+    let next = run_cli(temp.path(), &path, None, Some("Second question"));
+    assert_success(&next);
+    let requests = chosen.finish();
+    assert_eq!(requests[0]["model"], "second-model");
+    assert_eq!(requests[1]["model"], "second-model");
+    assert!(std::fs::read_to_string(path)
+        .unwrap()
+        .contains("default = \"second\""));
 }

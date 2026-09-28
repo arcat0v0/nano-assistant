@@ -1,8 +1,9 @@
+pub mod models;
 pub mod schema;
 
 pub use schema::{
     BehaviorConfig, Config, HubConfig, McpConfig, McpServerConfig, McpTransport, MemoryConfig,
-    ProviderConfig, SecurityConfig, SkillsConfig,
+    ModelProfile, ModelsConfig, ProviderConfig, SecurityConfig, SkillsConfig,
 };
 
 use std::path::Path;

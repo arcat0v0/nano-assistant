@@ -29,6 +29,8 @@ clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.0"
+toml_edit = "0.23"
+tempfile = "3.27.0"
 
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "blocking", "form", "query", "rustls"] }
@@ -99,4 +101,3 @@ strip = true
 
 [dev-dependencies]
 serial_test = "3"
-tempfile = "3.27.0"

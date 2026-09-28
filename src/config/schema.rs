@@ -5,6 +5,7 @@
 //! Priority: CLI flag > environment variable > config file
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Top-level configuration loaded from `config.toml`.
@@ -13,6 +14,12 @@ pub struct Config {
     /// Provider configuration (API key, model selection, etc.)
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    #[serde(default, skip_serializing_if = "ModelsConfig::is_empty")]
+    pub models: ModelsConfig,
+
+    #[serde(skip)]
+    pub active_profile: Option<String>,
 
     /// Memory backend configuration.
     #[serde(default)]
@@ -37,6 +44,35 @@ pub struct Config {
     /// Hub configuration for `free/*` models and ad delivery.
     #[serde(default)]
     pub hub: HubConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ModelsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ModelProfile>,
+}
+
+impl ModelsConfig {
+    fn is_empty(&self) -> bool {
+        self.default.is_none() && self.profiles.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelProfile {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -83,11 +119,11 @@ impl Default for ProviderConfig {
     }
 }
 
-fn default_timeout() -> u64 {
+pub(super) fn default_timeout() -> u64 {
     120
 }
 
-fn default_temperature() -> f64 {
+pub(super) fn default_temperature() -> f64 {
     0.7
 }
 
@@ -644,5 +680,46 @@ mod tests {
             config.mcp.servers[0].env.get("EXA_API_KEY").unwrap(),
             "test-key"
         );
+    }
+    #[test]
+    fn model_profiles_deserialize_and_serialize_without_runtime_selection() {
+        let source = r#"
+            [provider]
+            provider = "openai"
+            api_key = "legacy-key"
+
+            [models]
+            default = "private"
+
+            [models.profiles.private]
+            provider = "anthropic"
+            model = "claude-sonnet"
+            api_key_env = "PRIVATE_ANTHROPIC_KEY"
+            api_url = "https://private.example"
+            temperature = 0.3
+            timeout_secs = 45
+        "#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        assert_eq!(config.models.default.as_deref(), Some("private"));
+        let profile = &config.models.profiles["private"];
+        assert_eq!(profile.provider, "anthropic");
+        assert_eq!(profile.model, "claude-sonnet");
+        assert_eq!(
+            profile.api_key_env.as_deref(),
+            Some("PRIVATE_ANTHROPIC_KEY")
+        );
+        assert_eq!(profile.api_url.as_deref(), Some("https://private.example"));
+        assert_eq!(profile.temperature, Some(0.3));
+        assert_eq!(profile.timeout_secs, Some(45));
+        config.active_profile = Some("private".into());
+        let output = toml::to_string(&config).unwrap();
+        assert!(!output.contains("active_profile"));
+        let restored: Config = toml::from_str(&output).unwrap();
+        assert!(restored.active_profile.is_none());
+        assert_eq!(
+            restored.models.profiles["private"].api_key_env,
+            profile.api_key_env
+        );
+        assert_eq!(restored.provider.api_key.as_deref(), Some("legacy-key"));
     }
 }

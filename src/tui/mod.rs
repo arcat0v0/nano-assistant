@@ -5,6 +5,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use crate::agent::{turn_streamed_to_stdout, Agent};
+use crate::config::models::{list_profiles, resolve_selection, set_default_profile};
 use crate::config::schema::Config;
 use crate::hub::{maybe_render_ad, model_routes_via_hub};
 
@@ -14,11 +15,15 @@ pub async fn run_tui(
     mut agent: Agent,
     streaming: bool,
     history_path: PathBuf,
-    config: Config,
+    effective_config: Config,
     config_path: PathBuf,
+    mut catalog_config: Config,
+    selection_label: String,
 ) -> anyhow::Result<()> {
+    let mut current_config = effective_config;
+    let mut current_label = selection_label;
     print_welcome();
-    render_startup_ad(&config, &config_path).await;
+    render_startup_ad(&current_config, &config_path).await;
 
     let mut editor = DefaultEditor::new()?;
     load_history(&mut editor, &history_path);
@@ -54,8 +59,39 @@ pub async fn run_tui(
                         }
                         continue;
                     }
+                    InlineCommandResult::Model(command) => {
+                        match command {
+                            ModelCommand::List => {
+                                print_models(&catalog_config, &current_config, &current_label);
+                            }
+                            ModelCommand::Switch { profile, save } => {
+                                match switch_profile(
+                                    &mut agent,
+                                    &mut catalog_config,
+                                    &mut current_config,
+                                    &mut current_label,
+                                    &config_path,
+                                    profile,
+                                    save,
+                                )
+                                .await
+                                {
+                                    Ok(()) => println!(
+                                        "{}",
+                                        accent(&format!("Model switched to {current_label}"))
+                                    ),
+                                    Err(error) => eprintln!("[tui] model switch failed: {error:#}"),
+                                }
+                            }
+                            ModelCommand::Invalid => {
+                                println!("{}", warn("usage: /model [profile [--save]]"))
+                            }
+                        }
+                        continue;
+                    }
                     InlineCommandResult::Prompt(prompt) => {
-                        run_prompt(&mut agent, prompt, streaming, &config, &config_path).await?;
+                        run_prompt(&mut agent, prompt, streaming, &current_config, &config_path)
+                            .await?;
                     }
                 }
             }
@@ -72,6 +108,72 @@ pub async fn run_tui(
     }
 
     Ok(())
+}
+
+async fn switch_profile(
+    agent: &mut Agent,
+    catalog_config: &mut Config,
+    current_config: &mut Config,
+    current_label: &mut String,
+    config_path: &Path,
+    profile: &str,
+    save: bool,
+) -> anyhow::Result<()> {
+    let (selected, label) = resolve_selection(catalog_config, Some(profile), None, None)?;
+    let mut effective = current_config.clone();
+    effective.provider = selected.provider;
+    effective.active_profile = selected.active_profile;
+    let model = crate::providers::build_model(&effective, config_path)?;
+    if save {
+        set_default_profile(config_path, profile)?;
+        let default = (profile != "default").then(|| profile.to_string());
+        effective.models.default = default.clone();
+        catalog_config.models.default = default;
+    }
+    agent.switch_model(model, &effective).await;
+    *current_config = effective;
+    *current_label = label;
+    Ok(())
+}
+
+fn print_models(catalog: &Config, current: &Config, label: &str) {
+    println!(
+        "{}",
+        accent(&format!(
+            "Current model: {label} ({}/{})",
+            current.provider.provider.as_deref().unwrap_or("openai"),
+            current.provider.model.as_deref().unwrap_or("gpt-4o-mini")
+        ))
+    );
+    let legacy = &catalog.provider;
+    let marker = if label == "default" { "*" } else { " " };
+    let default = if catalog.models.default.is_none() {
+        " (default)"
+    } else {
+        ""
+    };
+    println!(
+        " {marker} default: {}/{}{}",
+        legacy.provider.as_deref().unwrap_or("openai"),
+        legacy.model.as_deref().unwrap_or("gpt-4o-mini"),
+        default
+    );
+    for (name, profile) in list_profiles(catalog) {
+        let marker = if current.active_profile.as_deref() == Some(name) {
+            "*"
+        } else {
+            " "
+        };
+        let default = if catalog.models.default.as_deref() == Some(name) {
+            " (default)"
+        } else {
+            ""
+        };
+        println!(
+            " {marker} {name}: {}/{}{}",
+            profile.provider, profile.model, default
+        );
+    }
 }
 
 async fn run_prompt(
@@ -116,6 +218,30 @@ enum InlineCommandResult<'a> {
     Quit,
     Prompt(&'a str),
     Rescan,
+    Model(ModelCommand<'a>),
+}
+
+enum ModelCommand<'a> {
+    List,
+    Switch { profile: &'a str, save: bool },
+    Invalid,
+}
+
+fn parse_model_command(line: &str) -> ModelCommand<'_> {
+    let mut args = line.split_whitespace();
+    let _ = args.next();
+    match (args.next(), args.next(), args.next()) {
+        (None, None, None) => ModelCommand::List,
+        (Some(profile), None, None) if profile != "--save" => ModelCommand::Switch {
+            profile,
+            save: false,
+        },
+        (Some(profile), Some("--save"), None) if profile != "--save" => ModelCommand::Switch {
+            profile,
+            save: true,
+        },
+        _ => ModelCommand::Invalid,
+    }
 }
 
 fn handle_inline_command<'a>(agent: &mut Agent, line: &'a str) -> InlineCommandResult<'a> {
@@ -143,6 +269,9 @@ fn handle_inline_command<'a>(agent: &mut Agent, line: &'a str) -> InlineCommandR
                 }
             }
             InlineCommandResult::Handled
+        }
+        cmd if cmd.split_whitespace().next() == Some("/model") => {
+            InlineCommandResult::Model(parse_model_command(cmd))
         }
         cmd if cmd.starts_with('/') => {
             println!("{}", warn(&format!("unknown command: {cmd}")));
@@ -179,7 +308,7 @@ fn print_welcome() {
     );
     println!(
         "{}",
-        dim("Commands: /help /clear /rescan /memory /exit /quit")
+        dim("Commands: /help /clear /rescan /memory /model /exit /quit")
     );
     println!();
 }
@@ -195,6 +324,15 @@ fn print_help() {
         accent("/rescan")
     );
     println!("  {}  show current MEMORY.md contents", accent("/memory"));
+    println!("  {}  list profiles and current model", accent("/model"));
+    println!(
+        "  {}  switch model for this conversation",
+        accent("/model <profile>")
+    );
+    println!(
+        "  {}  switch and set the default",
+        accent("/model <profile> --save")
+    );
     println!("  {}   show this help", accent("/help"));
     println!("  {}   quit interactive mode", accent("/exit"));
     println!("  {}   quit interactive mode", accent("/quit"));
@@ -363,5 +501,24 @@ mod tests {
             handle_inline_command(&mut agent, "/help"),
             InlineCommandResult::Handled
         ));
+    }
+
+    #[tokio::test]
+    async fn model_command_recognizes_list_and_rejects_invalid_syntax() {
+        let mut agent = create_test_agent().await;
+        assert!(matches!(
+            handle_inline_command(&mut agent, "/model"),
+            InlineCommandResult::Model(ModelCommand::List)
+        ));
+        for input in [
+            "/model --save",
+            "/model local extra",
+            "/model local --save extra",
+        ] {
+            assert!(matches!(
+                handle_inline_command(&mut agent, input),
+                InlineCommandResult::Model(ModelCommand::Invalid)
+            ));
+        }
     }
 }
