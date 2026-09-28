@@ -1,9 +1,8 @@
-use async_trait::async_trait;
+use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::json;
 use std::sync::Arc;
 
 use super::KnowledgeSource;
-use crate::tools::traits::{Tool, ToolResult};
 
 const MAX_READ_CHARS: usize = 50_000;
 
@@ -27,63 +26,46 @@ impl KnowledgeSearchTool {
             tool_description,
         }
     }
-}
-
-#[async_trait]
-impl Tool for KnowledgeSearchTool {
-    fn name(&self) -> &str {
-        &self.tool_name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_description
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query"
+    pub fn into_dynamic(self) -> DynamicTool {
+        let source = self.source;
+        DynamicTool::new(
+            self.tool_name,
+            self.tool_description,
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)"
+                    }
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default: 5)"
-                }
-            },
-            "required": ["query"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
-
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(5);
-
-        match self.source.search(query, limit).await {
-            Ok(results) => {
-                let output =
-                    serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
-                Ok(ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Search failed: {e}")),
+                "required": ["query"]
             }),
-        }
+            move |_context, args| {
+                let source = Arc::clone(&source);
+                Box::pin(async move {
+                    let query = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
+                        ToolExecutionError::invalid_args("Missing 'query' parameter")
+                    })?;
+                    let limit = args
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(5);
+                    let results = source
+                        .search(query, limit)
+                        .await
+                        .map_err(|e| ToolExecutionError::other(format!("Search failed: {e}")))?;
+                    let output =
+                        serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
+                    Ok(ToolOutput::text(output))
+                })
+            },
+        )
     }
 }
 
@@ -108,70 +90,53 @@ impl KnowledgeReadTool {
             tool_description,
         }
     }
-}
-
-#[async_trait]
-impl Tool for KnowledgeReadTool {
-    fn name(&self) -> &str {
-        &self.tool_name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_description
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "page_id": {
-                    "type": "string",
-                    "description": "The page identifier (from search results)"
+    pub fn into_dynamic(self) -> DynamicTool {
+        let source = self.source;
+        DynamicTool::new(
+            self.tool_name,
+            self.tool_description,
+            json!({
+                "type": "object",
+                "properties": {
+                    "page_id": {
+                        "type": "string",
+                        "description": "The page identifier (from search results)"
+                    },
+                    "section": {
+                        "type": "string",
+                        "description": "Optional section name to read only that section"
+                    }
                 },
-                "section": {
-                    "type": "string",
-                    "description": "Optional section name to read only that section"
-                }
-            },
-            "required": ["page_id"]
-        })
-    }
-
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let page_id = args
-            .get("page_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'page_id' parameter"))?;
-
-        let section = args.get("section").and_then(|v| v.as_str());
-
-        match self.source.read(page_id, section).await {
-            Ok(page) => {
-                let mut output = format!("# {}\n\nURL: {}\n\n", page.title, page.url);
-
-                if !page.sections.is_empty() {
-                    output.push_str("Sections: ");
-                    output.push_str(&page.sections.join(", "));
-                    output.push_str("\n\n");
-                }
-
-                output.push_str(&page.content);
-
-                // Truncate at paragraph boundary if over limit
-                truncate_at_paragraph(&mut output, MAX_READ_CHARS);
-
-                Ok(ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                })
-            }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Read failed: {e}")),
+                "required": ["page_id"]
             }),
-        }
+            move |_context, args| {
+                let source = Arc::clone(&source);
+                Box::pin(async move {
+                    let page_id =
+                        args.get("page_id")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                ToolExecutionError::invalid_args("Missing 'page_id' parameter")
+                            })?;
+                    let section = args.get("section").and_then(|v| v.as_str());
+                    let page = source
+                        .read(page_id, section)
+                        .await
+                        .map_err(|e| ToolExecutionError::other(format!("Read failed: {e}")))?;
+                    let mut output = format!("# {}\n\nURL: {}\n\n", page.title, page.url);
+
+                    if !page.sections.is_empty() {
+                        output.push_str("Sections: ");
+                        output.push_str(&page.sections.join(", "));
+                        output.push_str("\n\n");
+                    }
+
+                    output.push_str(&page.content);
+                    truncate_at_paragraph(&mut output, MAX_READ_CHARS);
+                    Ok(ToolOutput::text(output))
+                })
+            },
+        )
     }
 }
 
@@ -225,41 +190,74 @@ mod tests {
         assert!(text.contains("[content truncated]"));
     }
 
-    #[test]
-    fn search_tool_metadata() {
-        let config = super::super::types::KnowledgeSourceConfig {
-            name: "wiki".to_string(),
-            engine: "mediawiki".to_string(),
-            base_url: "https://wiki.example.com".to_string(),
-            language: "en".to_string(),
-            triggers: vec![],
-            priority: 10,
-        };
-        let source = super::super::create_source(&config);
-        let shared: Arc<Box<dyn KnowledgeSource>> = Arc::new(source);
-        let tool = KnowledgeSearchTool::new(shared);
-        assert_eq!(tool.name(), "wiki.search");
-        assert!(tool.description().contains("Search"));
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["required"], json!(["query"]));
+    struct ExampleSource;
+
+    #[async_trait::async_trait]
+    impl KnowledgeSource for ExampleSource {
+        fn name(&self) -> &str {
+            "wiki"
+        }
+
+        fn description(&self) -> &str {
+            "example wiki"
+        }
+
+        async fn search(
+            &self,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<super::super::SearchResult>> {
+            Ok(vec![super::super::SearchResult {
+                title: format!("{query} ({limit})"),
+                snippet: "Matched title".into(),
+                page_id: "42".into(),
+                url: "https://example.com/42".into(),
+            }])
+        }
+
+        async fn read(
+            &self,
+            page_id: &str,
+            section: Option<&str>,
+        ) -> anyhow::Result<super::super::PageContent> {
+            Ok(super::super::PageContent {
+                title: format!("Page {page_id}"),
+                content: section.unwrap_or("Full page").into(),
+                sections: vec!["Overview".into()],
+                url: "https://example.com/42".into(),
+            })
+        }
     }
 
-    #[test]
-    fn read_tool_metadata() {
-        let config = super::super::types::KnowledgeSourceConfig {
-            name: "wiki".to_string(),
-            engine: "mediawiki".to_string(),
-            base_url: "https://wiki.example.com".to_string(),
-            language: "en".to_string(),
-            triggers: vec![],
-            priority: 10,
-        };
-        let source = super::super::create_source(&config);
-        let shared: Arc<Box<dyn KnowledgeSource>> = Arc::new(source);
-        let tool = KnowledgeReadTool::new(shared);
-        assert_eq!(tool.name(), "wiki.read");
-        assert!(tool.description().contains("Read"));
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["required"], json!(["page_id"]));
+    #[tokio::test]
+    async fn knowledge_tools_return_source_results_through_rig() {
+        use rig::tool::{ToolContext, ToolErrorKind, ToolSet};
+
+        let tools = super::super::source_to_tools(Box::new(ExampleSource));
+        let tools = ToolSet::from_dynamic_tools(tools);
+        let mut context = ToolContext::new();
+        let missing_query = tools.execute("wiki.search", "{}", &mut context).await;
+        assert!(missing_query.is_error_kind(ToolErrorKind::InvalidArgs));
+        let search = tools
+            .execute("wiki.search", r#"{"query":"rust","limit":3}"#, &mut context)
+            .await;
+        let results: Vec<super::super::SearchResult> =
+            serde_json::from_str(search.output().as_text().unwrap()).unwrap();
+        assert_eq!(results[0].title, "rust (3)");
+        assert_eq!(results[0].page_id, "42");
+        let read = tools
+            .execute(
+                "wiki.read",
+                r#"{"page_id":"42","section":"Overview"}"#,
+                &mut context,
+            )
+            .await;
+        assert!(read.is_success());
+        assert!(read
+            .output()
+            .as_text()
+            .unwrap()
+            .contains("# Page 42\n\nURL: https://example.com/42"));
+        assert!(read.output().as_text().unwrap().contains("Overview"));
     }
 }

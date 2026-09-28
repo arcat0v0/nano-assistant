@@ -738,23 +738,22 @@ pub fn skills_to_prompt(skills: &[Skill]) -> String {
     prompt
 }
 
-/// Convert skill tools into callable `Tool` trait objects.
-pub fn skills_to_tools(skills: &[Skill]) -> Vec<Box<dyn crate::tools::Tool>> {
-    let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+pub fn skills_to_tools(skills: &[Skill]) -> Vec<rig::tool::DynamicTool> {
+    let mut tools = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
-                        &skill.name,
-                        tool,
-                    )));
+                    tools.push(
+                        crate::tools::skill_tool::SkillShellTool::new(&skill.name, tool)
+                            .into_dynamic(),
+                    );
                 }
                 "http" => {
-                    tools.push(Box::new(crate::tools::skill_http::SkillHttpTool::new(
-                        &skill.name,
-                        tool,
-                    )));
+                    tools.push(
+                        crate::tools::skill_http::SkillHttpTool::new(&skill.name, tool)
+                            .into_dynamic(),
+                    );
                 }
                 other => {
                     tracing::warn!(
@@ -1231,7 +1230,6 @@ pub fn parse_knowledge_source_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use std::fs;
 
     #[test]
@@ -1526,25 +1524,6 @@ command = "echo hello"
             "No heading description"
         );
         assert_eq!(extract_description("# Only heading\n"), "No description");
-    }
-
-    #[test]
-    #[serial(home_env)]
-    fn init_skills_creates_readme() {
-        let dir = tempfile::tempdir().unwrap();
-        // Override skills_dir for test by using a custom config
-        let skills_path = dir.path().join("skills");
-        let saved_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", dir.path());
-        // We can't easily override skills_dir() in tests since it reads HOME env var
-        // but we can test the function creates the right structure
-        let _ = std::fs::create_dir_all(&skills_path);
-        // Just verify the function exists and the dir logic is correct
-        match saved_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        assert!(true);
     }
 
     #[test]

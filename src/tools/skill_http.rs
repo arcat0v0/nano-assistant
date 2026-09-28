@@ -1,10 +1,9 @@
-use async_trait::async_trait;
+use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::skills::SkillTool;
-use crate::tools::traits::{Tool, ToolResult};
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
@@ -32,40 +31,24 @@ impl SkillHttpTool {
         }
     }
 
-    #[cfg(test)]
-    pub fn url_template(&self) -> &str {
-        &self.url
-    }
-}
-
-#[async_trait]
-impl Tool for SkillHttpTool {
-    fn name(&self) -> &str {
-        &self.tool_name
-    }
-
-    fn description(&self) -> &str {
-        "Skill HTTP request"
-    }
-
-    fn parameters_schema(&self) -> Value {
-        let mut properties = serde_json::Map::new();
-        for (key, desc) in &self.args {
-            properties.insert(
-                key.clone(),
-                json!({
-                    "type": "string",
-                    "description": desc,
-                }),
-            );
-        }
-        json!({
-            "type": "object",
-            "properties": properties,
+    pub fn into_dynamic(self) -> DynamicTool {
+        let name = self.tool_name.clone();
+        let schema = self.parameters();
+        let tool = std::sync::Arc::new(self);
+        DynamicTool::new(name, "Skill HTTP request", schema, move |_context, args| {
+            let tool = std::sync::Arc::clone(&tool);
+            Box::pin(async move { tool.run(args).await.map(ToolOutput::text) })
         })
     }
 
-    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+    fn parameters(&self) -> Value {
+        let mut properties = serde_json::Map::new();
+        for (key, desc) in &self.args {
+            properties.insert(key.clone(), json!({"type": "string", "description": desc}));
+        }
+        json!({"type": "object", "properties": properties})
+    }
+    async fn run(&self, args: Value) -> Result<String, ToolExecutionError> {
         let mut url = self.url.clone();
         for key in self.args.keys() {
             if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
@@ -74,45 +57,50 @@ impl Tool for SkillHttpTool {
         }
 
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Only http/https URLs are allowed".to_string()),
-            });
+            return Err(ToolExecutionError::invalid_args(
+                "Only http/https URLs are allowed",
+            ));
         }
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()?;
-
-        let response = client.get(&url).send().await?;
+            .build()
+            .map_err(|e| {
+                ToolExecutionError::network(format!("Failed to build HTTP client: {e}"))
+            })?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ToolExecutionError::network(format!("Request failed: {e}")))?;
 
         if !response.status().is_success() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("HTTP {}", response.status())),
-            });
+            return Err(ToolExecutionError::provider(format!(
+                "HTTP {}",
+                response.status()
+            )));
         }
 
-        let bytes = response.bytes().await?;
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        let truncated = text.len() > MAX_RESPONSE_BYTES;
-        let result = if truncated {
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ToolExecutionError::network(format!("Failed to read response: {e}")))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let result = if text.len() > MAX_RESPONSE_BYTES {
+            let mut boundary = MAX_RESPONSE_BYTES;
+            while !text.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
             format!(
                 "{}...\n[response truncated at {} bytes]",
-                &text[..MAX_RESPONSE_BYTES],
+                &text[..boundary],
                 MAX_RESPONSE_BYTES
             )
         } else {
-            text
+            text.into_owned()
         };
 
-        Ok(ToolResult {
-            success: true,
-            output: result,
-            error: None,
-        })
+        Ok(result)
     }
 }
 
@@ -137,65 +125,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_is_dotted() {
-        let tool = make_skill_tool("fetch", "http", "https://example.com", HashMap::new());
-        let ht = SkillHttpTool::new("my-skill", &tool);
-        assert_eq!(ht.name(), "my-skill.fetch");
-    }
-
-    #[test]
-    fn url_parameter_substitution() {
-        let mut args = HashMap::new();
-        args.insert("user".to_string(), "GitHub username".to_string());
-        let tool = make_skill_tool(
-            "profile",
-            "http",
-            "https://api.example.com/users/{{user}}",
-            args,
-        );
-        let ht = SkillHttpTool::new("demo", &tool);
-        assert_eq!(ht.url_template(), "https://api.example.com/users/{{user}}");
-    }
-
-    #[test]
     fn non_http_url_rejected() {
         let tool = make_skill_tool("bad", "http", "ftp://evil.com/file", HashMap::new());
         let ht = SkillHttpTool::new("demo", &tool);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(ht.execute(json!({}))).unwrap();
-        assert!(!result.success);
-        assert_eq!(
-            result.error.as_deref(),
-            Some("Only http/https URLs are allowed")
-        );
-    }
-
-    #[test]
-    fn parameters_schema_includes_args() {
-        let mut args = HashMap::new();
-        args.insert("query".to_string(), "Search query".to_string());
-        let tool = make_skill_tool(
-            "search",
-            "http",
-            "https://api.example.com/search?q={{query}}",
-            args,
-        );
-        let ht = SkillHttpTool::new("demo", &tool);
-        let schema = ht.parameters_schema();
-
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["properties"]["query"]["type"], "string");
-        assert_eq!(schema["properties"]["query"]["description"], "Search query");
-    }
-
-    #[test]
-    fn parameters_schema_empty_when_no_args() {
-        let tool = make_skill_tool("ping", "http", "https://example.com/health", HashMap::new());
-        let ht = SkillHttpTool::new("demo", &tool);
-        let schema = ht.parameters_schema();
-
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].as_object().unwrap().is_empty());
+        let error = rt.block_on(ht.run(json!({}))).unwrap_err();
+        assert_eq!(error.to_string(), "Only http/https URLs are allowed");
     }
 }

@@ -1,235 +1,202 @@
-use super::{BoxStream, ChatMessage, Provider, ProviderCapabilities, StreamChunk};
-use crate::hub::HubClient;
-use async_trait::async_trait;
+use bytes::Bytes;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use rig::http_client::{self, HttpClientExt, LazyBody, MultipartForm, Request, Response};
+use rig::wasm_compat::WasmCompatSend;
+use std::future::Future;
+use std::sync::Arc;
+
+use super::glm::GlmAuth;
+use crate::hub::HubClient;
+
+#[derive(Clone, Default)]
+pub(super) struct AuthenticatedTransport {
+    client: reqwest::Client,
+    auth: Option<Authentication>,
+}
 
 #[derive(Clone)]
-pub struct HubProvider {
-    client: HubClient,
+enum Authentication {
+    Hub(HubClient),
+    Glm(Arc<GlmAuth>),
+    AnthropicOAuth(String),
 }
 
-#[derive(Serialize)]
-struct ChatRequest {
-    messages: Vec<OpenAiMessage>,
-    model: String,
-    stream: bool,
-    temperature: f64,
-}
-
-#[derive(Serialize)]
-struct OpenAiMessage {
-    content: String,
-    role: String,
-}
-
-#[derive(Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Deserialize)]
-struct ResponseMessage {
-    content: Option<String>,
-    reasoning_content: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct StreamDelta {
-    choices: Vec<StreamChoice>,
-}
-
-#[derive(Deserialize)]
-struct StreamChoice {
-    delta: Option<StreamMessageDelta>,
-}
-
-#[derive(Deserialize)]
-struct StreamMessageDelta {
-    content: Option<String>,
-}
-
-impl ResponseMessage {
-    fn effective_content(&self) -> String {
-        match &self.content {
-            Some(content) if !content.is_empty() => content.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+impl std::fmt::Debug for AuthenticatedTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match self.auth {
+            Some(Authentication::Hub(_)) => "hub",
+            Some(Authentication::Glm(_)) => "glm",
+            Some(Authentication::AnthropicOAuth(_)) => "anthropic-oauth",
+            None => "unconfigured",
+        };
+        f.debug_struct("AuthenticatedTransport")
+            .field("mode", &mode)
+            .finish()
     }
 }
 
-impl HubProvider {
-    pub fn new(client: HubClient) -> Self {
-        Self { client }
-    }
-
-    async fn post(&self, request: &ChatRequest) -> anyhow::Result<String> {
-        let response = self
-            .client
-            .signed_json(
-                "POST",
-                "/v1/chat/completions",
-                serde_json::to_vec(request)?,
-                true,
-            )
-            .await?;
-
-        let chat_response: ChatResponse = response.json().await?;
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.effective_content())
-            .ok_or_else(|| anyhow::anyhow!("No response from hub"))
-    }
-}
-
-#[async_trait]
-impl Provider for HubProvider {
-    fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities {
-            native_tool_calling: false,
-            streaming: true,
+impl AuthenticatedTransport {
+    pub(super) fn hub(client: HubClient) -> Self {
+        Self {
+            auth: Some(Authentication::Hub(client)),
+            ..Self::default()
         }
     }
 
-    async fn chat_with_system(
+    pub(super) fn glm(key: &str, client: reqwest::Client) -> anyhow::Result<Self> {
+        Ok(Self {
+            client,
+            auth: Some(Authentication::Glm(Arc::new(GlmAuth::new(key)?))),
+        })
+    }
+
+    pub(super) fn anthropic_oauth(key: String, client: reqwest::Client) -> Self {
+        Self {
+            client,
+            auth: Some(Authentication::AnthropicOAuth(key)),
+        }
+    }
+
+    async fn request(
         &self,
-        system_prompt: Option<&str>,
-        message: &str,
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let mut messages = Vec::new();
-        if let Some(system_prompt) = system_prompt {
-            messages.push(OpenAiMessage {
-                content: system_prompt.to_string(),
-                role: "system".to_string(),
+        req: Request<()>,
+        body: Bytes,
+    ) -> http_client::Result<reqwest::Response> {
+        let (parts, _) = req.into_parts();
+        let response = match self.auth.as_ref() {
+            Some(Authentication::Hub(hub)) => {
+                let path = parts
+                    .uri
+                    .path_and_query()
+                    .map_or("/", |value| value.as_str());
+                if parts.method != reqwest::Method::POST || path != "/v1/chat/completions" {
+                    return Err(transport_error(
+                        "hub transport only supports POST /v1/chat/completions",
+                    ));
+                }
+                hub.signed_bytes("POST", path, body, true)
+                    .await
+                    .map_err(|error| transport_error(error.to_string()))?
+            }
+            Some(Authentication::Glm(auth)) => {
+                let token = auth
+                    .token()
+                    .map_err(|error| transport_error(error.to_string()))?;
+                let mut headers = parts.headers;
+                headers.remove(reqwest::header::AUTHORIZATION);
+                self.client
+                    .request(parts.method, parts.uri.to_string())
+                    .headers(headers)
+                    .bearer_auth(token)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|error| http_client::Error::Instance(Box::new(error)))?
+            }
+            Some(Authentication::AnthropicOAuth(key)) => {
+                let mut headers = parts.headers;
+                headers.remove("x-api-key");
+                self.client
+                    .request(parts.method, parts.uri.to_string())
+                    .headers(headers)
+                    .bearer_auth(key)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|error| http_client::Error::Instance(Box::new(error)))?
+            }
+            None => return Err(transport_error("authenticated transport is not configured")),
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let headers = Box::new(response.headers().clone());
+            let body = response
+                .text()
+                .await
+                .map_err(|error| http_client::Error::Instance(Box::new(error)))?;
+            return Err(http_client::Error::InvalidStatusCodeWithDetails {
+                status,
+                body,
+                headers,
             });
         }
-        messages.push(OpenAiMessage {
-            content: message.to_string(),
-            role: "user".to_string(),
-        });
-
-        self.post(&ChatRequest {
-            messages,
-            model: model.to_string(),
-            stream: false,
-            temperature,
-        })
-        .await
+        Ok(response)
     }
+}
 
-    async fn chat_with_history(
+fn transport_error(message: impl Into<String>) -> http_client::Error {
+    http_client::Error::Instance(Box::new(std::io::Error::other(message.into())))
+}
+
+impl HttpClientExt for AuthenticatedTransport {
+    fn send<T, U>(
         &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> anyhow::Result<String> {
-        let request = ChatRequest {
-            messages: messages
-                .iter()
-                .map(|message| OpenAiMessage {
-                    content: message.content.clone(),
-                    role: message.role.clone(),
-                })
-                .collect(),
-            model: model.to_string(),
-            stream: false,
-            temperature,
-        };
-
-        self.post(&request).await
-    }
-
-    fn stream_chat(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-    ) -> BoxStream<'static, anyhow::Result<StreamChunk>> {
-        let request = ChatRequest {
-            messages: messages
-                .iter()
-                .map(|message| OpenAiMessage {
-                    content: message.content.clone(),
-                    role: message.role.clone(),
-                })
-                .collect(),
-            model: model.to_string(),
-            stream: true,
-            temperature,
-        };
-
-        let client = self.client.clone();
-        let stream = async_stream::stream! {
-            let response = match client
-                .signed_json(
-                    "POST",
-                    "/v1/chat/completions",
-                    serde_json::to_vec(&request).unwrap_or_default(),
-                    true,
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    yield Err(error);
-                    return;
-                }
-            };
-
-            let mut bytes = response.bytes_stream();
-            let mut buffer = String::new();
-
-            while let Some(chunk_result) = bytes.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].trim().to_string();
-                            buffer = buffer[pos + 1..].to_string();
-
-                            if line.is_empty() || !line.starts_with("data: ") {
-                                continue;
-                            }
-
-                            let data = &line[6..];
-                            if data == "[DONE]" {
-                                yield Ok(StreamChunk::final_chunk());
-                                return;
-                            }
-
-                            if let Ok(delta) = serde_json::from_str::<StreamDelta>(data) {
-                                if let Some(choice) = delta.choices.first() {
-                                    if let Some(message_delta) = &choice.delta {
-                                        if let Some(content) = &message_delta.content {
-                                            if !content.is_empty() {
-                                                yield Ok(StreamChunk::delta(content));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        yield Err(anyhow::anyhow!("hub stream read error: {error}"));
-                        return;
-                    }
-                }
+        req: Request<T>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        T: Into<Bytes> + WasmCompatSend,
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        let (parts, body) = req.into_parts();
+        let body: Bytes = body.into();
+        let transport = self.clone();
+        async move {
+            let request = Request::from_parts(parts, ());
+            let response = transport.request(request, body).await?;
+            let mut result = Response::builder().status(response.status());
+            if let Some(headers) = result.headers_mut() {
+                *headers = response.headers().clone();
             }
+            let body: LazyBody<U> = Box::pin(async move {
+                response
+                    .bytes()
+                    .await
+                    .map(U::from)
+                    .map_err(|error| http_client::Error::Instance(Box::new(error)))
+            });
+            result.body(body).map_err(Into::into)
+        }
+    }
 
-            yield Ok(StreamChunk::final_chunk());
-        };
+    fn send_multipart<U>(
+        &self,
+        _req: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody<U>>>> + WasmCompatSend + 'static
+    where
+        U: From<Bytes> + WasmCompatSend + 'static,
+    {
+        async {
+            Err(transport_error(
+                "authenticated completion transport does not support multipart requests",
+            ))
+        }
+    }
 
-        Box::pin(stream)
+    fn send_streaming<T>(
+        &self,
+        req: Request<T>,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + WasmCompatSend
+    where
+        T: Into<Bytes> + WasmCompatSend,
+    {
+        let (parts, body) = req.into_parts();
+        let body: Bytes = body.into();
+        let transport = self.clone();
+        async move {
+            let request = Request::from_parts(parts, ());
+            let response = transport.request(request, body).await?;
+            let mut result = Response::builder()
+                .status(response.status())
+                .version(response.version());
+            if let Some(headers) = result.headers_mut() {
+                *headers = response.headers().clone();
+            }
+            let stream: http_client::sse::BoxedStream =
+                Box::pin(response.bytes_stream().map(|chunk| {
+                    chunk.map_err(|error| http_client::Error::Instance(Box::new(error)))
+                }));
+            result.body(stream).map_err(Into::into)
+        }
     }
 }

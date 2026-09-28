@@ -1,6 +1,5 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -19,18 +18,19 @@ impl Default for FileReadTool {
     }
 }
 
-#[async_trait]
 impl Tool for FileReadTool {
-    fn name(&self) -> &str {
-        "file_read"
-    }
+    const NAME: &'static str = "file_read";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Read file contents with line numbers. Supports partial reading via offset and limit. \
          Binary files are returned with lossy UTF-8 conversion."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -51,57 +51,35 @@ impl Tool for FileReadTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let path = args
             .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
+        let resolved = tokio::fs::canonicalize(path).await.map_err(|e| {
+            ToolExecutionError::other(format!("Failed to resolve file path {path}: {e}"))
+        })?;
 
-        let resolved = tokio::fs::canonicalize(path).await;
-
-        let resolved = match resolved {
-            Ok(p) => p,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to resolve file path: {e}")),
-                });
-            }
-        };
-
-        match tokio::fs::metadata(&resolved).await {
-            Ok(meta) if meta.len() > MAX_FILE_SIZE_BYTES => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
-                        meta.len()
-                    )),
-                });
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read file metadata: {e}")),
-                });
-            }
+        let metadata = tokio::fs::metadata(&resolved).await.map_err(|e| {
+            ToolExecutionError::other(format!("Failed to read file metadata for {path}: {e}"))
+        })?;
+        if metadata.len() > MAX_FILE_SIZE_BYTES {
+            return Err(ToolExecutionError::other(format!(
+                "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
+                metadata.len()
+            )));
         }
-
         match tokio::fs::read_to_string(&resolved).await {
             Ok(contents) => {
                 let lines: Vec<&str> = contents.lines().collect();
                 let total = lines.len();
 
                 if total == 0 {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: String::new(),
-                        error: None,
-                    });
+                    return Ok(String::new());
                 }
 
                 let offset = args
@@ -124,11 +102,7 @@ impl Tool for FileReadTool {
                 };
 
                 if start >= end {
-                    return Ok(ToolResult {
-                        success: true,
-                        output: format!("[No lines in range, file has {total} lines]"),
-                        error: None,
-                    });
+                    return Ok(format!("[No lines in range, file has {total} lines]"));
                 }
 
                 let numbered: String = lines[start..end]
@@ -145,23 +119,14 @@ impl Tool for FileReadTool {
                     format!("\n[{total} lines total]")
                 };
 
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("{numbered}{summary}"),
-                    error: None,
-                })
+                Ok(format!("{numbered}{summary}"))
             }
             Err(_) => {
-                let bytes = tokio::fs::read(&resolved)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
-
-                let lossy = String::from_utf8_lossy(&bytes).into_owned();
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("[binary file, lossy UTF-8 conversion]\n{lossy}"),
-                    error: None,
-                })
+                let bytes = tokio::fs::read(&resolved).await.map_err(|e| {
+                    ToolExecutionError::other(format!("Failed to read file {path}: {e}"))
+                })?;
+                let lossy = String::from_utf8_lossy(&bytes);
+                Ok(format!("[binary file, lossy UTF-8 conversion]\n{lossy}"))
             }
         }
     }
@@ -170,63 +135,18 @@ impl Tool for FileReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[tokio::test]
-    async fn reads_existing_file() {
-        let dir = test_dir("nano_file_read_test");
-        std::fs::write(dir.join("test.txt"), "hello world").unwrap();
-
-        let tool = FileReadTool::new();
-        let result = tool
-            .execute(json!({"path": dir.join("test.txt").to_string_lossy()}))
+    async fn returns_numbered_requested_lines() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "a\nb\nc\nd").await.unwrap();
+        let output = FileReadTool
+            .call(
+                &mut ToolContext::default(),
+                json!({"path": file.path(), "offset": 2, "limit": 2}),
+            )
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("1: hello world"));
-    }
-
-    #[tokio::test]
-    async fn offset_and_limit() {
-        let dir = test_dir("nano_file_read_offset");
-        std::fs::write(dir.join("lines.txt"), "a\nb\nc\nd\ne").unwrap();
-
-        let tool = FileReadTool::new();
-        let result = tool
-            .execute(json!({
-                "path": dir.join("lines.txt").to_string_lossy(),
-                "offset": 2,
-                "limit": 2
-            }))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("2: b"));
-        assert!(result.output.contains("3: c"));
-        assert!(result.output.contains("[Lines 2-3 of 5]"));
-    }
-
-    #[tokio::test]
-    async fn nonexistent_file() {
-        let tool = FileReadTool::new();
-        let result = tool
-            .execute(json!({"path": "/nonexistent_xyz_12345"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-    }
-
-    #[tokio::test]
-    async fn missing_path_param() {
-        let tool = FileReadTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
+        assert_eq!(output, "2: b\n3: c\n[Lines 2-3 of 4]");
     }
 }

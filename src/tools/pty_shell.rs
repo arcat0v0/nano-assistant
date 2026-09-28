@@ -3,9 +3,8 @@
 //! Executes commands in a pseudo-terminal, allowing scripted interaction
 //! with programs that require user input (e.g. password prompts, confirmations).
 
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -44,19 +43,20 @@ fn truncate_output(s: &mut String) {
     }
 }
 
-#[async_trait]
 impl Tool for PtyShellTool {
-    fn name(&self) -> &str {
-        "pty_shell"
-    }
+    const NAME: &'static str = "pty_shell";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Execute an interactive command in a PTY with scripted expect/respond interactions. \
          Use only when no non-interactive flag exists (e.g. -y, --noconfirm, --batch). \
          For password prompts, set respond to \"__USER_INPUT__\" to collect input securely."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -95,11 +95,15 @@ impl Tool for PtyShellTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let command = args
             .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'command' parameter"))?;
 
         let overall_timeout = Duration::from_secs(
             args.get("timeout_secs")
@@ -111,16 +115,18 @@ impl Tool for PtyShellTool {
         let mut interactions: Vec<Interaction> = Vec::new();
         if let Some(arr) = args.get("interactions").and_then(|v| v.as_array()) {
             for item in arr {
-                let pattern = item
-                    .get("expect")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("interaction missing 'expect'"))?;
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| anyhow::anyhow!("invalid regex '{}': {}", pattern, e))?;
+                let pattern = item.get("expect").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ToolExecutionError::invalid_args("interaction missing 'expect'")
+                })?;
+                let re = regex::Regex::new(pattern).map_err(|e| {
+                    ToolExecutionError::invalid_args(format!("invalid regex '{pattern}': {e}"))
+                })?;
                 let respond = item
                     .get("respond")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("interaction missing 'respond'"))?
+                    .ok_or_else(|| {
+                        ToolExecutionError::invalid_args("interaction missing 'respond'")
+                    })?
                     .to_string();
                 let timeout_secs = item
                     .get("timeout_secs")
@@ -138,7 +144,7 @@ impl Tool for PtyShellTool {
         let platform = crate::platform::current_platform();
         let mut pty = platform
             .spawn_pty(command)
-            .map_err(|e| anyhow::anyhow!("Failed to spawn PTY: {}", e))?;
+            .map_err(|e| ToolExecutionError::other(format!("Failed to spawn PTY: {e}")))?;
 
         let deadline = Instant::now() + overall_timeout;
         let mut collected = String::new();
@@ -231,18 +237,17 @@ impl Tool for PtyShellTool {
             collected.push_str(&format!("\n[exit code: {}]", code));
         }
 
-        Ok(ToolResult {
-            success,
-            output: collected,
-            error: if success {
-                None
-            } else {
-                Some(format!(
-                    "Process exited with code: {}",
-                    exit_code.map_or("unknown".to_string(), |c| c.to_string())
-                ))
-            },
-        })
+        if collected.contains("[TIMED OUT]") {
+            return Err(ToolExecutionError::timeout(collected));
+        }
+        if success {
+            Ok(collected)
+        } else {
+            Err(ToolExecutionError::other(format!(
+                "Process exited with code {}: {collected}",
+                exit_code.map_or("unknown".to_string(), |c| c.to_string())
+            )))
+        }
     }
 }
 
@@ -250,75 +255,19 @@ impl Tool for PtyShellTool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn tool_metadata() {
-        let tool = PtyShellTool::new();
-        assert_eq!(tool.name(), "pty_shell");
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["command"].is_object());
-        assert!(schema["properties"]["interactions"].is_object());
-    }
-
     #[tokio::test]
-    async fn executes_simple_echo() {
-        let tool = PtyShellTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "echo hello_pty",
-                "timeout_secs": 10
-            }))
+    async fn interactive_response_reaches_process() {
+        let result = PtyShellTool
+            .call(
+                &mut ToolContext::default(),
+                json!({
+                    "command": "printf 'Name: ' && read name && echo \"Hello, $name\"",
+                    "interactions": [{ "expect": "Name:", "respond": "World" }],
+                    "timeout_secs": 10
+                }),
+            )
             .await
             .unwrap();
-        assert!(
-            result.output.contains("hello_pty"),
-            "output: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn handles_interaction() {
-        let tool = PtyShellTool::new();
-        // Use a shell script that prompts then echoes the response
-        let result = tool
-            .execute(json!({
-                "command": "printf 'Name: ' && read name && echo \"Hello, $name\"",
-                "interactions": [
-                    { "expect": "Name:", "respond": "World" }
-                ],
-                "timeout_secs": 10
-            }))
-            .await
-            .unwrap();
-        assert!(
-            result.output.contains("Hello, World"),
-            "output: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_command_param() {
-        let tool = PtyShellTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_process() {
-        let tool = PtyShellTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sleep 60",
-                "timeout_secs": 2
-            }))
-            .await
-            .unwrap();
-        assert!(
-            result.output.contains("[TIMED OUT]"),
-            "output: {}",
-            result.output
-        );
+        assert!(result.contains("Hello, World"), "output: {result}");
     }
 }

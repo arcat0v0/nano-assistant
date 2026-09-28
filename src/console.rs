@@ -128,7 +128,7 @@ pub fn args_summary(tool_name: &str, args: &serde_json::Value) -> String {
 
 /// Style for the `[cli]` summary line at end of turn.
 pub fn format_tool_summary(count: usize) -> String {
-    format!("{} {} tool call(s) executed", dim_label("[cli]"), count)
+    format!("{} {} tool call(s) handled", dim_label("[cli]"), count)
 }
 
 #[cfg(test)]

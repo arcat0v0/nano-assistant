@@ -1,7 +1,6 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use scraper::{Html, Selector};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -119,19 +118,20 @@ fn is_binary(content_type: &str) -> bool {
     !text_types.iter().any(|t| content_type.contains(t))
 }
 
-#[async_trait]
 impl Tool for WebFetchTool {
-    fn name(&self) -> &str {
-        "web_fetch"
-    }
+    const NAME: &'static str = "web_fetch";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Fetch a URL and return its content as readable text. \
          HTML pages are converted to plain text. \
          JSON and plain text are returned as-is."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -152,11 +152,15 @@ impl Tool for WebFetchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let url = args
             .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'url' parameter"))?;
 
         let max_length = args
             .get("max_length")
@@ -169,26 +173,16 @@ impl Tool for WebFetchTool {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let response = match self.client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Request failed: {e}")),
-                });
-            }
-        };
-
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ToolExecutionError::network(format!("Request failed: {e}")))?;
         let status = response.status();
         if !status.is_success() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("HTTP {status}")),
-            });
+            return Err(ToolExecutionError::provider(format!("HTTP {status}")));
         }
-
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -197,23 +191,14 @@ impl Tool for WebFetchTool {
             .to_string();
 
         if is_binary(&content_type) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Binary content type not supported: {content_type}")),
-            });
+            return Err(ToolExecutionError::other(format!(
+                "Binary content type not supported: {content_type}"
+            )));
         }
 
-        let body = match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                });
-            }
-        };
+        let body = response.text().await.map_err(|e| {
+            ToolExecutionError::network(format!("Failed to read response body: {e}"))
+        })?;
 
         let mut output = if is_html(&content_type) {
             html_to_markdown_with_selector(&body, selector.as_deref())
@@ -223,33 +208,13 @@ impl Tool for WebFetchTool {
 
         truncate_to_limit(&mut output, max_length);
 
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spec_metadata() {
-        let tool = WebFetchTool::new();
-        assert_eq!(tool.name(), "web_fetch");
-        assert!(tool.description().contains("URL"));
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["required"], json!(["url"]));
-    }
-
-    #[tokio::test]
-    async fn missing_url_param_returns_error() {
-        let tool = WebFetchTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
 
     #[test]
     fn is_html_detects_html_content_types() {

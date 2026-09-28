@@ -1,7 +1,6 @@
-pub mod dispatcher;
-pub mod loop_;
+mod engine;
 pub mod prompt;
 pub mod streaming;
 
-pub use loop_::{Agent, ConversationHistory, TurnResult};
+pub use engine::{Agent, McpReloadResult, TurnResult};
 pub use streaming::{turn_streamed_to_stdout, StreamOutputEvent};

@@ -257,85 +257,69 @@ async fn rescan_system_info() -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::{SecurityManager, SecurityMode};
+    use std::sync::Arc;
 
-    #[test]
-    fn slash_quit_is_recognized() {
-        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
-            "compatible",
-            "http://localhost:8080/v1",
-            None,
-            Some("http://localhost:8080/v1"),
-        ));
-        let agent = crate::agent::Agent::new(
-            provider,
+    async fn create_test_agent() -> Agent {
+        let mut config = Config::default();
+        config.provider.provider = Some("compatible".to_string());
+        config.provider.api_url = Some("http://localhost:8080/v1".to_string());
+        let model = crate::providers::build_model(&config, Path::new("")).expect("model build");
+        Agent::new(
+            model,
             vec![],
             None,
-            crate::config::schema::Config::default(),
-        );
-        let mut agent = agent;
+            config,
+            vec![],
+            None,
+            Arc::new(SecurityManager::new(SecurityMode::Direct)),
+            PathBuf::from("config.toml"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn slash_quit_is_recognized() {
+        let mut agent = create_test_agent().await;
         assert!(matches!(
             handle_inline_command(&mut agent, "/quit"),
             InlineCommandResult::Quit
         ));
+        assert!(matches!(
+            handle_inline_command(&mut agent, "quit"),
+            InlineCommandResult::Quit
+        ));
+        assert!(matches!(
+            handle_inline_command(&mut agent, "/exit"),
+            InlineCommandResult::Quit
+        ));
+        assert!(matches!(
+            handle_inline_command(&mut agent, "exit"),
+            InlineCommandResult::Quit
+        ));
     }
 
-    #[test]
-    fn unknown_slash_command_is_handled() {
-        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
-            "compatible",
-            "http://localhost:8080/v1",
-            None,
-            Some("http://localhost:8080/v1"),
-        ));
-        let agent = crate::agent::Agent::new(
-            provider,
-            vec![],
-            None,
-            crate::config::schema::Config::default(),
-        );
-        let mut agent = agent;
+    #[tokio::test]
+    async fn unknown_slash_command_is_handled() {
+        let mut agent = create_test_agent().await;
         assert!(matches!(
             handle_inline_command(&mut agent, "/wat"),
             InlineCommandResult::Handled
         ));
     }
 
-    #[test]
-    fn plain_prompt_is_passed_through() {
-        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
-            "compatible",
-            "http://localhost:8080/v1",
-            None,
-            Some("http://localhost:8080/v1"),
-        ));
-        let agent = crate::agent::Agent::new(
-            provider,
-            vec![],
-            None,
-            crate::config::schema::Config::default(),
-        );
-        let mut agent = agent;
+    #[tokio::test]
+    async fn plain_prompt_is_passed_through() {
+        let mut agent = create_test_agent().await;
         match handle_inline_command(&mut agent, "hello") {
             InlineCommandResult::Prompt(prompt) => assert_eq!(prompt, "hello"),
             _ => panic!("expected prompt passthrough"),
         }
     }
 
-    #[test]
-    fn rescan_is_recognized() {
-        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
-            "compatible",
-            "http://localhost:8080/v1",
-            None,
-            Some("http://localhost:8080/v1"),
-        ));
-        let agent = crate::agent::Agent::new(
-            provider,
-            vec![],
-            None,
-            crate::config::schema::Config::default(),
-        );
-        let mut agent = agent;
+    #[tokio::test]
+    async fn rescan_is_recognized() {
+        let mut agent = create_test_agent().await;
         assert!(matches!(
             handle_inline_command(&mut agent, "/rescan"),
             InlineCommandResult::Rescan
@@ -346,27 +330,37 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn memory_command_is_recognized() {
-        let provider = std::sync::Arc::new(crate::providers::compatible::CompatibleProvider::new(
-            "compatible",
-            "http://localhost:8080/v1",
-            None,
-            Some("http://localhost:8080/v1"),
-        ));
-        let agent = crate::agent::Agent::new(
-            provider,
-            vec![],
-            None,
-            crate::config::schema::Config::default(),
-        );
-        let mut agent = agent;
+    #[tokio::test]
+    async fn memory_command_is_recognized() {
+        let mut agent = create_test_agent().await;
         assert!(matches!(
             handle_inline_command(&mut agent, "/memory"),
             InlineCommandResult::Handled
         ));
         assert!(matches!(
             handle_inline_command(&mut agent, "memory"),
+            InlineCommandResult::Handled
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_command_is_recognized() {
+        let mut agent = create_test_agent().await;
+        assert!(matches!(
+            handle_inline_command(&mut agent, "/clear"),
+            InlineCommandResult::Handled
+        ));
+        assert!(matches!(
+            handle_inline_command(&mut agent, "clear"),
+            InlineCommandResult::Handled
+        ));
+    }
+
+    #[tokio::test]
+    async fn help_command_is_recognized() {
+        let mut agent = create_test_agent().await;
+        assert!(matches!(
+            handle_inline_command(&mut agent, "/help"),
             InlineCommandResult::Handled
         ));
     }

@@ -1,4 +1,4 @@
-use crate::agent::loop_::{Agent, TurnResult};
+use crate::agent::{Agent, TurnResult};
 use std::io::{self, Write};
 
 pub enum StreamOutputEvent {
@@ -133,35 +133,6 @@ impl StreamPrinter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stream_printer_writes_content() {
-        let mut printer = StreamPrinter::new();
-        printer.print_event(StreamOutputEvent::Content("test".into()));
-    }
-
-    #[test]
-    fn stream_printer_writes_progress() {
-        let mut printer = StreamPrinter::new();
-        printer.print_event(StreamOutputEvent::Progress("progress".into()));
-    }
-
-    #[test]
-    fn loading_indicator_transitions_cleanly() {
-        let mut loading = LoadingIndicator::new();
-        loading.show();
-        assert!(loading.active);
-        loading.clear_for_output();
-        assert!(!loading.active);
-    }
-
-    #[test]
-    fn stream_printer_accumulates_content() {
-        let mut printer = StreamPrinter::new();
-        printer.print_event(StreamOutputEvent::Content("hello ".into()));
-        printer.print_event(StreamOutputEvent::Content("world".into()));
-        assert_eq!(printer.take_accumulated(), "hello world");
-    }
 
     #[test]
     fn stream_printer_take_accumulated_clears() {

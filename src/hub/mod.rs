@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -289,7 +290,7 @@ impl HubClient {
 
     pub async fn quota_status(&self) -> anyhow::Result<HubQuotaResponse> {
         let response = self
-            .send_signed("GET", "/v1/quota", Vec::new(), None, true)
+            .send_signed("GET", "/v1/quota", Bytes::new(), None, true)
             .await?;
         Ok(response.json::<HubQuotaResponse>().await?)
     }
@@ -309,11 +310,11 @@ impl HubClient {
             && model_routes_via_hub(&state.config)
     }
 
-    pub async fn signed_json(
+    pub async fn signed_bytes(
         &self,
         method: &str,
         path: &str,
-        body: Vec<u8>,
+        body: Bytes,
         retry_on_registration_error: bool,
     ) -> anyhow::Result<reqwest::Response> {
         self.send_signed(
@@ -364,7 +365,7 @@ impl HubClient {
         &self,
         method: &str,
         path: &str,
-        body: Vec<u8>,
+        body: Bytes,
         content_type: Option<&str>,
         retry_on_registration_error: bool,
     ) -> anyhow::Result<reqwest::Response> {
@@ -394,7 +395,7 @@ impl HubClient {
         &self,
         method: &str,
         path: &str,
-        body: Vec<u8>,
+        body: Bytes,
         content_type: Option<&str>,
     ) -> Result<reqwest::Response, HubApiError> {
         let resolved = self.resolved_config().await;

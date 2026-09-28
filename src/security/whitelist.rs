@@ -1,5 +1,4 @@
 use crate::security::SecurityDecision;
-use crate::tools::traits::{Tool, ToolResult};
 
 pub fn check_whitelist(command: &str, whitelist: &[String]) -> SecurityDecision {
     if whitelist.is_empty() {
@@ -14,26 +13,6 @@ pub fn check_whitelist(command: &str, whitelist: &[String]) -> SecurityDecision 
         SecurityDecision::Allow
     } else {
         SecurityDecision::Deny(format!("command not in whitelist: {command}"))
-    }
-}
-
-pub async fn execute(
-    tool: &dyn Tool,
-    args: serde_json::Value,
-    whitelist: &[String],
-) -> anyhow::Result<ToolResult> {
-    let command = args
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-
-    match check_whitelist(command, whitelist) {
-        SecurityDecision::Allow => tool.execute(args).await,
-        SecurityDecision::Deny(reason) => Ok(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(reason),
-        }),
     }
 }
 

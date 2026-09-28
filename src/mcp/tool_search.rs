@@ -1,48 +1,90 @@
-//! Built-in `tool_search` tool for on-demand MCP tool schema loading.
-//!
-//! When `mcp.deferred_loading` is enabled, this tool lets the LLM discover and
-//! activate deferred MCP tools. Supports two query modes:
-//! - `select:name1,name2` — fetch exact tools by prefixed name.
-//! - Free-text keyword search — returns the best-matching stubs.
-
 use std::fmt::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
+use parking_lot::Mutex;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 
 use super::deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use crate::tools::{Tool, ToolResult};
 
-/// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
-/// Built-in tool that fetches full schemas for deferred MCP tools.
 pub struct ToolSearchTool {
-    deferred: DeferredMcpToolSet,
+    deferred: Vec<DeferredMcpToolSet>,
     activated: Arc<Mutex<ActivatedToolSet>>,
 }
 
 impl ToolSearchTool {
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
+        Self::new_multi(vec![deferred], activated)
+    }
+
+    pub fn new_multi(
+        deferred: Vec<DeferredMcpToolSet>,
+        activated: Arc<Mutex<ActivatedToolSet>>,
+    ) -> Self {
         Self {
             deferred,
             activated,
         }
     }
+
+    fn find_set(&self, name: &str) -> Option<&DeferredMcpToolSet> {
+        self.deferred
+            .iter()
+            .find(|set| set.get_by_name(name).is_some())
+    }
+
+    fn activate(&self, name: &str, output: &mut String) -> Result<bool, ToolExecutionError> {
+        let Some(set) = self.find_set(name) else {
+            return Ok(false);
+        };
+        let mut activated = self.activated.lock();
+        let definition = match activated.get(name) {
+            Some(tool) => tool.definition(),
+            None => {
+                let tool = set.activate(name).expect("discovered MCP tool");
+                let definition = tool.definition();
+                activated.activate(tool);
+                definition
+            }
+        };
+        drop(activated);
+        let definition = serde_json::to_string(&definition).map_err(|e| {
+            ToolExecutionError::other(format!("Could not serialize tool definition: {e}"))
+        })?;
+        let _ = writeln!(output, "<function>{definition}</function>");
+        Ok(true)
+    }
+
+    fn select_tools(&self, names: &[&str]) -> Result<String, ToolExecutionError> {
+        let mut output = String::from("<functions>\n");
+        let mut not_found = Vec::new();
+        for name in names.iter().copied().filter(|name| !name.is_empty()) {
+            if !self.activate(name, &mut output)? {
+                not_found.push(name);
+            }
+        }
+        output.push_str("</functions>\n");
+        if !not_found.is_empty() {
+            let _ = write!(output, "\nNot found: {}", not_found.join(", "));
+        }
+        Ok(output)
+    }
 }
 
-#[async_trait]
 impl Tool for ToolSearchTool {
-    fn name(&self) -> &str {
-        "tool_search"
-    }
+    const NAME: &'static str = "tool_search";
+    type Args = serde_json::Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Fetch full schema definitions for deferred MCP tools so they can be called. \
          Use \"select:name1,name2\" for exact match or keywords to search."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -60,134 +102,48 @@ impl Tool for ToolSearchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: serde_json::Value,
+    ) -> Result<String, ToolExecutionError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .trim();
+        if query.is_empty() {
+            return Err(ToolExecutionError::invalid_args(
+                "query parameter is required",
+            ));
+        }
+
+        if let Some(names_str) = query.strip_prefix("select:") {
+            let names: Vec<&str> = names_str.split(',').map(str::trim).collect();
+            return self.select_tools(&names);
+        }
 
         let max_results = args
             .get("max_results")
             .and_then(|v| v.as_u64())
             .map(|v| usize::try_from(v).unwrap_or(DEFAULT_MAX_RESULTS))
             .unwrap_or(DEFAULT_MAX_RESULTS);
-
-        if query.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("query parameter is required".into()),
-            });
-        }
-
-        // Parse query mode
-        if let Some(names_str) = query.strip_prefix("select:") {
-            // Exact selection mode
-            let names: Vec<&str> = names_str.split(',').map(str::trim).collect();
-            return self.select_tools(&names);
-        }
-
-        // Keyword search mode
-        let results = self.deferred.search(query, max_results);
+        let results: Vec<_> = self
+            .deferred
+            .iter()
+            .flat_map(|set| set.search(query, max_results))
+            .take(max_results)
+            .collect();
         if results.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: "No matching deferred tools found.".into(),
-                error: None,
-            });
+            return Ok("No matching deferred tools found.".into());
         }
 
-        // Activate and return full specs
         let mut output = String::from("<functions>\n");
-        let mut activated_count = 0;
-        let mut guard = self.activated.lock().unwrap();
-
-        for stub in &results {
-            if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
-                if !guard.is_activated(&stub.prefixed_name) {
-                    if let Some(tool) = self.deferred.activate(&stub.prefixed_name) {
-                        guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
-                        activated_count += 1;
-                    }
-                }
-                let _ = writeln!(
-                    output,
-                    "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                    spec.name,
-                    spec.description.replace('"', "\\\""),
-                    spec.parameters
-                );
-            }
+        for stub in results {
+            self.activate(&stub.prefixed_name, &mut output)?;
         }
-
         output.push_str("</functions>\n");
-        drop(guard);
-
-        tracing::debug!(
-            "tool_search: query={query:?}, matched={}, activated={activated_count}",
-            results.len()
-        );
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
-    }
-}
-
-impl ToolSearchTool {
-    fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
-        let mut output = String::from("<functions>\n");
-        let mut not_found = Vec::new();
-        let mut activated_count = 0;
-        let mut guard = self.activated.lock().unwrap();
-
-        for name in names {
-            if name.is_empty() {
-                continue;
-            }
-            match self.deferred.tool_spec(name) {
-                Some(spec) => {
-                    if !guard.is_activated(name) {
-                        if let Some(tool) = self.deferred.activate(name) {
-                            guard.activate(String::from(*name), Arc::from(tool));
-                            activated_count += 1;
-                        }
-                    }
-                    let _ = writeln!(
-                        output,
-                        "<function>{{\"name\": \"{}\", \"description\": \"{}\", \"parameters\": {}}}</function>",
-                        spec.name,
-                        spec.description.replace('"', "\\\""),
-                        spec.parameters
-                    );
-                }
-                None => {
-                    not_found.push(*name);
-                }
-            }
-        }
-
-        output.push_str("</functions>\n");
-        drop(guard);
-
-        if !not_found.is_empty() {
-            let _ = write!(output, "\nNot found: {}", not_found.join(", "));
-        }
-
-        tracing::debug!(
-            "tool_search select: requested={}, activated={activated_count}, not_found={}",
-            names.len(),
-            not_found.len()
-        );
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        Ok(output)
     }
 }
 
@@ -197,6 +153,7 @@ mod tests {
     use crate::mcp::client::McpRegistry;
     use crate::mcp::deferred::DeferredMcpToolStub;
     use crate::mcp::protocol::McpToolDef;
+    use rig::tool::{ToolErrorKind, ToolSet};
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
@@ -204,165 +161,100 @@ mod tests {
     }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
-        let def = McpToolDef {
-            name: name.to_string(),
-            description: Some(desc.to_string()),
-            input_schema: serde_json::json!({"type": "object", "properties": {}}),
-        };
-        DeferredMcpToolStub::new(name.to_string(), def)
+        DeferredMcpToolStub::new(
+            name.into(),
+            McpToolDef {
+                name: name.into(),
+                description: Some(desc.into()),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        )
     }
 
     #[tokio::test]
-    async fn tool_metadata() {
+    async fn missing_query_is_model_visible_invalid_args() {
         let tool = ToolSearchTool::new(
             make_deferred_set(vec![]).await,
             Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
-        assert_eq!(tool.name(), "tool_search");
-        assert!(!tool.description().is_empty());
-        assert!(tool.parameters_schema()["properties"]["query"].is_object());
+        let tools = ToolSet::from_tools(vec![tool]);
+        let result = tools
+            .execute(
+                ToolSearchTool::NAME,
+                r#"{"query":""}"#,
+                &mut ToolContext::new(),
+            )
+            .await;
+        assert!(result.is_error_kind(ToolErrorKind::InvalidArgs));
+        assert!(result
+            .error()
+            .unwrap()
+            .model_output()
+            .as_text()
+            .unwrap()
+            .contains("query parameter is required"));
     }
 
     #[tokio::test]
-    async fn empty_query_returns_error() {
-        let tool = ToolSearchTool::new(
-            make_deferred_set(vec![]).await,
-            Arc::new(Mutex::new(ActivatedToolSet::new())),
-        );
-        let result = tool
-            .execute(serde_json::json!({"query": ""}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-    }
-
-    #[tokio::test]
-    async fn select_nonexistent_tool_reports_not_found() {
-        let tool = ToolSearchTool::new(
-            make_deferred_set(vec![]).await,
-            Arc::new(Mutex::new(ActivatedToolSet::new())),
-        );
-        let result = tool
-            .execute(serde_json::json!({"query": "select:nonexistent"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("Not found"));
-    }
-
-    #[tokio::test]
-    async fn keyword_search_no_matches() {
-        let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("fs__read", "Read file")]).await,
-            Arc::new(Mutex::new(ActivatedToolSet::new())),
-        );
-        let result = tool
-            .execute(serde_json::json!({"query": "zzzzz_nonexistent"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("No matching"));
-    }
-
-    #[tokio::test]
-    async fn keyword_search_finds_match() {
+    async fn search_and_selection_activate_tools_across_sets() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
-        let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+        let tool = ToolSearchTool::new_multi(
+            vec![
+                make_deferred_set(vec![make_stub("fs__read", "Read a file")]).await,
+                make_deferred_set(vec![make_stub("db__query", "Query database")]).await,
+            ],
             Arc::clone(&activated),
         );
-        let result = tool
-            .execute(serde_json::json!({"query": "read file"}))
+        let mut context = ToolContext::new();
+        let output = tool
+            .call(&mut context, serde_json::json!({"query": "read"}))
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("<function>"));
-        assert!(result.output.contains("fs__read"));
-        // Tool should now be activated
-        assert!(activated.lock().unwrap().is_activated("fs__read"));
+        assert!(output.contains("fs__read"));
+        assert!(!output.contains("db__query"));
+        assert!(activated.lock().is_activated("fs__read"));
+        assert!(!activated.lock().is_activated("db__query"));
+
+        let output = tool
+            .call(
+                &mut context,
+                serde_json::json!({"query": "select:db__query,missing"}),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("db__query"));
+        assert!(output.contains("Not found: missing"));
+        assert!(activated.lock().is_activated("db__query"));
+        assert_eq!(activated.lock().tool_names().len(), 2);
+
+        tool.call(
+            &mut context,
+            serde_json::json!({"query": "select:fs__read"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(activated.lock().tool_names().len(), 2);
     }
 
-    /// Verify tool_search works with stubs from multiple MCP servers,
-    /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
-    async fn multiple_servers_stubs_all_searchable() {
-        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
-        let stubs = vec![
-            make_stub("server_a__list_files", "List files on server A"),
-            make_stub("server_a__read_file", "Read file on server A"),
-            make_stub("server_b__query_db", "Query database on server B"),
-            make_stub("server_b__insert_row", "Insert row on server B"),
-        ];
-        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
-
-        // Search should find tools across both servers
-        let result = tool
-            .execute(serde_json::json!({"query": "file"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("server_a__list_files"));
-        assert!(result.output.contains("server_a__read_file"));
-
-        // Server B tools should also be searchable
-        let result = tool
-            .execute(serde_json::json!({"query": "database query"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("server_b__query_db"));
-    }
-
-    /// Verify select mode activates tools and they stay activated across calls,
-    /// matching the daemon-mode pattern where a single ActivatedToolSet persists.
-    #[tokio::test]
-    async fn select_activates_and_persists_across_calls() {
-        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
-        let stubs = vec![
-            make_stub("srv__tool_a", "Tool A"),
-            make_stub("srv__tool_b", "Tool B"),
-        ];
-        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
-
-        // Activate tool_a
-        let result = tool
-            .execute(serde_json::json!({"query": "select:srv__tool_a"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-        assert!(activated.lock().unwrap().is_activated("srv__tool_a"));
-        assert!(!activated.lock().unwrap().is_activated("srv__tool_b"));
-
-        // Activate tool_b in a separate call
-        let result = tool
-            .execute(serde_json::json!({"query": "select:srv__tool_b"}))
-            .await
-            .unwrap();
-        assert!(result.success);
-
-        // Both should remain activated
-        let guard = activated.lock().unwrap();
-        assert!(guard.is_activated("srv__tool_a"));
-        assert!(guard.is_activated("srv__tool_b"));
-        assert_eq!(guard.tool_specs().len(), 2);
-    }
-
-    /// Verify re-activating an already-activated tool does not duplicate it.
-    #[tokio::test]
-    async fn reactivation_is_idempotent() {
-        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+    async fn search_serializes_tool_descriptions_as_json() {
         let tool = ToolSearchTool::new(
-            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
-            Arc::clone(&activated),
+            make_deferred_set(vec![make_stub("fs__read", "Read \"quoted\" paths")]).await,
+            Arc::new(Mutex::new(ActivatedToolSet::new())),
         );
-
-        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+        let output = tool
+            .call(
+                &mut ToolContext::new(),
+                serde_json::json!({"query": "select:fs__read"}),
+            )
             .await
             .unwrap();
-        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
-            .await
+        let definition = output
+            .strip_prefix("<functions>\n<function>")
+            .unwrap()
+            .strip_suffix("</function>\n</functions>\n")
             .unwrap();
-
-        assert_eq!(activated.lock().unwrap().tool_specs().len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(definition).unwrap();
+        assert_eq!(parsed["description"], "Read \"quoted\" paths");
     }
 }

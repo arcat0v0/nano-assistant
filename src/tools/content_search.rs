@@ -1,7 +1,6 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
 use regex::RegexBuilder;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 use std::fmt::Write;
 use std::path::Path;
 
@@ -93,17 +92,17 @@ struct MatchResult {
     line: String,
 }
 
-#[async_trait]
 impl Tool for ContentSearchTool {
-    fn name(&self) -> &str {
-        "content_search"
+    const NAME: &'static str = "content_search";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        "Search file contents by regex pattern. Returns matching lines with file paths and line numbers.".into()
     }
 
-    fn description(&self) -> &str {
-        "Search file contents by regex pattern. Returns matching lines with file paths and line numbers."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -128,20 +127,20 @@ impl Tool for ContentSearchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let pattern = args
             .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
-
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'pattern' parameter"))?;
         if pattern.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Empty pattern is not allowed.".into()),
-            });
+            return Err(ToolExecutionError::invalid_args(
+                "Empty pattern is not allowed.",
+            ));
         }
-
         let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let include = args.get("include").and_then(|v| v.as_str());
         let case_sensitive = args
@@ -162,14 +161,11 @@ impl Tool for ContentSearchTool {
             )
         })
         .await
-        .map_err(|e| anyhow::anyhow!("Search task failed: {e}"))??;
+        .map_err(|e| ToolExecutionError::other(format!("Search task failed: {e}")))?
+        .map_err(|e| ToolExecutionError::invalid_args(e.to_string()))?;
 
         if matches.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: "No matches found.".into(),
-                error: None,
-            });
+            return Ok("No matches found.".into());
         }
 
         let mut buf = String::new();
@@ -194,115 +190,27 @@ impl Tool for ContentSearchTool {
         )
         .unwrap();
 
-        Ok(ToolResult {
-            success: true,
-            output: buf,
-            error: None,
-        })
+        Ok(buf)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[tokio::test]
-    async fn finds_matches() {
-        let dir = test_dir("nano_content_search_test");
-        std::fs::write(
-            dir.join("main.rs"),
-            "fn main() {\n    println!(\"hello\");\n}\n",
-        )
-        .unwrap();
-        std::fs::write(dir.join("lib.rs"), "pub fn greet() {}\n").unwrap();
-
-        let tool = ContentSearchTool::new();
-        let result = tool
-            .execute(json!({"pattern": "fn main", "path": dir.to_string_lossy()}))
+    async fn searches_content_case_insensitively_with_include_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("match.rs"), "Hello World")
             .await
             .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("main.rs"));
-        assert!(result.output.contains("fn main"));
-    }
-
-    #[tokio::test]
-    async fn case_insensitive() {
-        let dir = test_dir("nano_content_search_ci");
-        std::fs::write(dir.join("test.txt"), "Hello World\n").unwrap();
-
-        let tool = ContentSearchTool::new();
-        let result = tool
-            .execute(json!({
-                "pattern": "HELLO",
-                "path": dir.to_string_lossy(),
-                "case_sensitive": false
-            }))
+        tokio::fs::write(dir.path().join("omit.txt"), "Hello World")
             .await
             .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("Hello World"));
-    }
-
-    #[tokio::test]
-    async fn include_filter() {
-        let dir = test_dir("nano_content_search_include");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(dir.join("readme.txt"), "fn main is great\n").unwrap();
-
-        let tool = ContentSearchTool::new();
-        let result = tool
-            .execute(json!({
-                "pattern": "fn",
-                "path": dir.to_string_lossy(),
-                "include": "*.rs"
-            }))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("main.rs"));
-        assert!(!result.output.contains("readme.txt"));
-    }
-
-    #[tokio::test]
-    async fn no_matches() {
-        let dir = test_dir("nano_content_search_none");
-        std::fs::write(dir.join("test.txt"), "hello\n").unwrap();
-
-        let tool = ContentSearchTool::new();
-        let result = tool
-            .execute(json!({"pattern": "nonexistent_xyz", "path": dir.to_string_lossy()}))
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("No matches found"));
-    }
-
-    #[tokio::test]
-    async fn empty_pattern_rejected() {
-        let tool = ContentSearchTool::new();
-        let result = tool.execute(json!({"pattern": ""})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Empty pattern"));
-    }
-
-    #[tokio::test]
-    async fn missing_param() {
-        let tool = ContentSearchTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
+        let output = ContentSearchTool.call(&mut ToolContext::default(), json!({
+            "pattern": "hello", "path": dir.path(), "include": "*.rs", "case_sensitive": false
+        })).await.unwrap();
+        assert!(output.contains("match.rs:1:Hello World"));
+        assert!(!output.contains("omit.txt"));
     }
 }

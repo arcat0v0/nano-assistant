@@ -1,6 +1,5 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
@@ -188,18 +187,19 @@ fn format_results(results: &[SearchResult]) -> String {
     output
 }
 
-#[async_trait]
 impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
-        "web_search"
-    }
+    const NAME: &'static str = "web_search";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Search the web using DuckDuckGo and return results with titles, URLs, and snippets. \
          Free, no API key required."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -216,11 +216,15 @@ impl Tool for WebSearchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let query = args
             .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'query' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'query' parameter"))?;
 
         let max_results = args
             .get("max_results")
@@ -236,29 +240,19 @@ impl Tool for WebSearchTool {
             .await;
 
         let html = match response {
-            Ok(resp) if resp.status().is_success() => match resp.text().await {
-                Ok(text) => text,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Failed to read response: {e}")),
-                    });
-                }
-            },
+            Ok(resp) if resp.status().is_success() => resp.text().await.map_err(|e| {
+                ToolExecutionError::network(format!("Failed to read response: {e}"))
+            })?,
             Ok(resp) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("HTTP {}", resp.status())),
-                });
+                return Err(ToolExecutionError::provider(format!(
+                    "HTTP {}",
+                    resp.status()
+                )))
             }
             Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Search request failed: {e}")),
-                });
+                return Err(ToolExecutionError::network(format!(
+                    "Search request failed: {e}"
+                )))
             }
         };
 
@@ -274,33 +268,13 @@ impl Tool for WebSearchTool {
             output.push_str("\n... [results truncated]");
         }
 
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spec_metadata() {
-        let tool = WebSearchTool::new();
-        assert_eq!(tool.name(), "web_search");
-        assert!(tool.description().contains("DuckDuckGo"));
-        let schema = tool.parameters_schema();
-        assert_eq!(schema["required"], json!(["query"]));
-    }
-
-    #[tokio::test]
-    async fn missing_query_param_returns_error() {
-        let tool = WebSearchTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
 
     #[test]
     fn url_decode_handles_common_encodings() {

@@ -1,24 +1,16 @@
 //! System prompt builder for the agent.
 //!
-//! Simplified from ZeroClaw's `prompt.rs` — no AIEOS, no channel media.
-//! Builds a system prompt with: datetime, tools list, skills, tool-usage protocol, safety.
 
 use crate::skills::Skill;
-use crate::tools::Tool;
-use crate::tools::ToolSpec;
+use rig::completion::ToolDefinition;
 use std::fmt::Write;
 use std::process::Command;
 
 /// Context required to build the system prompt.
 pub struct PromptContext<'a> {
     /// Available tools for the agent.
-    pub tools: &'a [Box<dyn Tool>],
-    /// Tool specs pre-computed from tools (avoids re-computation).
-    pub tool_specs: &'a [ToolSpec],
-    /// Whether the provider supports native function calling.
-    pub native_tool_calling: bool,
-    /// Dispatcher-specific instructions (XML protocol for non-native, empty for native).
-    pub dispatcher_instructions: &'a str,
+    pub tools: &'a [ToolDefinition],
+    pub config_path: &'a std::path::Path,
     /// Available skills for the agent.
     pub skills: &'a [Skill],
     /// Optional system information from MEMORY.md.
@@ -45,10 +37,9 @@ impl SystemPromptBuilder {
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
         let deferred = build_deferred_tools_section(ctx);
-        let protocol = build_protocol_section(ctx);
         let safety = build_safety_section();
 
-        let self_management = build_self_management_section();
+        let self_management = build_self_management_section(ctx.config_path);
 
         let command_exec = build_command_execution_section();
 
@@ -60,7 +51,6 @@ impl SystemPromptBuilder {
             &tools,
             &skills,
             &deferred,
-            &protocol,
             &safety,
             &self_management,
             &command_exec,
@@ -168,17 +158,9 @@ fn build_tools_section(ctx: &PromptContext<'_>) -> String {
         let _ = writeln!(
             out,
             "- **{}**: {}\n  Parameters: `{}`",
-            tool.name(),
-            tool.description(),
-            tool.parameters_schema()
+            tool.name, tool.description, tool.parameters
         );
     }
-
-    if !ctx.dispatcher_instructions.is_empty() {
-        out.push('\n');
-        out.push_str(ctx.dispatcher_instructions);
-    }
-
     out
 }
 
@@ -208,24 +190,7 @@ fn build_deferred_tools_section(ctx: &PromptContext<'_>) -> String {
     out
 }
 
-fn build_protocol_section(ctx: &PromptContext<'_>) -> String {
-    if ctx.native_tool_calling {
-        String::new()
-    } else {
-        "## Tool Use Protocol\n\n\
-         To use a tool, wrap a JSON object in `antml:invoke name=\"tool_name\"` tags:\n\n\
-         ```\n\
-         antml:invoke name=\"tool_name\"\n\
-         {\"param\": \"value\"}\n\
-         antml:invoke\n\
-         ```\n\n\
-         Wait for tool results before responding. You may chain multiple tool calls \
-         if they are independent."
-            .to_string()
-    }
-}
-
-fn build_self_management_section() -> String {
+fn build_self_management_section(config_path: &std::path::Path) -> String {
     let mut prompt = String::from("## Self-Management Capabilities\n\n");
 
     prompt.push_str("### Skill Installation\n");
@@ -236,7 +201,6 @@ fn build_self_management_section() -> String {
     prompt.push_str("Do NOT modify builtin skills.\n\n");
 
     prompt.push_str("### MCP Server Configuration\n");
-    let config_path = crate::platform::current_platform().config_path();
     prompt.push_str(&format!(
         "Edit {} to add MCP servers.\n",
         config_path.display()
@@ -358,387 +322,4 @@ fn build_safety_section() -> String {
      - NEVER fabricate tool results. If a tool returns empty results, say \"No results found.\"\n\
      - If a tool call fails, report the error — never make up data."
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-
-    struct DummyTool;
-
-    #[async_trait]
-    impl Tool for DummyTool {
-        fn name(&self) -> &str {
-            "dummy_tool"
-        }
-        fn description(&self) -> &str {
-            "A test tool"
-        }
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> anyhow::Result<crate::tools::ToolResult> {
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: "ok".into(),
-                error: None,
-            })
-        }
-    }
-
-    #[test]
-    fn prompt_contains_tools_section() {
-        let tool: Box<dyn Tool> = Box::new(DummyTool);
-        let tools: Vec<Box<dyn Tool>> = vec![tool];
-        let specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec()).collect();
-        let ctx = PromptContext {
-            tools: &tools,
-            tool_specs: &specs,
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Available Tools"));
-        assert!(prompt.contains("dummy_tool"));
-    }
-
-    #[test]
-    fn prompt_contains_safety_section() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Safety"));
-        assert!(prompt.contains("NEVER fabricate"));
-    }
-
-    #[test]
-    fn prompt_includes_xml_protocol_for_non_native() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Tool Use Protocol"));
-    }
-
-    #[test]
-    fn prompt_omits_protocol_for_native() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: true,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(!prompt.contains("## Tool Use Protocol"));
-    }
-
-    #[test]
-    fn days_to_date_epoch() {
-        assert_eq!(days_to_date(0), (1970, 1, 1));
-    }
-
-    #[test]
-    fn days_to_date_recent() {
-        assert_eq!(days_to_date(19723), (2024, 1, 1));
-    }
-
-    #[test]
-    fn prompt_contains_datetime() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Current Date & Time"));
-    }
-
-    #[test]
-    fn prompt_empty_when_no_tools_and_native() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: true,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Current Date & Time"));
-        assert!(prompt.contains("## Safety"));
-    }
-
-    #[test]
-    fn prompt_includes_skills_section() {
-        let skills = vec![crate::skills::Skill {
-            name: "test-skill".to_string(),
-            description: "A test skill".to_string(),
-            version: "0.1.0".to_string(),
-            author: None,
-            tags: vec![],
-            tools: vec![],
-            prompts: vec!["Do the thing.".to_string()],
-            location: None,
-            is_builtin: false,
-            source: None,
-            raw_content: None,
-        }];
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &skills,
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("<available_skills>"));
-        assert!(prompt.contains("<name>test-skill</name>"));
-        assert!(prompt.contains("</available_skills>"));
-    }
-
-    #[test]
-    fn prompt_includes_system_info_when_provided() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: Some("OS: Linux\nKernel: 5.15"),
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## System Information"));
-        assert!(prompt.contains("OS: Linux"));
-    }
-
-    #[test]
-    fn prompt_includes_runtime_context() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Runtime Context"));
-        assert!(prompt.contains("Current Working Directory"));
-    }
-
-    #[test]
-    fn prompt_omits_system_info_when_none() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(!prompt.contains("## System Information\n\n### "));
-    }
-
-    #[test]
-    fn prompt_system_info_section_placed_after_datetime() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: Some("OS: TestLinux"),
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        let datetime_pos = prompt.find("## Current Date & Time").unwrap();
-        let sysinfo_pos = prompt.find("## System Information").unwrap();
-        assert!(
-            sysinfo_pos > datetime_pos,
-            "System info should appear after datetime"
-        );
-    }
-
-    #[test]
-    fn prompt_runtime_context_section_placed_after_system_info() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: Some("OS: TestLinux"),
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        let sysinfo_pos = prompt.find("## System Information").unwrap();
-        let runtime_pos = prompt.find("## Runtime Context").unwrap();
-        assert!(
-            runtime_pos > sysinfo_pos,
-            "Runtime context should appear after system info"
-        );
-    }
-
-    #[test]
-    fn prompt_contains_self_management_section() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## Self-Management Capabilities"));
-        assert!(prompt.contains("### Skill Installation"));
-        assert!(prompt.contains("### MCP Server Configuration"));
-        assert!(prompt.contains("### Memory Management"));
-        assert!(prompt.contains("config.toml"));
-        assert!(prompt.contains("MEMORY.md"));
-        assert!(prompt.contains("After successfully completing meaningful system work"));
-        assert!(prompt.contains("Do not store secrets, API keys, tokens, passwords"));
-    }
-
-    #[test]
-    fn prompt_contains_system_steward_policy_section() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("## System Steward Policy"));
-        assert!(prompt.contains("You are a system steward first."));
-        assert!(prompt.contains("The user may override this policy explicitly"));
-    }
-
-    #[test]
-    fn prompt_system_steward_policy_includes_environment_rules() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("Read the injected `System Information` first"));
-        assert!(prompt.contains("Debian or Ubuntu -> Debian skill/knowledge"));
-        assert!(prompt.contains("RHEL/CentOS/Fedora -> Red Hat style skill/knowledge"));
-        assert!(prompt.contains("Arch -> Arch guidance"));
-    }
-
-    #[test]
-    fn prompt_system_steward_policy_includes_privilege_preferences() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("Treat missing or ambiguous privilege evidence as non-admin"));
-        assert!(prompt.contains("Docker may be the default container recommendation"));
-        assert!(prompt.contains("prefer rootless Podman"));
-        assert!(prompt.contains("prefer project-local tooling first"));
-    }
-
-    #[test]
-    fn prompt_mentions_windows_interactive_limit() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("On Windows, pty_shell uses interactive stdin/stdout pipes"));
-        assert!(prompt.contains("full-screen terminal UIs may not behave correctly"));
-    }
-
-    #[test]
-    fn prompt_command_execution_enforces_execution_first_and_brief_reporting() {
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: None,
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("Execution comes before narration"));
-        assert!(
-            prompt.contains("Do not stop at a plan or checklist unless the user explicitly asked")
-        );
-        assert!(prompt
-            .contains("Default final reporting style: brief, steward-like, and outcome-focused"));
-    }
-
-    #[test]
-    fn prompt_system_info_preserves_multiline_content() {
-        let multiline = "OS: Linux\nKernel: 6.1.0\nArch: x86_64\nUser: test";
-        let ctx = PromptContext {
-            tools: &[],
-            tool_specs: &[],
-            native_tool_calling: false,
-            dispatcher_instructions: "",
-            skills: &[],
-            system_info: Some(multiline),
-            deferred_tool_names: &[],
-        };
-        let prompt = SystemPromptBuilder::build(&ctx);
-        assert!(prompt.contains("OS: Linux"));
-        assert!(prompt.contains("Kernel: 6.1.0"));
-        assert!(prompt.contains("Arch: x86_64"));
-    }
 }

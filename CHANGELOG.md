@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Rig 0.42 is now the sole model and Agent runtime: native structured tool calls/results, provider clients, streaming, and multi-turn execution replace the custom provider protocol, XML/native dispatcher, and turn loop.
+- Builtin, skill, knowledge, and MCP tools now use Rig's tool registry; direct/confirm/whitelist policy is applied to all execution paths. MCP discovery and reload, skill rescans, Markdown memory, CLI and TUI remain available.
+- Hub `free/*` models send the unprefixed model slug through the existing signed JSON transport; native tools and results continue across both streamed and nonstreamed Hub responses.
+- Source builds require Rust 1.88 or newer; the musl vendored OpenSSL release configuration remains in place.
+- Streamed tool calls and results again show progress on stderr; confirmation prompts name the tool and arguments instead of displaying an unknown command for non-shell tools.
+
+### Fixed
+
+- Tool-edit failures preserve actionable error feedback without modifying files; duplicate matches still require a unique replacement.
+- Conversation history is trimmed by complete user turns so a retained tool result keeps its matching call.
+
 ## v0.3.1 - 2026-04-13
 
 ### Added

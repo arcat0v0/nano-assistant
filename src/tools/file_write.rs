@@ -1,6 +1,5 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 
 pub struct FileWriteTool;
 
@@ -16,18 +15,19 @@ impl Default for FileWriteTool {
     }
 }
 
-#[async_trait]
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str {
-        "file_write"
-    }
+    const NAME: &'static str = "file_write";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Write content to a file. Creates parent directories if needed. \
          Overwrites existing files."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -44,35 +44,39 @@ impl Tool for FileWriteTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let path = args
             .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
-
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
         let content = args
             .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'content' parameter"))?;
 
         let full_path = std::path::Path::new(path);
-
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        if super::is_protected_skill_path(full_path) {
+            return Err(ToolExecutionError::permission_denied(format!(
+                "Refusing to write builtin skill source: {}",
+                full_path.display()
+            )));
         }
 
-        match tokio::fs::write(full_path, content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Written {} bytes to {path}", content.len()),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to write file: {e}")),
-            }),
+        if let Some(parent) = full_path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolExecutionError::other(format!(
+                    "Failed to create parent directory for {path}: {e}"
+                ))
+            })?;
         }
+        tokio::fs::write(full_path, content)
+            .await
+            .map_err(|e| ToolExecutionError::other(format!("Failed to write file {path}: {e}")))?;
+        Ok(format!("Written {} bytes to {path}", content.len()))
     }
 }
 
@@ -80,51 +84,40 @@ impl Tool for FileWriteTool {
 mod tests {
     use super::*;
 
-    fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[tokio::test]
-    async fn writes_file() {
-        let dir = test_dir("nano_file_write_test");
-        let tool = FileWriteTool::new();
-        let result = tool
-            .execute(json!({
-                "path": dir.join("out.txt").to_string_lossy(),
-                "content": "hello!"
-            }))
+    async fn writes_nested_file_and_blocks_builtin_skill_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/file.txt");
+        FileWriteTool
+            .call(
+                &mut ToolContext::default(),
+                json!({"path": path, "content": "hello"}),
+            )
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("6 bytes"));
-
-        let content = tokio::fs::read_to_string(dir.join("out.txt"))
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "hello");
+        let builtin =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/arch-wiki/SKILL.toml");
+        let original = tokio::fs::read_to_string(&builtin).await.unwrap();
+        let error = FileWriteTool
+            .call(
+                &mut ToolContext::default(),
+                json!({"path": builtin, "content": "malicious"}),
+            )
             .await
-            .unwrap();
-        assert_eq!(content, "hello!");
-    }
-
-    #[tokio::test]
-    async fn creates_parent_dirs() {
-        let dir = test_dir("nano_file_write_nested");
-        let tool = FileWriteTool::new();
-        let result = tool
-            .execute(json!({
-                "path": dir.join("a/b/c/deep.txt").to_string_lossy(),
-                "content": "deep"
-            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("builtin skill"));
+        assert_eq!(tokio::fs::read_to_string(&builtin).await.unwrap(), original);
+        let nonexistent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("skills/arch-wiki/new-folder/new-file.txt");
+        let error = FileWriteTool
+            .call(
+                &mut ToolContext::default(),
+                json!({"path": nonexistent, "content": "malicious"}),
+            )
             .await
-            .unwrap();
-        assert!(result.success);
-    }
-
-    #[tokio::test]
-    async fn missing_params() {
-        let tool = FileWriteTool::new();
-        assert!(tool.execute(json!({"path": "f.txt"})).await.is_err());
-        assert!(tool.execute(json!({"content": "x"})).await.is_err());
+            .unwrap_err();
+        assert!(error.to_string().contains("builtin skill"));
+        assert!(!nonexistent.exists());
     }
 }

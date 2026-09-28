@@ -1,18 +1,18 @@
 # nano-assistant
 
-运行在终端里的轻量级 AI 助手 -- 接入 LLM，用自然语言执行命令，完成任务。当前以 Linux/macOS 为主要目标，也支持 Windows 基础路径与命令执行。
+运行在终端里的轻量级 AI 助手 -- 基于 Rig 0.42 的原生模型与 Agent 运行时，用自然语言执行命令、调用工具并完成任务。当前以 Linux/macOS 为主要目标，也支持 Windows 基础路径与命令执行。
 
 ## 功能特性
 
 - **7 个 LLM Provider**: OpenAI、Anthropic、Gemini、GLM、Ollama，以及 DeepSeek/Kimi/Qwen 等兼容模式
 - **Hub 免费模型接入**: `free/*` 模型可自动走 `nana-hub`，支持 machine 注册、签名请求、配额查询与身份迁移
-- **8 个内置工具**: shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search
+- **9 个内置工具**: shell、pty_shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search
 - **MCP 协议支持**: 通过 MCP (Model Context Protocol) 接入外部工具服务器（Exa、Context7、Grep.app 等），支持 Stdio/HTTP/SSE 三种传输，延迟加载节省上下文
 - **skills.sh 生态兼容**: 自动扫描 `~/.agents/skills/`，直接使用 skills.sh 社区生态中的 skill
 - **丰富的运维 Skill**: 内置 Linux 发行版管理（Arch/Debian/Fedora/CentOS）、数据库管理、容器编排、服务器安全加固等 domain skill
 - **3 种安全模式**: direct（直接执行）、confirm（逐次确认）、whitelist（白名单）
 - **持久化记忆**: 基于 Markdown 文件的对话记忆存储
-- **实时流式输出**: LLM 响应实时显示，支持 Ctrl+C 中断
+- **实时流式输出**: Rig 原生文本增量、工具调用与多轮结果实时显示，支持 Ctrl+C 中断
 - **两种使用方式**: 单命令模式 `na "prompt"` + 交互模式 `na`
 - **Windows 基础支持**: 支持 Windows 配置路径、`cmd /C` 执行、以及基于 stdin/stdout 的交互式命令控制
 
@@ -56,7 +56,7 @@ install -m 0755 na ~/.local/bin/na
 
 ### 方式三：从源码编译
 
-需要 [Rust 工具链](https://rustup.rs/)：
+需要 [Rust 1.88 或更新工具链](https://rustup.rs/)：
 
 ```bash
 git clone https://github.com/arcat0v0/nano-assistant.git
@@ -316,6 +316,8 @@ ad_display = "inline"
 - hub 无广告或广告接口不可达时，广告展示会静默跳过，不影响回答
 - 其他普通模型名仍按原有 provider 配置直连，不经过 hub
 
+`free/` 是本地路由前缀，向 Hub 请求时发送其后的模型名（例如 `free/glm-5` 对应 Hub 的 `glm-5`）。Hub 接受带 ID 的原生工具调用和结果历史；工具执行与 direct/confirm/whitelist 安全校验仍在本机。免费路由当前不接受图片输入。
+
 常用命令：
 
 ```bash
@@ -340,7 +342,7 @@ mode = "direct"
 
 **confirm（逐次确认）**
 
-每次 LLM 要调用工具时，会在终端显示即将执行的命令，等待用户输入 `y` 确认或 `n` 拒绝。
+每次 LLM 要调用工具时，终端会显示实际工具名和参数（文件工具包含路径），等待输入 `y` 确认或 `n` 拒绝；MCP 与 skill 工具也经过同一确认。流式模式下工具调用和结果进度显示在 `stderr`，回答文本显示在 `stdout`。
 
 ```toml
 [security]
@@ -379,11 +381,12 @@ whitelist = [
 
 ## 内置工具
 
-nano-assistant 包含 8 个内置工具，LLM 会根据你的指令自动选择和调用：
+nano-assistant 包含 9 个内置工具，LLM 会根据你的指令自动选择和调用：
 
 | 工具 | 功能 | 示例 |
 |------|------|------|
 | `shell` | 执行 Shell 命令 | `ls -la`, `docker ps`, `systemctl status nginx` |
+| `pty_shell` | 在交互式终端中执行命令并匹配提示、发送回应 | 需要提示输入的终端程序（Unix 使用 PTY） |
 | `file_read` | 读取文件内容 | 读取 `/etc/hosts`、查看日志文件 |
 | `file_write` | 创建或覆盖写入文件 | 创建配置文件、写入脚本 |
 | `file_edit` | 编辑文件的指定部分 | 替换配置值、修改代码 |

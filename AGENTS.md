@@ -6,14 +6,14 @@
 
 ## Project Structure & Module Organization
 
-Core Rust code lives in `src/`. Entry: `src/bin/na.rs` → `src/cli/` parses CLI → constructs the agent loop.
+Core Rust code lives in `src/`. Entry: `src/bin/na.rs` → `src/cli/` parses CLI → constructs the Rig-backed agent session.
 
 Core module map (`src/`):
 
-- `agent/` — main agent loop. Iterates: build prompt → call provider → parse tool calls → execute via security gate → feed results back. Respects `max_iterations`.
-- `providers/` — LLM adapters behind a `Provider` trait. Implementations: OpenAI, Anthropic, Gemini, GLM (JWT auth via HMAC+SHA2), Ollama (also used as compat base for DeepSeek/Kimi/Qwen via custom `api_url`). Streaming supported.
-- `tools/` — 8 built-in tools implementing the `Tool` trait: `shell`, `file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`, `web_fetch`, `web_search`. Each is registered with a JSON schema that the LLM sees.
-- `security/` — wraps tool execution with 3 modes: `direct` (run), `confirm` (prompt per call), `whitelist` (pattern match with `*` globbing). Applied before every tool invocation.
+- `agent/` — thin session orchestration around Rig 0.42, which owns provider message handling, native tool calls/results, streaming, and multi-turn execution. Application code builds prompts, retains complete-turn history/Markdown memory, registers dynamic tools, and applies `max_iterations`.
+- `providers/` — Rig model clients for OpenAI, Anthropic, Gemini, GLM (JWT auth via HMAC+SHA2), Ollama, and compatible APIs (DeepSeek/Kimi/Qwen via custom `api_url`); Hub requests use the existing signed transport.
+- `tools/` — 9 built-in tools implementing Rig's native `Tool` API: `shell`, `pty_shell`, `file_read`, `file_write`, `file_edit`, `glob_search`, `content_search`, `web_fetch`, `web_search`. Skills, knowledge sources, and MCP tools use Rig `DynamicTool` registrations.
+- `security/` — Rig tool-call hook applies 3 modes before tool execution: `direct` (run), `confirm` (prompt per call), `whitelist` (raw command pattern match with `*` globbing).
 - `platform/` — OS abstraction behind a `Platform` trait. Unix uses `nix`/`libc` for PTY; Windows uses piped `cmd /C`. Add per-OS divergence here.
 - `mcp/` — MCP (Model Context Protocol) client. Three transports: stdio, http, sse. Supports `deferred_loading`: instead of registering all MCP tools upfront, a synthetic `tool_search` tool activates them on demand to keep prompts small.
 - `memory/` — Markdown-backed persistent conversation memory (`MEMORY.md` in config dir). Capped by `max_messages`.
@@ -21,7 +21,7 @@ Core module map (`src/`):
 - `knowledge/` — knowledge source adapters (URL-encoded queries to external docs).
 - `cli/`, `tui/`, `config/` — CLI parsing, terminal rendering (rustyline + termimad + crossterm), config loading.
 
-Integration tests live in `tests/integration.rs`; unit tests are co-located with modules. Release notes and design docs are under `docs/releases/` and `docs/superpowers/`. Built-in skill content is stored in `skills/`.
+Integration tests live in `tests/integration.rs`; actual CLI/provider/tool continuation contracts live in `tests/runtime_cli.rs`; unit tests are co-located with modules. Runtime ownership is documented in `docs/runtime.md`, with release notes and design docs under `docs/releases/` and `docs/superpowers/`. Built-in skill content is stored in `skills/`.
 
 ## Build, Test, and Development Commands
 
@@ -38,9 +38,9 @@ Run commands from the repository root where `Cargo.toml` is located.
 
 ## Coding Style & Naming Conventions
 
-Rust 2021, MSRV 1.70. 4-space indentation, `snake_case` for functions/modules, `CamelCase` for types, and focused modules with one clear responsibility.
+Rust 2021, MSRV 1.88. 4-space indentation, `snake_case` for functions/modules, `CamelCase` for types, and focused modules with one clear responsibility.
 
-Traits are the extension seams: `Tool`, `Provider`, `Platform`, `Memory`. Add new capabilities by implementing these, not by branching.
+Extension seams are Rig `Tool`/`DynamicTool` for tools and model clients/transports for providers, plus application `Platform` and `Memory`. Add capabilities through these boundaries, not a second provider or agent loop.
 
 Format before submitting with `cargo fmt`. Check for obvious issues with `cargo clippy` when practical. Keep comments short and only where behavior is non-obvious.
 
@@ -48,7 +48,7 @@ Format before submitting with `cargo fmt`. Check for obvious issues with `cargo 
 
 ## Testing Guidelines
 
-Use Rust's built-in test framework with `#[test]` and `#[tokio::test]`. Add unit tests close to the implementation and keep cross-module behavior in `tests/integration.rs`. Name tests descriptively, for example `handles_interaction` or `default_tools_returns_nine_tools_with_correct_names`.
+Use Rust's built-in test framework with `#[test]` and `#[tokio::test]`. Add unit tests close to the implementation, cross-module behavior in `tests/integration.rs`, and real CLI tool/model continuation in `tests/runtime_cli.rs`. Name tests descriptively, for example `handles_interaction` or `cli_streamed_file_edit_reports_tool_progress_only_on_stderr`.
 
 New features should include success-path coverage and at least one failure or timeout case where relevant.
 

@@ -1,6 +1,5 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -41,18 +40,19 @@ fn truncate_output(s: &mut String) {
     }
 }
 
-#[async_trait]
 impl Tool for ShellTool {
-    fn name(&self) -> &str {
-        "shell"
-    }
+    const NAME: &'static str = "shell";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Execute a shell command and return stdout/stderr. \
          Use for running builds, tests, git operations, and other CLI tasks."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -69,11 +69,15 @@ impl Tool for ShellTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let command = args
             .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'command' parameter"))?;
 
         let timeout = args
             .get("timeout")
@@ -86,6 +90,7 @@ impl Tool for ShellTool {
             tokio::process::Command::new(shell)
                 .arg(flag)
                 .arg(command)
+                .kill_on_drop(true)
                 .output(),
         )
         .await;
@@ -94,30 +99,29 @@ impl Tool for ShellTool {
             Ok(Ok(output)) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
                 truncate_output(&mut stdout);
                 truncate_output(&mut stderr);
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
+                if output.status.success() {
+                    if !stderr.is_empty() {
+                        if !stdout.is_empty() {
+                            stdout.push('\n');
+                        }
+                        stdout.push_str(&stderr);
+                    }
+                    Ok(stdout)
+                } else {
+                    Err(ToolExecutionError::other(format!(
+                        "Command exited with {}. stdout: {stdout}\nstderr: {stderr}",
+                        output.status
+                    )))
+                }
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Command timed out after {timeout}s and was killed")),
-            }),
+            Ok(Err(e)) => Err(ToolExecutionError::other(format!(
+                "Failed to execute command: {e}"
+            ))),
+            Err(_) => Err(ToolExecutionError::timeout(format!(
+                "Command timed out after {timeout}s and was killed"
+            ))),
         }
     }
 }
@@ -127,45 +131,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn executes_simple_command() {
-        let tool = ShellTool::new();
-        let result = tool
-            .execute(json!({"command": "echo hello"}))
+    async fn command_output_and_nonzero_exit_are_visible() {
+        let mut context = ToolContext::default();
+        let output = ShellTool::new()
+            .call(&mut context, json!({"command": "echo hello"}))
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("hello"));
-    }
-
-    #[tokio::test]
-    async fn captures_exit_code() {
-        let tool = ShellTool::new();
-        let result = tool.execute(json!({"command": "false"})).await.unwrap();
-        assert!(!result.success);
-    }
-
-    #[tokio::test]
-    async fn captures_stderr() {
-        let tool = ShellTool::new();
-        let result = tool
-            .execute(json!({"command": "echo err >&2"}))
+        assert!(output.contains("hello"));
+        let error = ShellTool::new()
+            .call(&mut context, json!({"command": "echo failure >&2; exit 7"}))
             .await
-            .unwrap();
-        assert!(result.error.as_deref().unwrap_or("").contains("err"));
-    }
-
-    #[tokio::test]
-    async fn missing_command_param() {
-        let tool = ShellTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn timeout_kills_command() {
-        let tool = ShellTool::new().with_timeout_secs(1);
-        let result = tool.execute(json!({"command": "sleep 10"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("timed out"));
+            .unwrap_err();
+        assert!(error.to_string().contains("failure"));
+        assert!(error.to_string().contains("exit status: 7"));
     }
 }

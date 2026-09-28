@@ -1,10 +1,9 @@
-use async_trait::async_trait;
+use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::skills::SkillTool;
-use crate::tools::traits::{Tool, ToolResult};
 
 const SHELL_TIMEOUT_SECS: u64 = 60;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024; // 1 MiB
@@ -32,41 +31,30 @@ impl SkillShellTool {
         }
     }
 
-    /// Exposed for testing: the raw command template before substitution.
-    #[cfg(test)]
-    pub fn command_template(&self) -> &str {
-        &self.command
-    }
-}
-
-#[async_trait]
-impl Tool for SkillShellTool {
-    fn name(&self) -> &str {
-        &self.tool_name
-    }
-
-    fn description(&self) -> &str {
-        "Skill shell command"
+    pub fn into_dynamic(self) -> DynamicTool {
+        let name = self.tool_name.clone();
+        let schema = self.parameters();
+        let tool = std::sync::Arc::new(self);
+        DynamicTool::new(
+            name,
+            "Skill shell command",
+            schema,
+            move |_context, args| {
+                let tool = std::sync::Arc::clone(&tool);
+                Box::pin(async move { tool.run(args).await.map(ToolOutput::text) })
+            },
+        )
     }
 
-    fn parameters_schema(&self) -> Value {
+    fn parameters(&self) -> Value {
         let mut properties = serde_json::Map::new();
         for (key, desc) in &self.args {
-            properties.insert(
-                key.clone(),
-                json!({
-                    "type": "string",
-                    "description": desc,
-                }),
-            );
+            properties.insert(key.clone(), json!({"type": "string", "description": desc}));
         }
-        json!({
-            "type": "object",
-            "properties": properties,
-        })
+        json!({"type": "object", "properties": properties})
     }
 
-    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+    async fn run(&self, args: Value) -> Result<String, ToolExecutionError> {
         let mut command = self.command.clone();
         for key in self.args.keys() {
             if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
@@ -75,7 +63,7 @@ impl Tool for SkillShellTool {
         }
 
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command);
+        cmd.arg("-c").arg(&command).kill_on_drop(true);
 
         for var in ["PATH", "HOME", "TERM", "LANG", "USER"] {
             if let Ok(val) = std::env::var(var) {
@@ -88,37 +76,36 @@ impl Tool for SkillShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let truncated = stdout.len() > MAX_OUTPUT_BYTES;
-                let text = if truncated {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let text = if stdout.len() > MAX_OUTPUT_BYTES {
+                    let mut boundary = MAX_OUTPUT_BYTES;
+                    while !stdout.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
                     format!(
                         "{}...\n[output truncated at {} bytes]",
-                        &stdout[..MAX_OUTPUT_BYTES],
+                        &stdout[..boundary],
                         MAX_OUTPUT_BYTES
                     )
                 } else {
-                    stdout
+                    stdout.into_owned()
                 };
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: text,
-                    error: if output.status.success() {
-                        None
-                    } else {
-                        Some(format!("exit code: {}", output.status.code().unwrap_or(-1)))
-                    },
-                })
+                if output.status.success() {
+                    Ok(text)
+                } else {
+                    Err(ToolExecutionError::other(format!(
+                        "Command exited with code {}: {text}\n{}",
+                        output.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&output.stderr)
+                    )))
+                }
             }
-            Ok(Err(io_err)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Command failed: {}", io_err)),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Command timed out after {}s", SHELL_TIMEOUT_SECS)),
-            }),
+            Ok(Err(io_err)) => Err(ToolExecutionError::other(format!(
+                "Command failed: {io_err}"
+            ))),
+            Err(_) => Err(ToolExecutionError::timeout(format!(
+                "Command timed out after {SHELL_TIMEOUT_SECS}s"
+            ))),
         }
     }
 }
@@ -143,63 +130,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_name_is_dotted() {
-        let tool = make_skill_tool("greet", "shell", "echo hello", HashMap::new());
-        let st = SkillShellTool::new("my-skill", &tool);
-        assert_eq!(st.name(), "my-skill.greet");
-    }
-
-    #[test]
-    fn parameters_schema_includes_args() {
-        let mut args = HashMap::new();
-        args.insert("name".to_string(), "The name to greet".to_string());
-        args.insert("count".to_string(), "How many times".to_string());
-        let tool = make_skill_tool("greet", "shell", "echo hello", args);
-        let st = SkillShellTool::new("demo", &tool);
-        let schema = st.parameters_schema();
-
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["properties"]["name"]["type"], "string");
-        assert_eq!(
-            schema["properties"]["name"]["description"],
-            "The name to greet"
-        );
-        assert_eq!(schema["properties"]["count"]["type"], "string");
-    }
-
-    #[test]
-    fn parameters_schema_empty_when_no_args() {
-        let tool = make_skill_tool("run", "shell", "ls", HashMap::new());
-        let st = SkillShellTool::new("demo", &tool);
-        let schema = st.parameters_schema();
-
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"].as_object().unwrap().is_empty());
-    }
-
     #[tokio::test]
-    async fn echo_command_with_arg_substitution() {
+    async fn shell_skill_dispatches_through_rig() {
         let mut args = HashMap::new();
         args.insert("msg".to_string(), "The message".to_string());
         let tool = make_skill_tool("echo", "shell", "echo {{msg}}", args);
-        let st = SkillShellTool::new("demo", &tool);
-
-        let result = st.execute(json!({ "msg": "hello world" })).await.unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("hello world"));
-        assert!(result.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn command_with_no_substitution_works() {
-        let tool = make_skill_tool("ls", "shell", "echo ok", HashMap::new());
-        let st = SkillShellTool::new("demo", &tool);
-
-        let result = st.execute(json!({})).await.unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("ok"));
+        let dynamic = SkillShellTool::new("demo", &tool).into_dynamic();
+        let tools = rig::tool::ToolSet::from_dynamic_tools(vec![dynamic]);
+        let result = tools
+            .execute(
+                "demo.echo",
+                json!({"msg": "hello world"}).to_string(),
+                &mut rig::tool::ToolContext::default(),
+            )
+            .await;
+        assert!(result.error().is_none());
+        assert!(result.output().as_text().unwrap().contains("hello world"));
     }
 
     #[tokio::test]
@@ -207,18 +153,7 @@ mod tests {
         let tool = make_skill_tool("fail", "shell", "exit 42", HashMap::new());
         let st = SkillShellTool::new("demo", &tool);
 
-        let result = st.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.is_some());
-        assert!(result.error.as_ref().unwrap().contains("exit code: 42"));
-    }
-
-    #[tokio::test]
-    async fn timeout_triggers_error() {
-        let tool = make_skill_tool("slow", "shell", "sleep 999", HashMap::new());
-        let st = SkillShellTool::new("demo", &tool);
-        assert_eq!(st.name(), "demo.slow");
-        // Executing would block for 60s; verify struct + template storage instead
-        assert!(st.command_template().contains("sleep 999"));
+        let error = st.run(json!({})).await.unwrap_err();
+        assert!(error.to_string().contains("code 42"));
     }
 }

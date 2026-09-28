@@ -35,12 +35,11 @@ pub fn create_source(config: &KnowledgeSourceConfig) -> Box<dyn KnowledgeSource>
     }
 }
 
-/// Wrap a knowledge source into Tool trait objects (search + read).
-pub fn source_to_tools(source: Box<dyn KnowledgeSource>) -> Vec<Box<dyn crate::tools::Tool>> {
+pub fn source_to_tools(source: Box<dyn KnowledgeSource>) -> Vec<rig::tool::DynamicTool> {
     let shared: Arc<Box<dyn KnowledgeSource>> = Arc::new(source);
     vec![
-        Box::new(tool::KnowledgeSearchTool::new(Arc::clone(&shared))),
-        Box::new(tool::KnowledgeReadTool::new(Arc::clone(&shared))),
+        tool::KnowledgeSearchTool::new(Arc::clone(&shared)).into_dynamic(),
+        tool::KnowledgeReadTool::new(Arc::clone(&shared)).into_dynamic(),
     ]
 }
 

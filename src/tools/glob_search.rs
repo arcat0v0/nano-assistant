@@ -1,6 +1,5 @@
-use super::traits::{Tool, ToolResult};
-use async_trait::async_trait;
-use serde_json::json;
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use serde_json::{json, Value};
 
 const MAX_RESULTS: usize = 1000;
 
@@ -18,19 +17,20 @@ impl Default for GlobSearchTool {
     }
 }
 
-#[async_trait]
 impl Tool for GlobSearchTool {
-    fn name(&self) -> &str {
-        "glob_search"
-    }
+    const NAME: &'static str = "glob_search";
+    type Args = Value;
+    type Output = String;
+    type Error = ToolExecutionError;
 
-    fn description(&self) -> &str {
+    fn description(&self) -> String {
         "Search for files matching a glob pattern. \
          Returns a sorted list of matching file paths. \
          Examples: '**/*.rs', 'src/**/*.mod.rs'."
+            .into()
     }
 
-    fn parameters_schema(&self) -> serde_json::Value {
+    fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
@@ -43,22 +43,17 @@ impl Tool for GlobSearchTool {
         })
     }
 
-    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Value,
+    ) -> Result<String, ToolExecutionError> {
         let pattern = args
             .get("pattern")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
-
-        let entries = match glob::glob(pattern) {
-            Ok(paths) => paths,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Invalid glob pattern: {e}")),
-                });
-            }
-        };
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'pattern' parameter"))?;
+        let entries = glob::glob(pattern)
+            .map_err(|e| ToolExecutionError::invalid_args(format!("Invalid glob pattern: {e}")))?;
 
         let mut results = Vec::new();
         let mut truncated = false;
@@ -98,66 +93,31 @@ impl Tool for GlobSearchTool {
             buf
         };
 
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        Ok(output)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[tokio::test]
-    async fn finds_files() {
-        let dir = test_dir("nano_glob_test");
-        std::fs::write(dir.join("a.txt"), "").unwrap();
-        std::fs::write(dir.join("b.rs"), "").unwrap();
-
-        let tool = GlobSearchTool::new();
-        let result = tool
-            .execute(json!({"pattern": dir.join("*.txt").to_string_lossy()}))
+    async fn glob_matches_files_not_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("a.txt"), "")
             .await
             .unwrap();
-
-        assert!(result.success);
-        assert!(result.output.contains("a.txt"));
-        assert!(!result.output.contains("b.rs"));
-    }
-
-    #[tokio::test]
-    async fn no_matches() {
-        let tool = GlobSearchTool::new();
-        let result = tool
-            .execute(json!({"pattern": "/nonexistent/**/*.xyz"}))
+        tokio::fs::create_dir(dir.path().join("b.txt"))
             .await
             .unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("No files matching"));
-    }
-
-    #[tokio::test]
-    async fn missing_param() {
-        let tool = GlobSearchTool::new();
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn invalid_pattern() {
-        let tool = GlobSearchTool::new();
-        let result = tool.execute(json!({"pattern": "[invalid"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Invalid glob"));
+        let output = GlobSearchTool
+            .call(
+                &mut ToolContext::default(),
+                json!({"pattern": dir.path().join("*.txt")}),
+            )
+            .await
+            .unwrap();
+        assert!(output.contains("a.txt"));
+        assert!(!output.contains("b.txt"));
     }
 }

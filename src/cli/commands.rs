@@ -8,10 +8,9 @@ use crate::agent::Agent;
 use crate::config::schema::default_config_path;
 use crate::config::{load_config_or_default, Config};
 use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
-use crate::providers::Provider;
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
-use crate::tools;
 use anyhow::Context;
+use rig::agent::model::ModelHandle;
 
 use super::CliArgs;
 use super::HubSubcommand;
@@ -63,12 +62,12 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         None => {
             let config_path = default_config_path();
             let config = load_config_or_default(&config_path);
-            let security_mode = SecurityMode::Direct;
+            let security_mode = resolve_security_mode(None, &config);
             let streaming = config.behavior.streaming;
-            let provider = build_provider(&config, &config_path)?;
+            let model = crate::providers::build_model(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             run_interactive(
-                provider,
+                model,
                 &config,
                 config_path,
                 security_mode,
@@ -101,16 +100,24 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
 
     match args.prompt_text() {
         Some(prompt) => {
-            let provider = build_provider(&config, &config_path)?;
+            let model = crate::providers::build_model(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
-            let agent = build_agent(provider, &config, security_mode, None, system_info);
+            let agent = build_agent(
+                model,
+                &config,
+                security_mode,
+                None,
+                system_info,
+                config_path.clone(),
+            )
+            .await;
             run_single(agent, &prompt, streaming, &config, &config_path).await
         }
         None => {
-            let provider = build_provider(&config, &config_path)?;
+            let model = crate::providers::build_model(&config, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             run_interactive(
-                provider,
+                model,
                 &config,
                 config_path,
                 security_mode,
@@ -137,82 +144,6 @@ fn resolve_security_mode(mode_override: Option<&str>, config: &Config) -> Securi
 
 fn resolve_debug_mode(cli_debug: bool, config: &Config) -> bool {
     cli_debug || config.behavior.debug
-}
-
-fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
-    config
-        .provider
-        .api_key
-        .clone()
-        .or_else(|| env_vars.iter().find_map(|v| std::env::var(v).ok()))
-}
-
-fn build_provider(config: &Config, config_path: &Path) -> anyhow::Result<Arc<dyn Provider>> {
-    if model_routes_via_hub(config) {
-        let hub_client = HubClient::new(config_path.to_path_buf(), config.clone())?;
-        return Ok(Arc::new(crate::providers::hub::HubProvider::new(
-            hub_client,
-        )));
-    }
-
-    if config
-        .provider
-        .model
-        .as_deref()
-        .is_some_and(|model| model.starts_with("free/"))
-    {
-        anyhow::bail!("free/* models require [hub].enabled = true or NANA_HUB_DISABLED unset");
-    }
-
-    let provider_name = config.provider.provider.as_deref().unwrap_or("openai");
-
-    let base_url = config.provider.api_url.as_deref();
-
-    let provider: Arc<dyn Provider> = match provider_name {
-        "openai" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "OPENAI_API_KEY"]);
-            Arc::new(
-                crate::providers::openai::OpenAiProvider::new(key.as_deref())
-                    .with_base_url(base_url.unwrap_or("https://api.openai.com/v1")),
-            )
-        }
-        "anthropic" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "ANTHROPIC_API_KEY"]);
-            Arc::new(crate::providers::anthropic::AnthropicProvider::new(
-                key.as_deref(),
-            ))
-        }
-        "gemini" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "GEMINI_API_KEY"]);
-            Arc::new(crate::providers::gemini::GeminiProvider::new(
-                key.as_deref(),
-            ))
-        }
-        "glm" => {
-            let key = resolve_api_key(config, &["NA_API_KEY", "GLM_API_KEY"]);
-            Arc::new(crate::providers::glm::GlmProvider::new(key.as_deref()))
-        }
-        "ollama" | "compatible" => {
-            let key = resolve_api_key(config, &["NA_API_KEY"]);
-            let default_url = if provider_name == "ollama" {
-                "http://localhost:11434/v1"
-            } else {
-                "http://localhost:8080/v1"
-            };
-            let url = base_url.unwrap_or(default_url);
-            Arc::new(crate::providers::compatible::CompatibleProvider::new(
-                provider_name,
-                default_url,
-                key.as_deref(),
-                Some(url),
-            ))
-        }
-        other => anyhow::bail!(
-            "unknown provider: '{other}'. Valid: openai, anthropic, gemini, glm, ollama"
-        ),
-    };
-
-    Ok(provider)
 }
 
 pub(crate) fn memory_md_path() -> std::path::PathBuf {
@@ -258,26 +189,21 @@ async fn load_or_create_memory_md() -> Option<String> {
     }
 }
 
-fn build_agent(
-    provider: Arc<dyn Provider>,
+async fn build_agent(
+    model: ModelHandle,
     config: &Config,
     security_mode: SecurityMode,
     confirmer: Option<Arc<dyn UserConfirmation>>,
     system_info: Option<String>,
+    config_path: std::path::PathBuf,
 ) -> Agent {
-    let raw_tools = tools::default_tools();
-    let mut secured_tools: Vec<Box<dyn crate::tools::Tool>> = raw_tools
-        .into_iter()
-        .map(|t| {
-            let mut sec_mgr =
-                SecurityManager::from_config_with_override(&config.security, Some(security_mode));
-            if let Some(confirmer) = confirmer.clone() {
-                sec_mgr = sec_mgr.with_confirmer(confirmer);
-            }
-            Box::new(crate::security::SecureTool::new(t, Arc::new(sec_mgr)))
-                as Box<dyn crate::tools::Tool>
-        })
-        .collect();
+    let mut sec_mgr =
+        SecurityManager::from_config_with_override(&config.security, Some(security_mode));
+    if let Some(confirmer) = confirmer {
+        sec_mgr = sec_mgr.with_confirmer(confirmer);
+    }
+    let security = Arc::new(sec_mgr);
+    let mut dynamic_tools = Vec::new();
 
     let skills = if config.skills.enabled {
         crate::skills::load_skills(&config.skills)
@@ -286,14 +212,14 @@ fn build_agent(
     };
 
     let skill_tools = crate::skills::skills_to_tools(&skills);
-    secured_tools.extend(skill_tools);
+    dynamic_tools.extend(skill_tools);
 
     // Register knowledge source tools from skills with type = "knowledge-source"
     for skill in &skills {
         if let Some(ks_config) = crate::skills::parse_knowledge_source_config(skill) {
             let source = crate::knowledge::create_source(&ks_config);
             let ks_tools = crate::knowledge::source_to_tools(source);
-            secured_tools.extend(ks_tools);
+            dynamic_tools.extend(ks_tools);
         }
     }
 
@@ -305,14 +231,17 @@ fn build_agent(
         None
     };
 
-    Agent::with_skills(
-        provider,
-        secured_tools,
+    Agent::new(
+        model,
+        dynamic_tools,
         memory,
         config.clone(),
         skills,
         system_info,
+        security,
+        config_path,
     )
+    .await
 }
 
 async fn run_single(
@@ -361,14 +290,22 @@ async fn run_single(
 }
 
 async fn run_interactive(
-    provider: Arc<dyn Provider>,
+    model: ModelHandle,
     config: &Config,
     config_path: std::path::PathBuf,
     security_mode: SecurityMode,
     streaming: bool,
     system_info: Option<String>,
 ) -> anyhow::Result<()> {
-    let agent = build_agent(provider, config, security_mode, None, system_info);
+    let agent = build_agent(
+        model,
+        config,
+        security_mode,
+        None,
+        system_info,
+        config_path.clone(),
+    )
+    .await;
     let history_path = config_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -768,25 +705,6 @@ mod tests {
         assert_eq!(config.provider.model, Some("gpt-4o-mini".to_string()));
         assert_eq!(config.provider.temperature, 0.7);
         assert!(config.memory.enabled);
-    }
-
-    #[test]
-    fn resolve_api_key_config_key_takes_precedence() {
-        let mut config = Config::default();
-        config.provider.api_key = Some("config-key".to_string());
-        std::env::set_var("NA_API_KEY", "env-key");
-        let key = resolve_api_key(&config, &["NA_API_KEY"]);
-        std::env::remove_var("NA_API_KEY");
-        assert_eq!(key, Some("config-key".to_string()));
-    }
-
-    #[test]
-    fn resolve_api_key_falls_back_to_env_var() {
-        let config = Config::default();
-        std::env::set_var("NA_API_KEY", "env-key-fallback");
-        let key = resolve_api_key(&config, &["NA_API_KEY"]);
-        std::env::remove_var("NA_API_KEY");
-        assert_eq!(key, Some("env-key-fallback".to_string()));
     }
 
     #[test]
