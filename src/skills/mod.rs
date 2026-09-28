@@ -27,6 +27,10 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
         include_str!("../../skills/container-orchestration/SKILL.md"),
     ),
     (
+        "config-manager",
+        include_str!("../../skills/config-manager/SKILL.md"),
+    ),
+    (
         "arch-wiki",
         include_str!("../../skills/arch-wiki/SKILL.toml"),
     ),
@@ -1462,6 +1466,33 @@ command = "echo hello"
         assert!(names.contains("arch-wiki"));
         assert!(names.contains("debian-wiki"));
         assert!(names.contains("redhat-wiki"));
+    }
+
+    #[test]
+    fn every_repo_skill_dir_is_embedded_and_parses() {
+        let skills_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let embedded: std::collections::HashSet<&str> =
+            BUILTIN_SKILLS.iter().map(|(name, _)| *name).collect();
+
+        for entry in std::fs::read_dir(&skills_root).unwrap() {
+            let dir = entry.unwrap().path();
+            if !dir.is_dir() || (!dir.join("SKILL.md").exists() && !dir.join("SKILL.toml").exists())
+            {
+                continue;
+            }
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                embedded.contains(name.as_str()),
+                "skills/{name} exists but is missing from BUILTIN_SKILLS"
+            );
+        }
+
+        let loaded = load_builtin_skills();
+        assert_eq!(
+            loaded.len(),
+            BUILTIN_SKILLS.len(),
+            "some embedded skills failed to parse: got {loaded:?}"
+        );
     }
 
     #[test]

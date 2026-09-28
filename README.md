@@ -452,13 +452,14 @@ npx skills add github/awesome-copilot@arch-linux-triage -g -y
 
 ### 内置 Domain Skills
 
-项目自带 3 个 domain skill（位于 `skills/` 目录）：
+项目自带 4 个 domain skill（位于 `skills/` 目录，编译进二进制）：
 
 | Skill | 覆盖内容 |
 |-------|---------|
 | `database-admin` | PostgreSQL、MySQL/MariaDB、Redis、SQLite 管理 |
 | `server-security` | SSH 加固、防火墙、fail2ban、SSL/TLS、安全审计 |
 | `container-orchestration` | Docker Compose、Podman rootless、网络与卷管理 |
+| `config-manager` | 安全修改 nano-assistant 自身 config.toml（provider/model、密钥轮换、安全模式、MCP 服务器） |
 
 ## 常见问题
 
