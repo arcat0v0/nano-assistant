@@ -1,5 +1,6 @@
 use crate::agent::{Agent, TurnResult};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
+use unicode_width::UnicodeWidthChar;
 
 pub enum StreamOutputEvent {
     Clear,
@@ -21,21 +22,143 @@ pub async fn turn_streamed_to_stdout(
     let mut printer = StreamPrinter::new();
     let result = run_streamed_turn(agent, user_message, &mut loading, &mut printer).await?;
     loading.finish();
-    println!();
 
-    // Redraw: replace raw streamed text with rendered markdown
     let accumulated = printer.take_accumulated();
-    if !accumulated.is_empty() {
-        let raw_rendered = crate::render::render_markdown_fallback(&accumulated, 0);
-        let line_count = crate::render::count_rendered_lines(&raw_rendered);
-        if line_count > 0 {
-            print!("\x1b[{}A\x1b[J", line_count);
-            let _ = std::io::stdout().flush();
-            crate::render::render_markdown_to_stdout(&accumulated);
+    if printer.stdout_is_terminal {
+        if accumulated.is_empty() {
+            crate::render::render_markdown_to_stdout(&result.response);
+        } else {
+            println!();
+            if let Ok((columns, rows)) = crossterm::terminal::size() {
+                let occupied_rows = terminal_rows(&accumulated, columns as usize);
+                if occupied_rows > 0 && occupied_rows <= rows as usize {
+                    print!("\x1b[{}A\x1b[J", occupied_rows);
+                    let _ = std::io::stdout().flush();
+                    crate::render::render_markdown_to_stdout(&result.response);
+                }
+            }
         }
+    } else {
+        crate::render::render_markdown_to_stdout(&result.response);
     }
 
     Ok(result)
+}
+
+/// Count the terminal rows occupied by text printed from column zero.
+/// Newline count alone misses soft wraps, leaving part of the streamed response
+/// on screen when the final Markdown rendering replaces it.
+fn terminal_rows(text: &str, columns: usize) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    let columns = columns.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    let mut row_count = 1;
+    let mut column = 0;
+    let mut wrap_pending = false;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '\x1b' {
+            index = skip_terminal_sequence(&chars, index);
+            continue;
+        }
+        index += 1;
+
+        match character {
+            '\n' => {
+                row_count += 1;
+                column = 0;
+                wrap_pending = false;
+            }
+            '\r' => {
+                column = 0;
+                wrap_pending = false;
+            }
+            '\t' => {
+                let target = (column / 8 + 1) * 8;
+                while column < target {
+                    advance_terminal_column(
+                        1,
+                        columns,
+                        &mut row_count,
+                        &mut column,
+                        &mut wrap_pending,
+                    );
+                }
+            }
+            control if control.is_control() => {}
+            printable => {
+                let width = UnicodeWidthChar::width(printable).unwrap_or(0);
+                if width > 0 {
+                    advance_terminal_column(
+                        width,
+                        columns,
+                        &mut row_count,
+                        &mut column,
+                        &mut wrap_pending,
+                    );
+                }
+            }
+        }
+    }
+
+    row_count
+}
+
+fn advance_terminal_column(
+    width: usize,
+    columns: usize,
+    row_count: &mut usize,
+    column: &mut usize,
+    wrap_pending: &mut bool,
+) {
+    if *wrap_pending || *column + width > columns {
+        *row_count += 1;
+        *column = 0;
+        *wrap_pending = false;
+    }
+    *column += width;
+    if *column >= columns {
+        *column = columns;
+        *wrap_pending = true;
+    }
+}
+
+fn skip_terminal_sequence(chars: &[char], start: usize) -> usize {
+    let Some(&kind) = chars.get(start + 1) else {
+        return start + 1;
+    };
+    match kind {
+        '[' => {
+            let mut index = start + 2;
+            while index < chars.len() {
+                let character = chars[index];
+                index += 1;
+                if ('@'..='~').contains(&character) {
+                    break;
+                }
+            }
+            index
+        }
+        ']' => {
+            let mut index = start + 2;
+            while index < chars.len() {
+                if chars[index] == '\x07' {
+                    return index + 1;
+                }
+                if chars[index] == '\x1b' && chars.get(index + 1) == Some(&'\\') {
+                    return index + 2;
+                }
+                index += 1;
+            }
+            index
+        }
+        _ => start + 2,
+    }
 }
 
 async fn run_streamed_turn(
@@ -96,14 +219,18 @@ struct StreamPrinter {
     stdout: io::Stdout,
     stderr: io::Stderr,
     accumulated: String,
+    stdout_is_terminal: bool,
 }
 
 impl StreamPrinter {
     fn new() -> Self {
+        let stdout = io::stdout();
+        let stdout_is_terminal = stdout.is_terminal();
         Self {
-            stdout: io::stdout(),
+            stdout,
             stderr: io::stderr(),
             accumulated: String::new(),
+            stdout_is_terminal,
         }
     }
 
@@ -118,8 +245,10 @@ impl StreamPrinter {
                 let _ = self.stderr.flush();
             }
             StreamOutputEvent::Content(text) => {
-                let _ = self.stdout.write_all(text.as_bytes());
-                let _ = self.stdout.flush();
+                if self.stdout_is_terminal {
+                    let _ = self.stdout.write_all(text.as_bytes());
+                    let _ = self.stdout.flush();
+                }
                 self.accumulated.push_str(&text);
             }
         }
@@ -159,5 +288,24 @@ mod tests {
         printer.print_event(StreamOutputEvent::Content("visible text".into()));
         printer.print_event(StreamOutputEvent::Progress("tool: done".into()));
         assert_eq!(printer.take_accumulated(), "visible text");
+    }
+
+    #[test]
+    fn terminal_rows_count_soft_wraps_and_newlines() {
+        let response = "Hi! I'm your system steward on this Arch Linux box. What can I help you with today?\n\nA few things I can do right away:\n- help with system updates";
+        assert_eq!(terminal_rows(response, 100), 4);
+        assert_eq!(terminal_rows(response, 80), 5);
+    }
+
+    #[test]
+    fn terminal_rows_count_wide_characters_and_ignore_ansi_sequences() {
+        assert_eq!(terminal_rows("界界界\n\x1b[31mred\x1b[0m", 4), 3);
+    }
+
+    #[test]
+    fn terminal_rows_handle_exact_width_and_empty_text() {
+        assert_eq!(terminal_rows("1234", 4), 1);
+        assert_eq!(terminal_rows("12345", 4), 2);
+        assert_eq!(terminal_rows("", 4), 0);
     }
 }

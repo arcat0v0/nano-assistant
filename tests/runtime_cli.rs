@@ -1388,7 +1388,9 @@ fn cli_streamed_turn_uses_switched_model_and_keeps_history() {
     let second_request = second.finish().remove(0);
     assert_eq!(second_request["model"], "second-stream-model");
     assert!(second_request.to_string().contains("First streamed reply."));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Second streamed reply."));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("First streamed reply.").count(), 1);
+    assert_eq!(stdout.matches("Second streamed reply.").count(), 1);
 }
 
 #[test]

@@ -14,10 +14,17 @@ use rig::providers::{anthropic, gemini, openai};
 use crate::config::Config;
 use crate::hub::{model_routes_via_hub, resolve_hub_config, HubClient};
 
-fn resolve_api_key(config: &Config, env_vars: &[&str]) -> Option<String> {
+fn resolve_api_key(config: &Config, provider: &str, env_vars: &[&str]) -> Option<String> {
     env_vars
         .iter()
         .find_map(|name| std::env::var(name).ok())
+        .or_else(|| {
+            config
+                .runtime_api_key
+                .as_ref()
+                .and_then(|key| key.for_provider(provider))
+                .map(str::to_owned)
+        })
         .or_else(|| config.provider.api_key.clone())
 }
 
@@ -33,11 +40,19 @@ fn profile_key(config: &Config) -> anyhow::Result<Option<String>> {
     let Some(env_name) = profile.api_key_env.as_deref() else {
         return Ok(None);
     };
-    std::env::var(env_name)
-        .ok()
-        .filter(|key| !key.is_empty())
-        .map(Some)
-        .with_context(|| format!("model profile '{name}' requires environment variable {env_name}"))
+    if let Some(key) = std::env::var(env_name).ok().filter(|key| !key.is_empty()) {
+        return Ok(Some(key));
+    }
+    if let Some(key) = config
+        .runtime_api_key
+        .as_ref()
+        .and_then(|key| key.for_provider(&profile.provider))
+    {
+        return Ok(Some(key.to_owned()));
+    }
+    Err(anyhow::anyhow!(
+        "model profile '{name}' requires environment variable {env_name}"
+    ))
 }
 
 pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelHandle> {
@@ -72,7 +87,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
     match provider {
         "openai" => {
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "OPENAI_API_KEY"]))
+                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "OPENAI_API_KEY"]))
                 .context("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")?;
             let openai = openai::CompletionsClient::builder()
                 .api_key(key)
@@ -87,7 +102,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         }
         "anthropic" => {
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "ANTHROPIC_API_KEY"]))
+                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "ANTHROPIC_API_KEY"]))
                 .context("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")?;
             let base = base_url.unwrap_or("https://api.anthropic.com");
             if key.starts_with("sk-ant-oat01-") {
@@ -115,7 +130,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         }
         "gemini" => {
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY", "GEMINI_API_KEY"]))
+                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "GEMINI_API_KEY"]))
                 .context("Gemini API key not set. Set GEMINI_API_KEY or edit config.toml.")?;
             let base = base_url
                 .unwrap_or("https://generativelanguage.googleapis.com")
@@ -134,7 +149,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         "deepseek" | "kimi" | "glm" | "mimo" | "qwen" => {
             let preset = preset(provider).expect("built-in provider has a preset");
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY", preset.api_key_env]))
+                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", preset.api_key_env]))
                 .with_context(|| {
                     format!(
                         "{provider} API key not set. Set {} or edit config.toml.",
@@ -161,7 +176,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         }
         "ollama" | "compatible" => {
             let key = profile_key
-                .or_else(|| resolve_api_key(config, &["NA_API_KEY"]))
+                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY"]))
                 .unwrap_or_else(|| "not-required".to_string());
             let default_url = if provider == "ollama" {
                 "http://localhost:11434/v1"
@@ -221,20 +236,66 @@ mod tests {
         std::env::set_var("OPENAI_API_KEY", "provider-key");
         std::env::set_var("NA_API_KEY", "global-key");
         assert_eq!(
-            resolve_api_key(&config, &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
+            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
             Some("global-key")
         );
 
         std::env::remove_var("NA_API_KEY");
         assert_eq!(
-            resolve_api_key(&config, &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
+            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
             Some("provider-key")
         );
 
         std::env::remove_var("OPENAI_API_KEY");
         assert_eq!(
-            resolve_api_key(&config, &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
+            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
             Some("config-key")
+        );
+    }
+
+    #[test]
+    fn runtime_api_key_is_scoped_to_its_provider() {
+        let mut config = Config::default();
+        config.provider.api_key = Some("legacy-openai-key".into());
+        config.runtime_api_key = Some(crate::config::schema::RuntimeApiKey::new(
+            "deepseek",
+            "separate-deepseek-key",
+        ));
+        assert_eq!(
+            resolve_api_key(&config, "openai", &[]).as_deref(),
+            Some("legacy-openai-key")
+        );
+        assert_eq!(
+            resolve_api_key(&config, "deepseek", &[]).as_deref(),
+            Some("separate-deepseek-key")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn saved_runtime_key_can_satisfy_a_matching_profiles_environment_fallback() {
+        let _saved = SavedKeys::new(&["DEEPSEEK_PROFILE_KEY"]);
+        std::env::remove_var("DEEPSEEK_PROFILE_KEY");
+        let mut config = Config::default();
+        config.runtime_api_key = Some(crate::config::schema::RuntimeApiKey::new(
+            "deepseek",
+            "file-backed-key",
+        ));
+        config.active_profile = Some("saved".into());
+        config.models.profiles.insert(
+            "saved".into(),
+            crate::config::ModelProfile {
+                provider: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                api_url: None,
+                api_key_env: Some("DEEPSEEK_PROFILE_KEY".into()),
+                temperature: None,
+                timeout_secs: None,
+            },
+        );
+        assert_eq!(
+            profile_key(&config).unwrap().as_deref(),
+            Some("file-backed-key")
         );
     }
 
@@ -261,14 +322,12 @@ mod tests {
         let (effective, _) =
             crate::config::models::resolve_selection(&config, Some("private"), None, None).unwrap();
         let error = build_model(&effective, Path::new("config.toml"))
-            .err()
-            .expect("missing profile key should reject model");
+            .expect_err("missing profile key should reject model");
         assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
 
         std::env::set_var("MISSING_PROFILE_KEY", "");
         let error = build_model(&effective, Path::new("config.toml"))
-            .err()
-            .expect("empty profile key should reject model");
+            .expect_err("empty profile key should reject model");
         assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
 
         std::env::set_var("MISSING_PROFILE_KEY", "profile-key");

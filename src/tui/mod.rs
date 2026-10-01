@@ -1,6 +1,9 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -15,15 +18,26 @@ use rustyline::{
     KeyCode, KeyEvent, Modifiers, RepeatCount,
 };
 
+use crossterm::{
+    event::{self, Event as TerminalEvent, KeyCode as TerminalKeyCode, KeyEventKind, KeyModifiers},
+    event::{DisableBracketedPaste, EnableBracketedPaste},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+
 use crate::agent::{turn_streamed_to_stdout, Agent};
+use crate::config::credentials::{deepseek_key_path, save_deepseek_key};
 use crate::config::models::{
     add_profile, list_profiles, remove_profile, resolve_selection, set_default_profile,
 };
-use crate::config::schema::Config;
+use crate::config::schema::{Config, RuntimeApiKey};
 use crate::config::ModelProfile;
 use crate::hub::{maybe_render_ad, model_routes_via_hub};
 use crate::security::SecurityMode;
 use rig::agent::model::ModelHandle;
+
+mod onboarding;
+mod resources;
 
 const PROMPT: &str = "❯ ";
 
@@ -54,6 +68,7 @@ enum PaletteSelection {
 #[derive(Default)]
 struct PaletteState {
     filter: String,
+    model_label: String,
     selected: usize,
     menu: Option<Vec<ModelMenuOption>>,
     accepted: Option<PaletteSelection>,
@@ -127,6 +142,9 @@ impl Hinter for PaletteHelper {
             for (index, option) in menu.iter().enumerate() {
                 append_palette_entry(&mut text, &option.label, state.selected == index);
             }
+        } else if !line.starts_with('/') {
+            text.push_str("\n  ");
+            text.push_str(&state.model_label);
         } else if line.starts_with('/') && !line.contains(char::is_whitespace) {
             state.synchronize(line);
             for (index, command) in SLASH_COMMANDS
@@ -349,8 +367,7 @@ pub async fn run_tui(
     let mut agent = None;
     let mut current_config = effective_config;
     let mut current_label = selection_label;
-    print_welcome();
-    render_startup_ad(&current_config, &config_path).await;
+    print_logo();
 
     let palette = Arc::new(Mutex::new(PaletteState::default()));
     let mut editor = TuiEditor::new()?;
@@ -360,14 +377,36 @@ pub async fn run_tui(
     bind_palette_keys(&mut editor, &palette);
     load_history(&mut editor, &history_path);
 
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        if onboarding::has_configured_key(&current_config, &catalog_config, &config_path)? {
+            onboarding::attach_saved_key(&mut current_config, &config_path)?;
+        } else if !run_deepseek_onboarding(
+            &mut editor,
+            &mut current_config,
+            &mut catalog_config,
+            &mut current_label,
+            &config_path,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+
     loop {
         {
             let mut state = palette.lock();
             state.active = true;
             state.filter.clear();
+            state.model_label = current_config
+                .provider
+                .model
+                .as_deref()
+                .unwrap_or("gpt-4o-mini")
+                .to_owned();
             state.selected = 0;
         }
-        match editor.readline(PROMPT) {
+        match readline_with_resources(&mut editor, PROMPT, &palette) {
             Ok(line) => {
                 let accepted = palette.lock().accepted.take();
                 palette.lock().active = false;
@@ -381,6 +420,14 @@ pub async fn run_tui(
 
                 let _ = editor.add_history_entry(line);
                 save_history(&mut editor, &history_path);
+                println!(
+                    "  {}",
+                    dim(current_config
+                        .provider
+                        .model
+                        .as_deref()
+                        .unwrap_or("gpt-4o-mini"))
+                );
 
                 match handle_inline_command(&mut agent, line) {
                     InlineCommandResult::Handled => continue,
@@ -967,17 +1014,254 @@ fn clear_terminal() {
     let _ = io::stdout().flush();
 }
 
-fn print_welcome() {
-    println!("nano-assistant v{}", env!("CARGO_PKG_VERSION"));
-    println!(
-        "{}",
-        dim("Simple interactive mode • full terminal scrollback preserved • Ctrl+C/Ctrl+D to quit")
-    );
-    println!(
-        "{}",
-        dim("Commands: /help /clear /rescan /memory /model /model add /exit /quit")
-    );
+fn print_logo() {
+    println!("{}", mint("  ╱╲"));
+    println!("{}", mint(" ╱╱╲╲  na"));
+}
+
+fn mint(text: &str) -> String {
+    format!("\x1b[38;2;127;224;190m{text}\x1b[0m")
+}
+
+struct RawInputGuard;
+
+impl RawInputGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for RawInputGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = disable_raw_mode();
+    }
+}
+
+fn read_masked_key() -> anyhow::Result<Option<String>> {
+    let _raw = RawInputGuard::enter()?;
+    let mut stdout = io::stdout();
+    print!("API Key > \x1b[2msk-***\x1b[0m\x1b[6D");
+    stdout.flush()?;
+    let mut key = String::new();
+    let mut placeholder = true;
+    loop {
+        match event::read()? {
+            TerminalEvent::Key(event) if event.kind == KeyEventKind::Press => {
+                if event.code == TerminalKeyCode::Esc
+                    || (event.code == TerminalKeyCode::Char('c')
+                        && event.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    println!();
+                    return Ok(None);
+                }
+                match event.code {
+                    TerminalKeyCode::Enter => {
+                        if !key.trim().is_empty() {
+                            println!();
+                            return Ok(Some(key.trim().to_owned()));
+                        }
+                    }
+                    TerminalKeyCode::Backspace => {
+                        if placeholder {
+                            print!("\x1b[0K");
+                            placeholder = false;
+                        }
+                        key.pop();
+                        print!("\r\x1b[2KAPI Key > {}", "•".repeat(key.chars().count()));
+                        stdout.flush()?;
+                    }
+                    TerminalKeyCode::Char(ch)
+                        if !event.modifiers.contains(KeyModifiers::CONTROL)
+                            && !event.modifiers.contains(KeyModifiers::ALT)
+                            && !ch.is_control() =>
+                    {
+                        if placeholder {
+                            print!("\x1b[0K");
+                            placeholder = false;
+                        }
+                        key.push(ch);
+                        print!("•");
+                        stdout.flush()?;
+                    }
+                    _ => {}
+                }
+            }
+            TerminalEvent::Paste(text) => {
+                if placeholder {
+                    print!("\x1b[0K");
+                    placeholder = false;
+                }
+                let accepted: String = text
+                    .chars()
+                    .filter(|ch| !ch.is_control() && !matches!(ch, '\r' | '\n' | '\0'))
+                    .collect();
+                key.push_str(&accepted);
+                print!("\r\x1b[2KAPI Key > {}", "•".repeat(key.chars().count()));
+                stdout.flush()?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn readline_with_resources(
+    editor: &mut TuiEditor,
+    prompt: &str,
+    palette: &Arc<Mutex<PaletteState>>,
+) -> Result<String, ReadlineError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return editor.readline(prompt);
+    }
+    let width = crossterm::terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80);
+    let mut sampler = resources::ResourceSampler::default();
+    let initial = resources::format_line(sampler.sample(), width);
+    println!("{}", mint(&initial));
+    let _ = io::stdout().flush();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread_palette = Arc::clone(palette);
+    let updater = thread::spawn(move || loop {
+        for _ in 0..10 {
+            if thread_stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if thread_stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let width = crossterm::terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(80);
+        let snapshot = sampler.sample();
+        let in_palette = {
+            let state = thread_palette.lock();
+            state.menu.is_some() || (state.active && state.filter.starts_with('/'))
+        };
+        if in_palette {
+            continue;
+        }
+        let status = resources::format_line(snapshot, width);
+        let output = format!("\x1b[s\x1b[1A\r\x1b[2K{}\x1b[u", mint(&status));
+        let mut stdout = io::stdout().lock();
+        if stdout.write_all(output.as_bytes()).is_err() || stdout.flush().is_err() {
+            return;
+        }
+    });
+    let result = editor.readline(prompt);
+    stop.store(true, Ordering::Relaxed);
+    let _ = updater.join();
+    result
+}
+
+async fn run_deepseek_onboarding(
+    editor: &mut TuiEditor,
+    current_config: &mut Config,
+    catalog_config: &mut Config,
+    current_label: &mut String,
+    config_path: &Path,
+) -> anyhow::Result<bool> {
     println!();
+    println!("{}", mint("Connect DeepSeek"));
+    println!("  1. Open https://platform.deepseek.com/api_keys");
+    println!("  2. Sign in or create an API key, then copy it.");
+    println!("  3. Paste the key below. Input is masked.");
+
+    let api_base = onboarding::api_base(current_config, catalog_config);
+    loop {
+        let Some(mut key) = read_masked_key()? else {
+            return Ok(false);
+        };
+        loop {
+            println!("  Testing connection...");
+            match onboarding::validate_key(&api_base, &key).await {
+                Ok(()) => {
+                    if let Err(error) = save_deepseek_key(config_path, &key) {
+                        key.clear();
+                        return Err(error);
+                    }
+                    let profile_name = next_deepseek_profile_name(catalog_config);
+                    let profile = ModelProfile {
+                        provider: "deepseek".to_owned(),
+                        model: onboarding::MODEL.to_owned(),
+                        api_url: (api_base != onboarding::API_BASE).then_some(api_base.clone()),
+                        api_key_env: None,
+                        temperature: None,
+                        timeout_secs: None,
+                    };
+                    if let Err(error) = add_profile(config_path, &profile_name, profile) {
+                        let _ = std::fs::remove_file(deepseek_key_path(config_path));
+                        key.clear();
+                        return Err(error);
+                    }
+                    if let Err(error) = set_default_profile(config_path, &profile_name) {
+                        let _ = remove_profile(config_path, &profile_name);
+                        let _ = std::fs::remove_file(deepseek_key_path(config_path));
+                        key.clear();
+                        return Err(error);
+                    }
+                    catalog_config.models.profiles.insert(
+                        profile_name.clone(),
+                        ModelProfile {
+                            provider: "deepseek".to_owned(),
+                            model: onboarding::MODEL.to_owned(),
+                            api_url: (api_base != onboarding::API_BASE).then_some(api_base),
+                            api_key_env: None,
+                            temperature: None,
+                            timeout_secs: None,
+                        },
+                    );
+                    catalog_config.models.default = Some(profile_name.clone());
+                    let (mut selected, label) =
+                        resolve_selection(catalog_config, Some(&profile_name), None, None)?;
+                    selected.runtime_api_key = Some(RuntimeApiKey::new("deepseek", key.clone()));
+                    *current_config = selected;
+                    *current_label = label;
+                    key.clear();
+                    return Ok(true);
+                }
+                Err(_) => {
+                    println!("  Connection failed. [R retry] [E edit]");
+                    editor.helper().unwrap().state.lock().active = false;
+                    match editor.readline("  > ") {
+                        Ok(choice) if choice.trim().eq_ignore_ascii_case("r") => continue,
+                        Ok(choice) if choice.trim().eq_ignore_ascii_case("e") => {
+                            key.clear();
+                            break;
+                        }
+                        Ok(choice) if choice.trim().eq_ignore_ascii_case("q") => {
+                            key.clear();
+                            return Ok(false);
+                        }
+                        Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                            key.clear();
+                            return Ok(false);
+                        }
+                        Ok(_) => println!("  Choose R to retry, E to edit, or q to quit."),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn next_deepseek_profile_name(config: &Config) -> String {
+    if !config.models.profiles.contains_key("deepseek") {
+        return "deepseek".to_owned();
+    }
+    (2..)
+        .map(|index| format!("deepseek-{index}"))
+        .find(|name| !config.models.profiles.contains_key(name))
+        .unwrap()
 }
 
 fn print_help() {
@@ -1037,16 +1321,6 @@ async fn render_inline_ad(config: &Config, config_path: &Path) {
 
     if let Err(error) = maybe_render_ad(config_path.to_path_buf(), "inline_after_response").await {
         eprintln!("[hub] ad fetch skipped: {error}");
-    }
-}
-
-async fn render_startup_ad(config: &Config, config_path: &Path) {
-    if !model_routes_via_hub(config) {
-        return;
-    }
-
-    if let Err(error) = maybe_render_ad(config_path.to_path_buf(), "startup").await {
-        eprintln!("[hub] startup ad skipped: {error}");
     }
 }
 

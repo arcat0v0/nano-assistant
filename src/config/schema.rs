@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 /// Top-level configuration loaded from `config.toml`.
@@ -14,6 +15,10 @@ pub struct Config {
     /// Provider configuration (API key, model selection, etc.)
     #[serde(default)]
     pub provider: ProviderConfig,
+
+    /// In-memory credential for one selected provider; never serialized.
+    #[serde(skip)]
+    pub runtime_api_key: Option<RuntimeApiKey>,
 
     #[serde(default, skip_serializing_if = "ModelsConfig::is_empty")]
     pub models: ModelsConfig,
@@ -44,6 +49,35 @@ pub struct Config {
     /// Hub configuration for `free/*` models and ad delivery.
     #[serde(default)]
     pub hub: HubConfig,
+}
+
+#[derive(Clone)]
+pub struct RuntimeApiKey {
+    provider: String,
+    secret: String,
+}
+
+impl RuntimeApiKey {
+    pub fn new(provider: impl Into<String>, secret: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            secret: secret.into(),
+        }
+    }
+
+    pub fn for_provider(&self, provider: &str) -> Option<&str> {
+        (self.provider == provider).then_some(self.secret.as_str())
+    }
+}
+
+impl fmt::Debug for RuntimeApiKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeApiKey")
+            .field("provider", &self.provider)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
