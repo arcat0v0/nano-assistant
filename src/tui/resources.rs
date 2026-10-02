@@ -135,7 +135,7 @@ pub fn format_line(snapshot: ResourceSnapshot, width: usize) -> String {
     let upload = format_rate(snapshot.upload_bytes_per_sec);
     let download = format_rate(snapshot.download_bytes_per_sec);
 
-    let verbose = format!("CPU {cpu}% · 内存 {used}/{total}G · 网络 ↑{upload} ↓{download} · 1s");
+    let verbose = format!("CPU {cpu}% · 内存 {used}/{total}G · 网络 ↑{upload} ↓{download}");
     if width >= 74 && display_width(&verbose) <= width {
         return verbose;
     }
@@ -255,6 +255,7 @@ mod tests {
         assert!(wide.contains("12%"));
         assert!(wide.contains("↑"));
         assert!(wide.contains("↓"));
+        assert!(!wide.contains("· 1s"));
 
         let large = ResourceSnapshot {
             cpu_percent: Some(100),
