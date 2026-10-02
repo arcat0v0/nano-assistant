@@ -11,56 +11,116 @@ use rig::agent::model::ModelHandle;
 use rig::client::CompletionClient;
 use rig::providers::{anthropic, gemini, openai};
 
-use crate::config::Config;
+use crate::config::credentials::load_deepseek_key;
+use crate::config::{Config, ResolvedModel};
 use crate::hub::{model_routes_via_hub, resolve_hub_config, HubClient};
 
-fn resolve_api_key(config: &Config, provider: &str, env_vars: &[&str]) -> Option<String> {
-    env_vars
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .or_else(|| {
-            config
-                .runtime_api_key
-                .as_ref()
-                .and_then(|key| key.for_provider(provider))
-                .map(str::to_owned)
-        })
-        .or_else(|| config.provider.api_key.clone())
+fn provider_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "gemini" => Some("GEMINI_API_KEY"),
+        "deepseek" | "kimi" | "glm" | "mimo" | "qwen" => {
+            preset(provider).map(|entry| entry.api_key_env)
+        }
+        _ => None,
+    }
 }
 
-fn profile_key(config: &Config) -> anyhow::Result<Option<String>> {
-    let Some(name) = config.active_profile.as_deref() else {
+fn env_key(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn resolve_api_key(
+    config: &Config,
+    selected: &ResolvedModel,
+    config_path: &Path,
+) -> anyhow::Result<Option<String>> {
+    if let Some(env_name) = selected.api_key_env.as_deref() {
+        if let Some(key) = env_key(env_name) {
+            return Ok(Some(key));
+        }
+        if selected.provider == "deepseek" {
+            if let Some(key) = load_deepseek_key(config_path)? {
+                return Ok(Some(key));
+            }
+        }
         return Ok(None);
-    };
-    let profile = config
-        .models
-        .profiles
-        .get(name)
-        .with_context(|| format!("model profile '{name}' not found"))?;
-    let Some(env_name) = profile.api_key_env.as_deref() else {
-        return Ok(None);
-    };
-    if let Some(key) = std::env::var(env_name).ok().filter(|key| !key.is_empty()) {
+    }
+
+    if let Some(key) = env_key("NA_API_KEY") {
         return Ok(Some(key));
     }
-    if let Some(key) = config
-        .runtime_api_key
-        .as_ref()
-        .and_then(|key| key.for_provider(&profile.provider))
-    {
-        return Ok(Some(key.to_owned()));
+    if let Some(env_name) = provider_key_env(&selected.provider) {
+        if let Some(key) = env_key(env_name) {
+            return Ok(Some(key));
+        }
     }
-    Err(anyhow::anyhow!(
-        "model profile '{name}' requires environment variable {env_name}"
-    ))
+    if selected.provider == "deepseek" {
+        if let Some(key) = load_deepseek_key(config_path)? {
+            return Ok(Some(key));
+        }
+    }
+    if selected.allows_legacy_key {
+        if let Some(key) = config
+            .provider
+            .api_key
+            .as_ref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            return Ok(Some(key.clone()));
+        }
+    }
+
+    if matches!(selected.provider.as_str(), "ollama" | "compatible") {
+        return Ok(Some("not-required".into()));
+    }
+
+    Ok(None)
 }
 
-pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelHandle> {
-    let model = config.provider.model.as_deref().unwrap_or("gpt-4o-mini");
-    let profile_key = profile_key(config)?;
-    if model_routes_via_hub(config) {
+fn require_api_key(
+    config: &Config,
+    selected: &ResolvedModel,
+    config_path: &Path,
+) -> anyhow::Result<String> {
+    resolve_api_key(config, selected, config_path)?.ok_or_else(|| {
+        if let Some(env_name) = selected.api_key_env.as_deref() {
+            anyhow::anyhow!(
+                "model profile '{}' requires environment variable {env_name} or its provider credential",
+                selected.profile_name.as_deref().unwrap_or("<unnamed>")
+            )
+        } else {
+            let hint = provider_key_env(&selected.provider).unwrap_or("NA_API_KEY");
+            anyhow::anyhow!(
+                "{} API key not set for model '{}'. Set {hint} or configure this profile.",
+                selected.provider,
+                selected.model
+            )
+        }
+    })
+}
+
+pub fn credentials_available(
+    config: &Config,
+    selected: &ResolvedModel,
+    config_path: &Path,
+) -> anyhow::Result<bool> {
+    Ok(resolve_api_key(config, selected, config_path)?.is_some())
+}
+
+pub fn build_model(
+    selected: &ResolvedModel,
+    config: &Config,
+    config_path: &Path,
+) -> anyhow::Result<ModelHandle> {
+    let model = selected.model.as_str();
+    if model_routes_via_hub(&selected.apply_to_config(config)) {
         let resolved = resolve_hub_config(config);
-        let client = HubClient::new(config_path.to_path_buf(), config.clone())?;
+        let effective_config = selected.apply_to_config(config);
+        let client = HubClient::new(config_path.to_path_buf(), effective_config)?;
         let transport = hub::AuthenticatedTransport::hub(client);
         let openai = openai::CompletionsClient::builder()
             .api_key("hub-signed")
@@ -76,19 +136,17 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         anyhow::bail!("free/* models require [hub].enabled = true or NANA_HUB_DISABLED unset");
     }
 
-    let provider = config.provider.provider.as_deref().unwrap_or("openai");
-    let base_url = config.provider.api_url.as_deref();
+    let provider = selected.provider.as_str();
+    let base_url = selected.api_url.as_deref();
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.provider.timeout_secs))
+        .timeout(Duration::from_secs(selected.timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .context("building provider HTTP client")?;
 
     match provider {
         "openai" => {
-            let key = profile_key
-                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "OPENAI_API_KEY"]))
-                .context("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")?;
+            let key = require_api_key(config, selected, config_path)?;
             let openai = openai::CompletionsClient::builder()
                 .api_key(key)
                 .base_url(
@@ -101,9 +159,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             Ok(ModelHandle::named(provider, openai.completion_model(model)))
         }
         "anthropic" => {
-            let key = profile_key
-                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "ANTHROPIC_API_KEY"]))
-                .context("Anthropic API key not set. Set ANTHROPIC_API_KEY or edit config.toml.")?;
+            let key = require_api_key(config, selected, config_path)?;
             let base = base_url.unwrap_or("https://api.anthropic.com");
             if key.starts_with("sk-ant-oat01-") {
                 let transport = hub::AuthenticatedTransport::anthropic_oauth(key.clone(), client);
@@ -129,9 +185,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             }
         }
         "gemini" => {
-            let key = profile_key
-                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", "GEMINI_API_KEY"]))
-                .context("Gemini API key not set. Set GEMINI_API_KEY or edit config.toml.")?;
+            let key = require_api_key(config, selected, config_path)?;
             let base = base_url
                 .unwrap_or("https://generativelanguage.googleapis.com")
                 .trim_end_matches('/')
@@ -148,14 +202,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
         }
         "deepseek" | "kimi" | "glm" | "mimo" | "qwen" => {
             let preset = preset(provider).expect("built-in provider has a preset");
-            let key = profile_key
-                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY", preset.api_key_env]))
-                .with_context(|| {
-                    format!(
-                        "{provider} API key not set. Set {} or edit config.toml.",
-                        preset.api_key_env
-                    )
-                })?;
+            let key = require_api_key(config, selected, config_path)?;
             let url = base_url.unwrap_or(preset.base_url).trim_end_matches('/');
             if provider == "mimo" {
                 let transport = hub::AuthenticatedTransport::mimo(key.clone(), client);
@@ -175,9 +222,7 @@ pub fn build_model(config: &Config, config_path: &Path) -> anyhow::Result<ModelH
             }
         }
         "ollama" | "compatible" => {
-            let key = profile_key
-                .or_else(|| resolve_api_key(config, provider, &["NA_API_KEY"]))
-                .unwrap_or_else(|| "not-required".to_string());
+            let key = require_api_key(config, selected, config_path)?;
             let default_url = if provider == "ollama" {
                 "http://localhost:11434/v1"
             } else {
@@ -233,70 +278,61 @@ mod tests {
         let _saved = SavedKeys::new(&["NA_API_KEY", "OPENAI_API_KEY"]);
         let mut config = Config::default();
         config.provider.api_key = Some("config-key".into());
+        let selected = crate::config::models::resolve_selection(&config, None, None, None).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
         std::env::set_var("OPENAI_API_KEY", "provider-key");
         std::env::set_var("NA_API_KEY", "global-key");
         assert_eq!(
-            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
-            Some("global-key")
+            resolve_api_key(&config, &selected, &path).unwrap(),
+            Some("global-key".into())
         );
 
         std::env::remove_var("NA_API_KEY");
         assert_eq!(
-            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
-            Some("provider-key")
+            resolve_api_key(&config, &selected, &path).unwrap(),
+            Some("provider-key".into())
         );
 
         std::env::remove_var("OPENAI_API_KEY");
         assert_eq!(
-            resolve_api_key(&config, "openai", &["NA_API_KEY", "OPENAI_API_KEY"]).as_deref(),
-            Some("config-key")
+            resolve_api_key(&config, &selected, &path).unwrap(),
+            Some("config-key".into())
         );
     }
 
     #[test]
-    fn runtime_api_key_is_scoped_to_its_provider() {
+    fn cli_and_tui_credential_checks_share_deepseek_key_file_resolution() {
+        let _saved = SavedKeys::new(&["NA_API_KEY", "DEEPSEEK_API_KEY"]);
+        std::env::remove_var("NA_API_KEY");
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        crate::config::credentials::save_deepseek_key(&config_path, "sk-fixture-only").unwrap();
         let mut config = Config::default();
-        config.provider.api_key = Some("legacy-openai-key".into());
-        config.runtime_api_key = Some(crate::config::schema::RuntimeApiKey::new(
-            "deepseek",
-            "separate-deepseek-key",
-        ));
-        assert_eq!(
-            resolve_api_key(&config, "openai", &[]).as_deref(),
-            Some("legacy-openai-key")
-        );
-        assert_eq!(
-            resolve_api_key(&config, "deepseek", &[]).as_deref(),
-            Some("separate-deepseek-key")
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn saved_runtime_key_can_satisfy_a_matching_profiles_environment_fallback() {
-        let _saved = SavedKeys::new(&["DEEPSEEK_PROFILE_KEY"]);
-        std::env::remove_var("DEEPSEEK_PROFILE_KEY");
-        let mut config = Config::default();
-        config.runtime_api_key = Some(crate::config::schema::RuntimeApiKey::new(
-            "deepseek",
-            "file-backed-key",
-        ));
-        config.active_profile = Some("saved".into());
         config.models.profiles.insert(
             "saved".into(),
             crate::config::ModelProfile {
                 provider: "deepseek".into(),
                 model: "deepseek-flash".into(),
                 api_url: None,
-                api_key_env: Some("DEEPSEEK_PROFILE_KEY".into()),
+                api_key_env: None,
                 temperature: None,
                 timeout_secs: None,
             },
         );
+        let selected = crate::config::models::resolve_profile(
+            &config,
+            "saved",
+            crate::config::SelectionSource::Session,
+        )
+        .unwrap();
         assert_eq!(
-            profile_key(&config).unwrap().as_deref(),
-            Some("file-backed-key")
+            resolve_api_key(&config, &selected, &config_path).unwrap(),
+            Some("sk-fixture-only".into())
         );
+        assert!(credentials_available(&config, &selected, &config_path).unwrap());
+        assert!(build_model(&selected, &config, &config_path).is_ok());
     }
 
     #[test]
@@ -319,18 +355,20 @@ mod tests {
                 timeout_secs: None,
             },
         );
-        let (effective, _) =
+        let selected =
             crate::config::models::resolve_selection(&config, Some("private"), None, None).unwrap();
-        let error = build_model(&effective, Path::new("config.toml"))
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let error = build_model(&selected, &config, &config_path)
             .expect_err("missing profile key should reject model");
         assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
 
         std::env::set_var("MISSING_PROFILE_KEY", "");
-        let error = build_model(&effective, Path::new("config.toml"))
+        let error = build_model(&selected, &config, &config_path)
             .expect_err("empty profile key should reject model");
         assert!(error.to_string().contains("MISSING_PROFILE_KEY"));
 
         std::env::set_var("MISSING_PROFILE_KEY", "profile-key");
-        assert!(build_model(&effective, Path::new("config.toml")).is_ok());
+        assert!(build_model(&selected, &config, &config_path).is_ok());
     }
 }

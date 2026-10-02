@@ -1,6 +1,7 @@
 //! System prompt builder for the agent.
 //!
 
+use crate::config::ResolvedModel;
 use crate::skills::Skill;
 use rig::completion::ToolDefinition;
 use std::fmt::Write;
@@ -8,6 +9,8 @@ use std::process::Command;
 
 /// Context required to build the system prompt.
 pub struct PromptContext<'a> {
+    /// Selected runtime provider/model identity. Never includes credentials.
+    pub model: &'a ResolvedModel,
     /// Available tools for the agent.
     pub tools: &'a [ToolDefinition],
     pub config_path: &'a std::path::Path,
@@ -33,6 +36,7 @@ impl SystemPromptBuilder {
             .map(build_system_info_section)
             .unwrap_or_default();
         let runtime_context = build_runtime_context_section();
+        let model_identity = build_model_identity_section(ctx.model);
         let system_steward = build_system_steward_section();
         let tools = build_tools_section(ctx);
         let skills = build_skills_section(ctx);
@@ -47,6 +51,7 @@ impl SystemPromptBuilder {
             &datetime,
             &system_info,
             &runtime_context,
+            &model_identity,
             &system_steward,
             &tools,
             &skills,
@@ -64,6 +69,13 @@ impl SystemPromptBuilder {
 
         output
     }
+}
+
+fn build_model_identity_section(model: &ResolvedModel) -> String {
+    format!(
+        "## Active Model\n\nConfigured provider: {}\nModel ID: {}\nUse this runtime selection when asked which model is active; do not infer it from saved config files or model-name prefixes.",
+        model.provider, model.model
+    )
 }
 
 fn build_datetime_section() -> String {
@@ -322,4 +334,50 @@ fn build_safety_section() -> String {
      - NEVER fabricate tool results. If a tool returns empty results, say \"No results found.\"\n\
      - If a tool call fails, report the error — never make up data."
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ResolvedModel, SelectionSource};
+
+    fn active_model(provider: &str, model: &str) -> ResolvedModel {
+        ResolvedModel {
+            profile_name: Some("selected".into()),
+            provider: provider.into(),
+            model: model.into(),
+            api_url: Some("https://private.example/v1".into()),
+            api_key_env: Some("PRIVATE_TEST_KEY".into()),
+            temperature: 0.7,
+            timeout_secs: 120,
+            source: SelectionSource::Session,
+            allows_legacy_key: false,
+            label: "selected".into(),
+        }
+    }
+
+    fn prompt(model: &ResolvedModel) -> String {
+        SystemPromptBuilder::build(&PromptContext {
+            model,
+            tools: &[],
+            config_path: std::path::Path::new("config.toml"),
+            skills: &[],
+            system_info: None,
+            deferred_tool_names: &[],
+        })
+    }
+
+    #[test]
+    fn system_prompt_uses_current_resolved_model_without_credentials() {
+        let first_model = active_model("deepseek", "deepseek-flash");
+        let first_prompt = prompt(&first_model);
+        assert!(first_prompt.contains("Configured provider: deepseek\nModel ID: deepseek-flash"));
+        assert!(!first_prompt.contains("PRIVATE_TEST_KEY"));
+        assert!(!first_prompt.contains("private.example"));
+
+        let switched_model = active_model("anthropic", "claude-sonnet");
+        let switched_prompt = prompt(&switched_model);
+        assert!(switched_prompt.contains("Configured provider: anthropic\nModel ID: claude-sonnet"));
+        assert!(!switched_prompt.contains("deepseek-flash"));
+    }
 }

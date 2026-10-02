@@ -372,6 +372,27 @@ fn wait_for_exit(terminal: &mut Terminal) {
 }
 
 #[test]
+fn existing_non_deepseek_provider_skips_deepseek_onboarding() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = config(&temp.path().join("assistant.toml"));
+    let mut terminal = Terminal::start(temp.path(), &config_path, None);
+    terminal.until("CPU");
+    terminal.until("❯ ");
+    assert!(!terminal.text().contains("Connect DeepSeek"));
+    assert!(!terminal.text().contains("API Key > "));
+    wait_for_exit(&mut terminal);
+    assert!(terminal.terminal_restored());
+
+    let saved: Config = toml::from_str(&fs::read_to_string(config_path).unwrap()).unwrap();
+    assert_eq!(saved.provider.provider.as_deref(), Some("openai"));
+    assert_eq!(saved.provider.model.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(
+        saved.provider.api_key.as_deref(),
+        Some("preserve-openai-key")
+    );
+}
+
+#[test]
 fn first_run_masks_key_tests_it_and_preserves_other_provider_config() {
     let temp = tempfile::tempdir().unwrap();
     let fixture = ApiFixture::start(vec![(200, r#"{"data":[{"id":"deepseek-flash"}]}"#)]);
@@ -530,7 +551,8 @@ fn live_resource_updates_keep_unicode_input_and_adapt_after_resize() {
 fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
     for abort in ["\x1b", "\x03"] {
         let temp = tempfile::tempdir().unwrap();
-        let config_path = config(&temp.path().join("assistant.toml"));
+        let config_path =
+            config_with_deepseek_fixture(&temp.path().join("assistant.toml"), "http://127.0.0.1:9");
         let mut terminal = Terminal::start(temp.path(), &config_path, None);
         terminal.until("API Key > ");
         terminal.send(abort);

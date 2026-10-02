@@ -1,107 +1,20 @@
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
-use crate::config::credentials::load_deepseek_key;
-use crate::config::schema::Config;
-use crate::config::schema::RuntimeApiKey;
+use crate::config::ResolvedModel;
 
 pub const MODEL: &str = "deepseek-flash";
 pub const API_BASE: &str = "https://api.deepseek.com";
 
-pub fn api_base(config: &Config, catalog: &Config) -> String {
-    let selected = config
-        .active_profile
+pub fn api_base(model: &ResolvedModel) -> String {
+    model
+        .api_url
         .as_deref()
-        .and_then(|name| catalog.models.profiles.get(name));
-    if let Some(profile) = selected.filter(|profile| profile.provider == "deepseek") {
-        if let Some(url) = profile.api_url.as_ref() {
-            return url.trim_end_matches('/').to_owned();
-        }
-    }
-    if config.provider.provider.as_deref() == Some("deepseek") {
-        if let Some(url) = config.provider.api_url.as_ref() {
-            return url.trim_end_matches('/').to_owned();
-        }
-    }
-    if catalog.provider.provider.as_deref() == Some("deepseek") {
-        if let Some(url) = catalog.provider.api_url.as_ref() {
-            return url.trim_end_matches('/').to_owned();
-        }
-    }
-    if let Some(profile) = catalog
-        .models
-        .default
-        .as_deref()
-        .and_then(|name| catalog.models.profiles.get(name))
-        .filter(|profile| profile.provider == "deepseek")
-    {
-        if let Some(url) = profile.api_url.as_ref() {
-            return url.trim_end_matches('/').to_owned();
-        }
-    }
-    API_BASE.to_owned()
-}
-
-pub fn has_configured_key(
-    current: &Config,
-    catalog: &Config,
-    config_path: &Path,
-) -> anyhow::Result<bool> {
-    if nonempty_env("DEEPSEEK_API_KEY").is_some() {
-        return Ok(true);
-    }
-
-    for profile in catalog
-        .models
-        .profiles
-        .values()
-        .filter(|profile| profile.provider == "deepseek")
-    {
-        if profile
-            .api_key_env
-            .as_deref()
-            .and_then(nonempty_env)
-            .is_some()
-        {
-            return Ok(true);
-        }
-    }
-
-    if current.provider.provider.as_deref() == Some("deepseek")
-        && (current
-            .provider
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.is_empty())
-            || nonempty_env("NA_API_KEY").is_some())
-    {
-        return Ok(true);
-    }
-
-    Ok(load_deepseek_key(config_path)?.is_some())
-}
-
-pub fn attach_saved_key(current: &mut Config, config_path: &Path) -> anyhow::Result<()> {
-    if current.provider.provider.as_deref() != Some("deepseek") {
-        return Ok(());
-    }
-    let explicit_key = nonempty_env("DEEPSEEK_API_KEY").or_else(|| nonempty_env("NA_API_KEY"));
-    if explicit_key.is_some()
-        || current
-            .provider
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.is_empty())
-    {
-        return Ok(());
-    }
-    if let Some(key) = load_deepseek_key(config_path)? {
-        current.runtime_api_key = Some(RuntimeApiKey::new("deepseek", key));
-    }
-    Ok(())
+        .unwrap_or(API_BASE)
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 pub async fn validate_key(api_base: &str, key: &str) -> anyhow::Result<()> {
@@ -123,12 +36,6 @@ pub async fn validate_key(api_base: &str, key: &str) -> anyhow::Result<()> {
         bail!("DeepSeek did not list the default model");
     }
     Ok(())
-}
-
-fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Deserialize)]

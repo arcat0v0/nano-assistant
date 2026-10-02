@@ -28,10 +28,10 @@ use crossterm::{
 use crate::agent::{turn_streamed_to_stdout, Agent};
 use crate::config::credentials::{deepseek_key_path, save_deepseek_key};
 use crate::config::models::{
-    add_profile, list_profiles, remove_profile, resolve_selection, set_default_profile,
+    add_profile, list_profiles, remove_profile, resolve_profile, set_default_profile,
+    SelectionSource,
 };
-use crate::config::schema::{Config, RuntimeApiKey};
-use crate::config::ModelProfile;
+use crate::config::{Config, ModelProfile, ResolvedModel};
 use crate::hub::{maybe_render_ad, model_routes_via_hub};
 use crate::security::SecurityMode;
 use rig::agent::model::ModelHandle;
@@ -276,13 +276,13 @@ fn bind_palette_keys(editor: &mut TuiEditor, state: &Arc<Mutex<PaletteState>>) {
     );
 }
 
-fn model_menu_options(catalog: &Config, current: &Config) -> Vec<ModelMenuOption> {
+fn model_menu_options(catalog: &Config, current: &ResolvedModel) -> Vec<ModelMenuOption> {
     let mut options = vec![ModelMenuOption {
         label: format!(
             "default: {}/{}{}",
             catalog.provider.provider.as_deref().unwrap_or("openai"),
             catalog.provider.model.as_deref().unwrap_or("gpt-4o-mini"),
-            if current.active_profile.is_none() {
+            if current.profile_name.is_none() {
                 " (current)"
             } else {
                 ""
@@ -296,7 +296,7 @@ fn model_menu_options(catalog: &Config, current: &Config) -> Vec<ModelMenuOption
                 "{name}: {}/{}{}",
                 profile.provider,
                 profile.model,
-                if current.active_profile.as_deref() == Some(name) {
+                if current.profile_name.as_deref() == Some(name) {
                     " (current)"
                 } else {
                     ""
@@ -320,7 +320,7 @@ fn choose_model_menu(
     editor: &mut TuiEditor,
     state: &Arc<Mutex<PaletteState>>,
     catalog: &Config,
-    current: &Config,
+    current: &ResolvedModel,
 ) -> anyhow::Result<ModelMenuAction> {
     let options = model_menu_options(catalog, current);
     {
@@ -360,13 +360,13 @@ pub async fn run_tui(
     effective_config: Config,
     config_path: PathBuf,
     mut catalog_config: Config,
-    selection_label: String,
+    selection: ResolvedModel,
     history_path: PathBuf,
     security_mode: SecurityMode,
 ) -> anyhow::Result<()> {
     let mut agent = None;
     let mut current_config = effective_config;
-    let mut current_label = selection_label;
+    let mut current_model = selection;
     print_logo();
 
     let palette = Arc::new(Mutex::new(PaletteState::default()));
@@ -377,17 +377,21 @@ pub async fn run_tui(
     bind_palette_keys(&mut editor, &palette);
     load_history(&mut editor, &history_path);
 
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        if onboarding::has_configured_key(&current_config, &catalog_config, &config_path)? {
-            onboarding::attach_saved_key(&mut current_config, &config_path)?;
-        } else if !run_deepseek_onboarding(
-            &mut editor,
-            &mut current_config,
-            &mut catalog_config,
-            &mut current_label,
-            &config_path,
-        )
-        .await?
+    if io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && current_model.is_provider("deepseek")
+    {
+        let has_credential =
+            crate::providers::credentials_available(&catalog_config, &current_model, &config_path)?;
+        if !has_credential
+            && !run_deepseek_onboarding(
+                &mut editor,
+                &mut current_config,
+                &mut catalog_config,
+                &mut current_model,
+                &config_path,
+            )
+            .await?
         {
             return Ok(());
         }
@@ -398,12 +402,7 @@ pub async fn run_tui(
             let mut state = palette.lock();
             state.active = true;
             state.filter.clear();
-            state.model_label = current_config
-                .provider
-                .model
-                .as_deref()
-                .unwrap_or("gpt-4o-mini")
-                .to_owned();
+            state.model_label = current_model.model.clone();
             state.selected = 0;
         }
         match readline_with_resources(&mut editor, PROMPT, &palette) {
@@ -420,14 +419,7 @@ pub async fn run_tui(
 
                 let _ = editor.add_history_entry(line);
                 save_history(&mut editor, &history_path);
-                println!(
-                    "  {}",
-                    dim(current_config
-                        .provider
-                        .model
-                        .as_deref()
-                        .unwrap_or("gpt-4o-mini"))
-                );
+                println!("  {}", dim(&current_model.model));
 
                 match handle_inline_command(&mut agent, line) {
                     InlineCommandResult::Handled => continue,
@@ -451,7 +443,7 @@ pub async fn run_tui(
                     }
                     InlineCommandResult::Model(command) => {
                         let chosen = if matches!(command, ModelCommand::Menu) {
-                            print_models(&catalog_config, &current_config, &current_label);
+                            print_models(&catalog_config, &current_model);
                             if !io::stdin().is_terminal() {
                                 continue;
                             }
@@ -459,7 +451,7 @@ pub async fn run_tui(
                                 &mut editor,
                                 &palette,
                                 &catalog_config,
-                                &current_config,
+                                &current_model,
                             ) {
                                 Ok(choice) => choice,
                                 Err(error) => {
@@ -514,7 +506,7 @@ pub async fn run_tui(
                                     &mut agent,
                                     &mut catalog_config,
                                     &mut current_config,
-                                    &mut current_label,
+                                    &mut current_model,
                                     &config_path,
                                     security_mode,
                                     profile,
@@ -524,7 +516,10 @@ pub async fn run_tui(
                                 {
                                     Ok(()) => println!(
                                         "{}",
-                                        accent(&format!("Model switched to {current_label}"))
+                                        accent(&format!(
+                                            "Model switched to {}",
+                                            current_model.label
+                                        ))
                                     ),
                                     Err(error) => eprintln!("[tui] model switch failed: {error:#}"),
                                 }
@@ -535,7 +530,7 @@ pub async fn run_tui(
                                     &mut agent,
                                     &mut catalog_config,
                                     &mut current_config,
-                                    &mut current_label,
+                                    &mut current_model,
                                     &config_path,
                                     security_mode,
                                     provider,
@@ -544,7 +539,10 @@ pub async fn run_tui(
                                 {
                                     Ok(true) => println!(
                                         "{}",
-                                        accent(&format!("Model switched to {current_label}"))
+                                        accent(&format!(
+                                            "Model switched to {}",
+                                            current_model.label
+                                        ))
                                     ),
                                     Ok(false) => println!("{}", dim("Model setup canceled")),
                                     Err(error) => eprintln!("[tui] model setup failed: {error:#}"),
@@ -563,11 +561,16 @@ pub async fn run_tui(
                     }
                     InlineCommandResult::Prompt(prompt) => {
                         if agent.is_none() {
-                            match crate::providers::build_model(&current_config, &config_path) {
+                            match crate::providers::build_model(
+                                &current_model,
+                                &catalog_config,
+                                &config_path,
+                            ) {
                                 Ok(model) => {
                                     activate_model(
                                         &mut agent,
                                         model,
+                                        &current_model,
                                         &current_config,
                                         &config_path,
                                         security_mode,
@@ -612,17 +615,19 @@ pub async fn run_tui(
 async fn activate_model(
     agent: &mut Option<Agent>,
     model: ModelHandle,
+    resolved_model: &ResolvedModel,
     config: &Config,
     config_path: &Path,
     security_mode: SecurityMode,
 ) {
     if let Some(agent) = agent {
-        agent.switch_model(model, config).await;
+        agent.switch_model(model, resolved_model, config).await;
     } else {
         let system_info = crate::cli::commands::load_or_create_memory_md().await;
         *agent = Some(
             crate::cli::commands::build_agent(
                 model,
+                resolved_model.clone(),
                 config,
                 security_mode,
                 None,
@@ -638,26 +643,32 @@ async fn switch_profile(
     agent: &mut Option<Agent>,
     catalog_config: &mut Config,
     current_config: &mut Config,
-    current_label: &mut String,
+    current_model: &mut ResolvedModel,
     config_path: &Path,
     security_mode: SecurityMode,
     profile: &str,
     save: bool,
 ) -> anyhow::Result<()> {
-    let (selected, label) = resolve_selection(catalog_config, Some(profile), None, None)?;
-    let mut effective = current_config.clone();
-    effective.provider = selected.provider;
-    effective.active_profile = selected.active_profile;
-    let model = crate::providers::build_model(&effective, config_path)?;
+    let selected = resolve_profile(catalog_config, profile, SelectionSource::Session)?;
+    let mut effective = selected.apply_to_config(catalog_config);
+    let model = crate::providers::build_model(&selected, &effective, config_path)?;
     if save {
         set_default_profile(config_path, profile)?;
         let default = (profile != "default").then(|| profile.to_string());
         effective.models.default = default.clone();
         catalog_config.models.default = default;
     }
-    activate_model(agent, model, &effective, config_path, security_mode).await;
+    activate_model(
+        agent,
+        model,
+        &selected,
+        &effective,
+        config_path,
+        security_mode,
+    )
+    .await;
     *current_config = effective;
-    *current_label = label;
+    *current_model = selected;
     Ok(())
 }
 
@@ -710,7 +721,7 @@ async fn add_model_profile(
     agent: &mut Option<Agent>,
     catalog_config: &mut Config,
     current_config: &mut Config,
-    current_label: &mut String,
+    current_model: &mut ResolvedModel,
     config_path: &Path,
     security_mode: SecurityMode,
     requested_provider: Option<&str>,
@@ -816,15 +827,9 @@ async fn add_model_profile(
         .models
         .profiles
         .insert(name.clone(), profile.clone());
-    let (selected, _) = resolve_selection(&updated, Some(&name), None, None)?;
-    let mut effective = current_config.clone();
-    effective
-        .models
-        .profiles
-        .insert(name.clone(), profile.clone());
-    effective.provider = selected.provider;
-    effective.active_profile = selected.active_profile;
-    let model = crate::providers::build_model(&effective, config_path)?;
+    let selected = resolve_profile(&updated, &name, SelectionSource::Session)?;
+    let mut effective = selected.apply_to_config(&updated);
+    let model = crate::providers::build_model(&selected, &effective, config_path)?;
     add_profile(config_path, &name, profile)?;
     if save {
         if let Err(error) = set_default_profile(config_path, &name) {
@@ -834,24 +839,35 @@ async fn add_model_profile(
         updated.models.default = Some(name.clone());
         effective.models.default = Some(name.clone());
     }
-    activate_model(agent, model, &effective, config_path, security_mode).await;
+    activate_model(
+        agent,
+        model,
+        &selected,
+        &effective,
+        config_path,
+        security_mode,
+    )
+    .await;
     *catalog_config = updated;
     *current_config = effective;
-    *current_label = name;
+    *current_model = selected;
     Ok(true)
 }
 
-fn print_models(catalog: &Config, current: &Config, label: &str) {
+fn print_models(catalog: &Config, current: &ResolvedModel) {
     println!(
         "{}",
         accent(&format!(
-            "Current model: {label} ({}/{})",
-            current.provider.provider.as_deref().unwrap_or("openai"),
-            current.provider.model.as_deref().unwrap_or("gpt-4o-mini")
+            "Current model: {} ({}/{})",
+            current.label, current.provider, current.model
         ))
     );
     let legacy = &catalog.provider;
-    let marker = if label == "default" { "*" } else { " " };
+    let marker = if current.profile_name.is_none() {
+        "*"
+    } else {
+        " "
+    };
     let default = if catalog.models.default.is_none() {
         " (default)"
     } else {
@@ -864,7 +880,7 @@ fn print_models(catalog: &Config, current: &Config, label: &str) {
         default
     );
     for (name, profile) in list_profiles(catalog) {
-        let marker = if current.active_profile.as_deref() == Some(name) {
+        let marker = if current.profile_name.as_deref() == Some(name) {
             "*"
         } else {
             " "
@@ -1166,7 +1182,7 @@ async fn run_deepseek_onboarding(
     editor: &mut TuiEditor,
     current_config: &mut Config,
     catalog_config: &mut Config,
-    current_label: &mut String,
+    current_model: &mut ResolvedModel,
     config_path: &Path,
 ) -> anyhow::Result<bool> {
     println!();
@@ -1175,7 +1191,7 @@ async fn run_deepseek_onboarding(
     println!("  2. Sign in or create an API key, then copy it.");
     println!("  3. Paste the key below. Input is masked.");
 
-    let api_base = onboarding::api_base(current_config, catalog_config);
+    let api_base = onboarding::api_base(current_model);
     loop {
         let Some(mut key) = read_masked_key()? else {
             return Ok(false);
@@ -1220,11 +1236,10 @@ async fn run_deepseek_onboarding(
                         },
                     );
                     catalog_config.models.default = Some(profile_name.clone());
-                    let (mut selected, label) =
-                        resolve_selection(catalog_config, Some(&profile_name), None, None)?;
-                    selected.runtime_api_key = Some(RuntimeApiKey::new("deepseek", key.clone()));
-                    *current_config = selected;
-                    *current_label = label;
+                    let selected =
+                        resolve_profile(catalog_config, &profile_name, SelectionSource::Session)?;
+                    *current_config = selected.apply_to_config(catalog_config);
+                    *current_model = selected;
                     key.clear();
                     return Ok(true);
                 }

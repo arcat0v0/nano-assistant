@@ -4,12 +4,12 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::agent::turn_streamed_to_stdout;
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentModelContext};
 use crate::config::models::{
     add_profile, list_profiles, remove_profile, resolve_selection, set_default_profile,
 };
 use crate::config::schema::default_config_path;
-use crate::config::{load_config_or_default, Config, ModelProfile};
+use crate::config::{load_config_or_default, Config, ModelProfile, ResolvedModel};
 use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use anyhow::Context;
@@ -79,7 +79,8 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         None => {
             let config_path = default_config_path();
             let catalog = load_config_or_default(&config_path);
-            let (config, selected) = resolve_selection(&catalog, None, None, None)?;
+            let selected = resolve_selection(&catalog, None, None, None)?;
+            let config = selected.apply_to_config(&catalog);
             let security_mode = resolve_security_mode(None, &config);
             run_interactive(config, config_path, security_mode, catalog, selected).await
         }
@@ -94,12 +95,13 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
 
     let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
     let catalog = load_config_or_default(&config_path);
-    let (mut config, selected) = resolve_selection(
+    let selected = resolve_selection(
         &catalog,
         args.profile.as_deref(),
         args.model.as_deref(),
         args.provider.as_deref(),
     )?;
+    let mut config = selected.apply_to_config(&catalog);
     let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
     config.behavior.debug = resolve_debug_mode(args.debug, &config);
     let streaming = config.behavior.streaming;
@@ -113,10 +115,11 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
 
     match args.prompt_text() {
         Some(prompt) => {
-            let model = crate::providers::build_model(&config, &config_path)?;
+            let model = crate::providers::build_model(&selected, &catalog, &config_path)?;
             let system_info = load_or_create_memory_md().await;
             let agent = build_agent(
                 model,
+                selected.clone(),
                 &config,
                 security_mode,
                 None,
@@ -190,8 +193,8 @@ async fn handle_model_command(
             }
         }
         ModelSubcommand::Use { name } => {
-            let (effective, _) = resolve_selection(&config, Some(&name), None, None)?;
-            crate::providers::build_model(&effective, &config_path)?;
+            let effective = resolve_selection(&config, Some(&name), None, None)?;
+            crate::providers::build_model(&effective, &config, &config_path)?;
             set_default_profile(&config_path, &name)?;
             println!("Default model: {name}");
         }
@@ -265,6 +268,7 @@ pub(crate) async fn load_or_create_memory_md() -> Option<String> {
 
 pub(crate) async fn build_agent(
     model: ModelHandle,
+    resolved_model: ResolvedModel,
     config: &Config,
     security_mode: SecurityMode,
     confirmer: Option<Arc<dyn UserConfirmation>>,
@@ -307,9 +311,12 @@ pub(crate) async fn build_agent(
 
     Agent::new(
         model,
+        AgentModelContext {
+            selection: resolved_model,
+            config: config.clone(),
+        },
         dynamic_tools,
         memory,
-        config.clone(),
         skills,
         system_info,
         security,
@@ -368,7 +375,7 @@ async fn run_interactive(
     config_path: std::path::PathBuf,
     security_mode: SecurityMode,
     catalog: Config,
-    selected: String,
+    selected: ResolvedModel,
 ) -> anyhow::Result<()> {
     let history_path = config_path
         .parent()
@@ -754,11 +761,12 @@ mod tests {
     }
 
     #[test]
-    fn load_config_nonexistent_returns_default() {
+    fn load_config_nonexistent_uses_deepseek_first_run_default() {
         let path = std::path::Path::new("/tmp/does_not_exist_na_test_config_99999.toml");
         let config = load_config_or_default(path);
-        assert_eq!(config.provider.provider, Some("openai".to_string()));
-        assert_eq!(config.provider.model, Some("gpt-4o-mini".to_string()));
+        assert_eq!(config.provider.provider, Some("deepseek".to_string()));
+        assert_eq!(config.provider.model, Some("deepseek-flash".to_string()));
+        assert!(config.first_run);
         assert_eq!(config.provider.temperature, 0.7);
         assert!(config.memory.enabled);
         assert_eq!(config.security.mode, "direct");

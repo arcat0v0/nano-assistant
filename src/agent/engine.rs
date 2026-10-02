@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::streaming::StreamOutputEvent;
-use crate::config::{Config, SkillsConfig};
+use crate::config::{Config, ResolvedModel, SkillsConfig};
 use crate::mcp::{DeferredMcpToolSet, McpRegistry, McpToolWrapper, ToolSearchTool};
 use crate::memory::Memory;
 use crate::security::SecurityManager;
@@ -31,6 +31,12 @@ use crate::tools;
 pub struct TurnResult {
     pub response: String,
     pub tool_calls_count: usize,
+}
+
+/// The resolved selection and its legacy-compatible configuration projection.
+pub struct AgentModelContext {
+    pub selection: ResolvedModel,
+    pub config: Config,
 }
 
 #[derive(Debug)]
@@ -67,6 +73,7 @@ struct RuntimeState {
     skills: Vec<Skill>,
     system_info: Option<String>,
     config: Config,
+    active_model: ResolvedModel,
     config_path: PathBuf,
     security: Arc<SecurityManager>,
     deferred_names: Vec<String>,
@@ -92,6 +99,7 @@ impl RuntimeState {
             }
         };
         self.preamble = SystemPromptBuilder::build(&PromptContext {
+            model: &self.active_model,
             tools: &tools,
             config_path: &self.config_path,
             skills: &self.skills,
@@ -378,14 +386,18 @@ pub struct Agent {
 impl Agent {
     pub async fn new(
         model: ModelHandle,
+        model_context: AgentModelContext,
         tools: Vec<DynamicTool>,
         memory: Option<Arc<dyn Memory>>,
-        config: Config,
         skills: Vec<Skill>,
         system_info: Option<String>,
         security: Arc<SecurityManager>,
         config_path: PathBuf,
     ) -> Self {
+        let AgentModelContext {
+            selection: resolved_model,
+            config,
+        } = model_context;
         let handle = ToolServer::new().run();
         tools::register_builtin_tools(&handle).await;
         let mut state = RuntimeState {
@@ -393,6 +405,7 @@ impl Agent {
             skills,
             system_info,
             config: config.clone(),
+            active_model: resolved_model.clone(),
             config_path,
             security,
             deferred_names: Vec::new(),
@@ -420,7 +433,7 @@ impl Agent {
         state.preamble_dirty = false;
         let preamble = state.preamble.clone();
         let state = Arc::new(Mutex::new(state));
-        let rig = Self::build_rig(model, &config, &state, handle, &preamble);
+        let rig = Self::build_rig(model, &resolved_model, &config, &state, handle, &preamble);
         Self {
             rig,
             state,
@@ -434,6 +447,7 @@ impl Agent {
 
     fn build_rig(
         model: ModelHandle,
+        resolved_model: &ResolvedModel,
         config: &Config,
         state: &Arc<Mutex<RuntimeState>>,
         handle: ToolServerHandle,
@@ -441,23 +455,32 @@ impl Agent {
     ) -> rig::agent::Agent {
         AgentBuilder::from_model_handle(model)
             .preamble(preamble)
-            .temperature(config.provider.temperature)
+            .temperature(resolved_model.temperature)
             .default_max_turns(config.behavior.max_iterations)
             .add_hook(RuntimeHook(Arc::clone(state)))
             .tool_server_handle(handle)
             .build()
     }
 
-    pub async fn switch_model(&mut self, model: ModelHandle, config: &Config) {
+    pub async fn switch_model(
+        &mut self,
+        model: ModelHandle,
+        resolved_model: &ResolvedModel,
+        config: &Config,
+    ) {
         let mut state = self.state.lock().await;
+        state.config = config.clone();
+        state.active_model = resolved_model.clone();
+        state.refresh_preamble().await;
+        state.preamble_dirty = false;
         let rig = Self::build_rig(
             model,
+            resolved_model,
             config,
             &self.state,
             state.handle.clone(),
             &state.preamble,
         );
-        state.config = config.clone();
         self.rig = rig;
     }
 

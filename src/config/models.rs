@@ -6,6 +6,60 @@ use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::{Config, ModelProfile, ProviderConfig};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionSource {
+    CommandLine,
+    Environment,
+    SavedDefault,
+    LegacyConfig,
+    FirstRunDefault,
+    Session,
+}
+
+/// The single, resolved model selection used by the request builder and UI.
+/// Credentials are deliberately resolved separately and are never displayed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedModel {
+    pub profile_name: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub api_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub temperature: f64,
+    pub timeout_secs: u64,
+    pub source: SelectionSource,
+    pub allows_legacy_key: bool,
+    pub label: String,
+}
+
+impl ResolvedModel {
+    pub fn apply_to_config(&self, config: &Config) -> Config {
+        let mut effective = config.clone();
+        effective.provider = ProviderConfig {
+            api_key: self
+                .allows_legacy_key
+                .then(|| config.provider.api_key.clone())
+                .flatten(),
+            provider: Some(self.provider.clone()),
+            model: Some(self.model.clone()),
+            api_url: self.api_url.clone(),
+            temperature: self.temperature,
+            timeout_secs: self.timeout_secs,
+        };
+        effective
+    }
+
+    pub fn is_provider(&self, provider: &str) -> bool {
+        self.provider == provider
+    }
+
+    pub fn session_copy(&self) -> Self {
+        let mut resolved = self.clone();
+        resolved.source = SelectionSource::Session;
+        resolved
+    }
+}
+
 pub fn list_profiles(config: &Config) -> Vec<(&str, &ModelProfile)> {
     config
         .models
@@ -20,7 +74,7 @@ pub fn resolve_selection(
     profile: Option<&str>,
     model_id: Option<&str>,
     provider: Option<&str>,
-) -> anyhow::Result<(Config, String)> {
+) -> anyhow::Result<ResolvedModel> {
     if profile.is_some() && (model_id.is_some() || provider.is_some()) {
         bail!("a model profile cannot be combined with a model or provider override");
     }
@@ -28,18 +82,19 @@ pub fn resolve_selection(
         bail!("a provider override requires a model");
     }
 
-    let mut effective = config.clone();
-    effective.active_profile = None;
     if let Some(name) = profile {
-        return select_profile(effective, name);
+        return resolve_profile(config, name, SelectionSource::CommandLine);
     }
-    let (effective, label) = if let Some(name) = config.models.default.as_deref() {
-        select_profile(effective, name)?
+
+    let mut selected = if let Some(name) = config.models.default.as_deref() {
+        resolve_profile(config, name, SelectionSource::SavedDefault)?
+    } else if config.first_run {
+        resolve_root_provider(config, SelectionSource::FirstRunDefault, false, "default")
     } else {
-        (effective, "default".into())
+        resolve_root_provider(config, SelectionSource::LegacyConfig, true, "default")
     };
     if let Some(model) = model_id {
-        return select_model(effective, model, provider);
+        return override_model(selected, model, provider, SelectionSource::CommandLine);
     }
 
     let env_model = std::env::var("NA_MODEL").ok();
@@ -48,15 +103,29 @@ pub fn resolve_selection(
         bail!("NA_PROVIDER requires NA_MODEL");
     }
     if let Some(model) = env_model.as_deref() {
-        return select_model(effective, model, env_provider.as_deref());
+        selected = override_model(
+            selected,
+            model,
+            env_provider.as_deref(),
+            SelectionSource::Environment,
+        )?;
     }
 
-    Ok((effective, label))
+    Ok(selected)
 }
 
-fn select_profile(mut config: Config, name: &str) -> anyhow::Result<(Config, String)> {
+pub fn resolve_profile(
+    config: &Config,
+    name: &str,
+    source: SelectionSource,
+) -> anyhow::Result<ResolvedModel> {
     if name == "default" {
-        return Ok((config, "default".into()));
+        return Ok(resolve_root_provider(
+            config,
+            source,
+            !config.first_run,
+            "default",
+        ));
     }
     let profile = config
         .models
@@ -64,28 +133,58 @@ fn select_profile(mut config: Config, name: &str) -> anyhow::Result<(Config, Str
         .get(name)
         .with_context(|| format!("model profile '{name}' not found"))?;
     validate_profile(profile)?;
-    let selected = ProviderConfig {
-        api_key: None,
-        provider: Some(profile.provider.clone()),
-        model: Some(profile.model.clone()),
+    Ok(ResolvedModel {
+        profile_name: Some(name.into()),
+        provider: profile.provider.clone(),
+        model: profile.model.clone(),
         api_url: profile.api_url.clone(),
+        api_key_env: profile.api_key_env.clone(),
         temperature: profile
             .temperature
             .unwrap_or(super::schema::default_temperature()),
         timeout_secs: profile
             .timeout_secs
             .unwrap_or(super::schema::default_timeout()),
-    };
-    config.provider = selected;
-    config.active_profile = Some(name.into());
-    Ok((config, name.into()))
+        source,
+        allows_legacy_key: false,
+        label: name.into(),
+    })
 }
 
-fn select_model(
-    mut config: Config,
+fn resolve_root_provider(
+    config: &Config,
+    source: SelectionSource,
+    allows_legacy_key: bool,
+    label: &str,
+) -> ResolvedModel {
+    ResolvedModel {
+        profile_name: None,
+        provider: config
+            .provider
+            .provider
+            .clone()
+            .unwrap_or_else(|| "openai".into()),
+        model: config
+            .provider
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-4o-mini".into()),
+        api_url: config.provider.api_url.clone(),
+        api_key_env: None,
+        temperature: config.provider.temperature,
+        timeout_secs: config.provider.timeout_secs,
+        source,
+        allows_legacy_key,
+        label: label.into(),
+    }
+}
+
+fn override_model(
+    mut selected: ResolvedModel,
     model: &str,
     provider: Option<&str>,
-) -> anyhow::Result<(Config, String)> {
+    source: SelectionSource,
+) -> anyhow::Result<ResolvedModel> {
     if model.trim().is_empty() {
         bail!("model name must not be empty");
     }
@@ -93,21 +192,24 @@ fn select_model(
         if provider.trim().is_empty() {
             bail!("provider name must not be empty");
         }
-        if config.provider.provider.as_deref() != Some(provider) {
-            config.provider = ProviderConfig {
-                api_key: None,
-                provider: Some(provider.into()),
-                model: Some(model.into()),
-                api_url: None,
-                timeout_secs: super::schema::default_timeout(),
-                temperature: super::schema::default_temperature(),
-            };
-            config.active_profile = None;
-            return Ok((config, model.into()));
+        if selected.provider != provider {
+            selected.profile_name = None;
+            selected.provider = provider.into();
+            selected.model = model.into();
+            selected.api_url = None;
+            selected.api_key_env = None;
+            selected.temperature = super::schema::default_temperature();
+            selected.timeout_secs = super::schema::default_timeout();
+            selected.allows_legacy_key = false;
+            selected.source = source;
+            selected.label = model.into();
+            return Ok(selected);
         }
     }
-    config.provider.model = Some(model.into());
-    Ok((config, model.into()))
+    selected.model = model.into();
+    selected.source = source;
+    selected.label = model.into();
+    Ok(selected)
 }
 
 fn validate_profile(profile: &ModelProfile) -> anyhow::Result<()> {
@@ -334,29 +436,29 @@ mod tests {
         config.models.profiles.insert("work".into(), selected);
         config.models.default = Some("work".into());
 
-        let (effective, label) = resolve_selection(&config, None, None, None).unwrap();
-        assert_eq!(label, "work");
-        assert_eq!(effective.active_profile.as_deref(), Some("work"));
-        assert_eq!(effective.provider.provider.as_deref(), Some("anthropic"));
-        assert_eq!(effective.provider.model.as_deref(), Some("claude-custom"));
-        assert_eq!(effective.provider.api_key, None);
-        assert_eq!(effective.provider.api_url, None);
-        assert_eq!(effective.provider.temperature, 0.7);
-        assert_eq!(effective.provider.timeout_secs, 120);
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.label, "work");
+        assert_eq!(effective.profile_name.as_deref(), Some("work"));
+        assert_eq!(effective.provider, "anthropic");
+        assert_eq!(effective.model, "claude-custom");
+        assert!(!effective.allows_legacy_key);
+        assert_eq!(effective.api_url, None);
+        assert_eq!(effective.temperature, 0.7);
+        assert_eq!(effective.timeout_secs, 120);
         assert_eq!(config.provider.api_key.as_deref(), Some("legacy-secret"));
         let mut tailored = profile("compatible", "custom");
         tailored.api_url = Some("http://localhost:5000/v1".into());
         tailored.temperature = Some(0.2);
         tailored.timeout_secs = Some(30);
         config.models.profiles.insert("local".into(), tailored);
-        let (effective, _) = resolve_selection(&config, Some("local"), None, None).unwrap();
+        let effective = resolve_profile(&config, "local", SelectionSource::CommandLine).unwrap();
         assert_eq!(
-            effective.provider.api_url.as_deref(),
+            effective.api_url.as_deref(),
             Some("http://localhost:5000/v1")
         );
-        assert_eq!(effective.provider.temperature, 0.2);
-        assert_eq!(effective.provider.timeout_secs, 30);
-        assert!(effective.provider.api_key.is_none());
+        assert_eq!(effective.temperature, 0.2);
+        assert_eq!(effective.timeout_secs, 30);
+        assert!(!effective.allows_legacy_key);
     }
 
     #[test]
@@ -374,25 +476,26 @@ mod tests {
         std::env::set_var("NA_MODEL", "env-model");
         std::env::set_var("NA_PROVIDER", "gemini");
 
-        let (effective, label) = resolve_selection(&config, Some("work"), None, None).unwrap();
-        assert_eq!(label, "work");
-        assert_eq!(effective.provider.model.as_deref(), Some("claude"));
-        let (effective, label) =
+        let effective = resolve_selection(&config, Some("work"), None, None).unwrap();
+        assert_eq!(effective.label, "work");
+        assert_eq!(effective.model, "claude");
+        let effective =
             resolve_selection(&config, None, Some("cli-model"), Some("ollama")).unwrap();
-        assert_eq!(label, "cli-model");
-        assert_eq!(effective.provider.provider.as_deref(), Some("ollama"));
-        assert_eq!(effective.provider.api_key, None);
-        let (effective, label) = resolve_selection(&config, None, None, None).unwrap();
-        assert_eq!(label, "env-model");
-        assert_eq!(effective.provider.provider.as_deref(), Some("gemini"));
+        assert_eq!(effective.label, "cli-model");
+        assert_eq!(effective.provider, "ollama");
+        assert!(!effective.allows_legacy_key);
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.label, "env-model");
+        assert_eq!(effective.provider, "gemini");
         std::env::remove_var("NA_MODEL");
         std::env::remove_var("NA_PROVIDER");
-        let (_, label) = resolve_selection(&config, None, None, None).unwrap();
-        assert_eq!(label, "work");
-        let (effective, label) = resolve_selection(&config, Some("default"), None, None).unwrap();
-        assert_eq!(label, "default");
-        assert!(effective.active_profile.is_none());
-        assert_eq!(effective.provider.model.as_deref(), Some("gpt-4o-mini"));
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.label, "work");
+        let effective = resolve_selection(&config, Some("default"), None, None).unwrap();
+        assert_eq!(effective.label, "default");
+        assert!(effective.profile_name.is_none());
+        assert_eq!(effective.model, "gpt-4o-mini");
+        assert!(effective.allows_legacy_key);
     }
 
     #[test]
@@ -411,46 +514,40 @@ mod tests {
         config.models.profiles.insert("second".into(), saved);
         config.models.default = Some("second".into());
 
-        let (effective, label) = resolve_selection(&config, None, Some("temporary"), None).unwrap();
-        assert_eq!(label, "temporary");
-        assert_eq!(effective.provider.model.as_deref(), Some("temporary"));
-        assert_eq!(effective.provider.provider.as_deref(), Some("compatible"));
+        let effective = resolve_selection(&config, None, Some("temporary"), None).unwrap();
+        assert_eq!(effective.label, "temporary");
+        assert_eq!(effective.model, "temporary");
+        assert_eq!(effective.provider, "compatible");
         assert_eq!(
-            effective.provider.api_url.as_deref(),
+            effective.api_url.as_deref(),
             Some("https://saved.example/v1")
         );
-        assert_eq!(effective.provider.timeout_secs, 45);
-        assert_eq!(effective.active_profile.as_deref(), Some("second"));
-        assert!(effective.provider.api_key.is_none());
+        assert_eq!(effective.timeout_secs, 45);
+        assert_eq!(effective.profile_name.as_deref(), Some("second"));
+        assert!(!effective.allows_legacy_key);
 
         std::env::set_var("NA_MODEL", "environment-model");
-        let (effective, _) = resolve_selection(&config, None, None, None).unwrap();
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.model, "environment-model");
         assert_eq!(
-            effective.provider.model.as_deref(),
-            Some("environment-model")
-        );
-        assert_eq!(
-            effective.provider.api_url.as_deref(),
+            effective.api_url.as_deref(),
             Some("https://saved.example/v1")
         );
-        assert_eq!(effective.active_profile.as_deref(), Some("second"));
+        assert_eq!(effective.profile_name.as_deref(), Some("second"));
 
         std::env::set_var("NA_PROVIDER", "anthropic");
-        let (effective, _) = resolve_selection(&config, None, None, None).unwrap();
-        assert_eq!(effective.provider.provider.as_deref(), Some("anthropic"));
-        assert_eq!(
-            effective.provider.model.as_deref(),
-            Some("environment-model")
-        );
-        assert!(effective.provider.api_key.is_none());
-        assert!(effective.provider.api_url.is_none());
-        assert_eq!(effective.provider.timeout_secs, 120);
-        assert!(effective.active_profile.is_none());
-        let (effective, _) =
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.provider, "anthropic");
+        assert_eq!(effective.model, "environment-model");
+        assert!(!effective.allows_legacy_key);
+        assert!(effective.api_url.is_none());
+        assert_eq!(effective.timeout_secs, 120);
+        assert!(effective.profile_name.is_none());
+        let effective =
             resolve_selection(&config, None, Some("cli-model"), Some("openai")).unwrap();
-        assert_eq!(effective.provider.provider.as_deref(), Some("openai"));
-        assert!(effective.provider.api_url.is_none());
-        assert!(effective.active_profile.is_none());
+        assert_eq!(effective.provider, "openai");
+        assert!(effective.api_url.is_none());
+        assert!(effective.profile_name.is_none());
     }
 
     #[test]
@@ -490,9 +587,9 @@ mod tests {
             .models
             .profiles
             .insert("paid".into(), profile("openai", "gpt-4o"));
-        let (effective, label) = resolve_selection(&config, None, None, None).unwrap();
-        assert_eq!(label, "default");
-        assert_eq!(effective.provider.model.as_deref(), Some("free/community"));
+        let effective = resolve_selection(&config, None, None, None).unwrap();
+        assert_eq!(effective.label, "default");
+        assert_eq!(effective.model, "free/community");
     }
 
     #[test]

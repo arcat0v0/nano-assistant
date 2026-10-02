@@ -1171,7 +1171,13 @@ fn cli_switches_profile_between_turns_without_losing_tool_history() {
     let second_requests = second.finish();
     assert_success(&output);
     assert_eq!(first_requests.len(), 2);
+    assert!(first_requests[0]["messages"]
+        .to_string()
+        .contains("Model ID: local-test-model"));
     assert_eq!(second_requests[0]["model"], "second-model");
+    assert!(second_requests[0]["messages"]
+        .to_string()
+        .contains("Configured provider: compatible\\nModel ID: second-model"));
     assert!(second_requests[0]
         .to_string()
         .contains("First model answered."));

@@ -2,6 +2,7 @@ pub mod credentials;
 pub mod models;
 pub mod schema;
 
+pub use models::{ResolvedModel, SelectionSource};
 pub use schema::{
     BehaviorConfig, Config, HubConfig, McpConfig, McpServerConfig, McpTransport, MemoryConfig,
     ModelProfile, ModelsConfig, ProviderConfig, SecurityConfig, SkillsConfig,
@@ -30,7 +31,7 @@ pub fn load_config_or_default(path: &Path) -> Config {
             }
         }
     } else {
-        Config::default()
+        Config::first_run_default()
     }
 }
 
@@ -42,4 +43,31 @@ pub fn save_config(path: &Path, config: &Config) -> anyhow::Result<()> {
     let serialized = toml::to_string_pretty(config)?;
     std::fs::write(path, serialized)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_missing_config_gets_the_first_run_deepseek_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+
+        let fresh = load_config_or_default(&path);
+        assert!(fresh.first_run);
+        assert_eq!(fresh.provider.provider.as_deref(), Some("deepseek"));
+        assert_eq!(fresh.provider.model.as_deref(), Some("deepseek-flash"));
+
+        std::fs::write(
+            &path,
+            "[provider]\nprovider = 'openai'\nmodel = 'gpt-4o-mini'\napi_key = 'fixture-only'\n",
+        )
+        .unwrap();
+        let existing = load_config_or_default(&path);
+        assert!(!existing.first_run);
+        assert_eq!(existing.provider.provider.as_deref(), Some("openai"));
+        assert_eq!(existing.provider.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(existing.provider.api_key.as_deref(), Some("fixture-only"));
+    }
 }

@@ -6,7 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::PathBuf;
 
 /// Top-level configuration loaded from `config.toml`.
@@ -16,15 +15,12 @@ pub struct Config {
     #[serde(default)]
     pub provider: ProviderConfig,
 
-    /// In-memory credential for one selected provider; never serialized.
-    #[serde(skip)]
-    pub runtime_api_key: Option<RuntimeApiKey>,
-
     #[serde(default, skip_serializing_if = "ModelsConfig::is_empty")]
     pub models: ModelsConfig,
 
+    /// True only when no config file existed at startup; never persisted.
     #[serde(skip)]
-    pub active_profile: Option<String>,
+    pub first_run: bool,
 
     /// Memory backend configuration.
     #[serde(default)]
@@ -51,32 +47,17 @@ pub struct Config {
     pub hub: HubConfig,
 }
 
-#[derive(Clone)]
-pub struct RuntimeApiKey {
-    provider: String,
-    secret: String,
-}
-
-impl RuntimeApiKey {
-    pub fn new(provider: impl Into<String>, secret: impl Into<String>) -> Self {
+impl Config {
+    pub fn first_run_default() -> Self {
         Self {
-            provider: provider.into(),
-            secret: secret.into(),
+            first_run: true,
+            provider: ProviderConfig {
+                provider: Some("deepseek".into()),
+                model: Some("deepseek-flash".into()),
+                ..ProviderConfig::default()
+            },
+            ..Self::default()
         }
-    }
-
-    pub fn for_provider(&self, provider: &str) -> Option<&str> {
-        (self.provider == provider).then_some(self.secret.as_str())
-    }
-}
-
-impl fmt::Debug for RuntimeApiKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RuntimeApiKey")
-            .field("provider", &self.provider)
-            .field("secret", &"[REDACTED]")
-            .finish()
     }
 }
 
@@ -745,11 +726,11 @@ mod tests {
         assert_eq!(profile.api_url.as_deref(), Some("https://private.example"));
         assert_eq!(profile.temperature, Some(0.3));
         assert_eq!(profile.timeout_secs, Some(45));
-        config.active_profile = Some("private".into());
+        config.first_run = true;
         let output = toml::to_string(&config).unwrap();
-        assert!(!output.contains("active_profile"));
+        assert!(!output.contains("first_run"));
         let restored: Config = toml::from_str(&output).unwrap();
-        assert!(restored.active_profile.is_none());
+        assert!(!restored.first_run);
         assert_eq!(
             restored.models.profiles["private"].api_key_env,
             profile.api_key_env
