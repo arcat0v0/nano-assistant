@@ -55,7 +55,7 @@ pub fn dim_label(label: &str) -> String {
 ///
 /// Output:
 /// ```text
-///   ⏳ shell  uname -a   ✓
+///   ✓ shell · uname -a · result
 /// ```
 pub fn format_tool_call_line(name: &str, args_summary: &str, success: bool) -> String {
     let icon = if success {
@@ -66,35 +66,45 @@ pub fn format_tool_call_line(name: &str, args_summary: &str, success: bool) -> S
     let args_part = if args_summary.is_empty() {
         String::new()
     } else {
-        format!(" {}", tool_args(args_summary))
+        format!(" · {}", tool_args(&compact_text(args_summary)))
     };
-    format!(
-        "  {} {}{}  {}\n",
-        spinner_icon(),
-        tool_name(name),
-        args_part,
-        icon,
-    )
+    format!("  {icon} {}{args_part} · result\n", tool_name(name))
 }
 
 /// Format a tool-call-in-progress line (before execution).
 ///
 /// Output:
 /// ```text
-///   ⏳ shell  uname -a  ...
+///   ⏳ shell · uname -a
 /// ```
 pub fn format_tool_pending(name: &str, args_summary: &str) -> String {
     let args_part = if args_summary.is_empty() {
         String::new()
     } else {
-        format!(" {}", tool_args(args_summary))
+        format!(" · {}", tool_args(&compact_text(args_summary)))
     };
-    format!(
-        "  {} {}{}  {DIM}...{RESET}",
-        spinner_icon(),
-        tool_name(name),
-        args_part,
-    )
+    format!("  {} {}{args_part}", spinner_icon(), tool_name(name))
+}
+
+fn compact_text(text: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut output = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let part = if ch.is_control() {
+            ch.escape_default().to_string()
+        } else {
+            ch.to_string()
+        };
+        let part_width: usize = part.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+        if width + part_width > 95 {
+            output.push('…');
+            break;
+        }
+        output.push_str(&part);
+        width += part_width;
+    }
+    output
 }
 
 /// Build a short one-line summary of tool arguments for display.
@@ -107,7 +117,7 @@ pub fn format_tool_pending(name: &str, args_summary: &str) -> String {
 /// - Anything else → first string value found
 pub fn args_summary(tool_name: &str, args: &serde_json::Value) -> String {
     let key = match tool_name {
-        "shell" => "command",
+        "shell" | "pty_shell" => "command",
         "file_read" | "file_write" | "file_edit" => "path",
         "glob_search" | "content_search" => "pattern",
         _ => {
@@ -135,6 +145,23 @@ pub fn format_tool_summary(count: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn progress_is_compact_and_escapes_terminal_controls() {
+        let text = format_tool_pending("shell", &format!("echo\n\x1b[2J{}", "界".repeat(100)));
+        assert_eq!(text.lines().count(), 1);
+        assert!(!text.contains("\x1b[2J"));
+        assert!(text.contains('…'));
+        assert!(text.chars().count() < 150);
+    }
+
+    #[test]
+    fn completed_progress_has_only_a_final_status() {
+        let text = format_tool_call_line("shell", "", false);
+        assert!(text.contains('✗'));
+        assert!(!text.contains('⏳'));
+        assert!(text.contains("result"));
+    }
 
     #[test]
     fn args_summary_shell() {

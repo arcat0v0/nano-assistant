@@ -682,6 +682,9 @@ fn cli_streamed_file_edit_reports_tool_progress_only_on_stderr() {
         "{stderr}"
     );
     assert!(stderr.contains("result"), "{stderr}");
+    assert_eq!(stderr.matches("progress.txt").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("result").count(), 1, "{stderr}");
+    assert!(!stderr.contains("[tool]"), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Edit completed."));
     assert!(!stdout.contains("call_progress_edit") && !stdout.contains("ToolResult"));
@@ -725,6 +728,86 @@ fn cli_streamed_parallel_calls_preserve_both_results_and_ids() {
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&"call_stream_a"));
     assert!(ids.contains(&"call_stream_b"));
+}
+
+#[test]
+fn cli_default_turn_limit_allows_more_than_ten_rounds_without_duplicate_execution() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut responses = (0..12)
+        .map(|number| {
+            completion(
+                None,
+                vec![tool_call(
+                    &format!("round_{number}"),
+                    "shell",
+                    json!({"command":"printf x >> rounds.txt"}),
+                )],
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(completion(Some("完成。"), vec![]));
+    let endpoint = ScriptedEndpoint::start(responses);
+    let path = config(
+        temp.path(),
+        &endpoint.url,
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("max_iterations = 8\n", "");
+    std::fs::write(&path, text).unwrap();
+    let output = run_cli(temp.path(), &path, None, Some("执行十二轮写入"));
+    let requests = endpoint.finish();
+    assert_success(&output);
+    assert_eq!(requests.len(), 13);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("rounds.txt")).unwrap(),
+        "x".repeat(12)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("result").count(), 12, "{stderr}");
+    for number in 1..=12 {
+        assert_eq!(
+            stderr.matches(&format!("#{number} shell")).count(),
+            2,
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn cli_failed_tool_progress_reports_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let endpoint = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "failed",
+                "file_read",
+                json!({"path":temp.path().join("missing.txt")}),
+            )],
+        ),
+        completion(Some("Read failed."), vec![]),
+    ]);
+    let path = config(
+        temp.path(),
+        &endpoint.url,
+        false,
+        false,
+        "mode = \"direct\"",
+    );
+    let output = run_cli(temp.path(), &path, None, Some("Read the missing file"));
+    let requests = endpoint.finish();
+    assert_success(&output);
+    assert!(tool_result(&requests[1], "failed")
+        .to_string()
+        .contains("error"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains('✗'), "{stderr}");
+    assert_eq!(stderr.matches("#1 file_read").count(), 2, "{stderr}");
+    assert!(!stderr.contains('✓'), "{stderr}");
 }
 
 #[test]
@@ -1815,7 +1898,28 @@ async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation(
         assert!(!reviews[0]
             .to_string()
             .contains("PRIVATE_MEMORY_NOT_FOR_REVIEWER"));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("[y/N]"));
+        assert!(
+            stderr.contains("safe") && stderr.contains("bounded write requested by user"),
+            "{stderr}"
+        );
+        assert_eq!(stderr.matches("result").count(), 1, "{stderr}");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("bounded write requested by user")
+        );
+        let system = requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "system")
+            .unwrap();
+        assert!(system
+            .to_string()
+            .contains("Match the language of the current user message"));
+        assert!(reviews[0]
+            .to_string()
+            .contains("same language as user_request"));
         let payload = review_payload(&reviews[0]);
         assert_eq!(payload["user_request"], "Write reviewed to review-ok.txt");
         assert_eq!(payload["action"]["tool_name"], "shell");

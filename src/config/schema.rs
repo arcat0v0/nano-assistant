@@ -228,7 +228,7 @@ fn default_autonomy_level() -> String {
 /// Behavior configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BehaviorConfig {
-    /// Maximum tool-call iterations per user message. Default: 10.
+    /// Maximum tool-call iterations per user message. Default: 50.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
 
@@ -262,7 +262,7 @@ impl Default for BehaviorConfig {
 }
 
 fn default_max_iterations() -> usize {
-    10
+    50
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(config.security.autonomy_level, "review");
         assert!(config.security.allowed_tools.is_empty());
         assert!(config.security.blocked_tools.is_empty());
-        assert_eq!(config.behavior.max_iterations, 10);
+        assert_eq!(config.behavior.max_iterations, 50);
         assert!(config.behavior.streaming);
         assert!(config.behavior.verbose_errors);
         assert!(config.behavior.explain_tools);
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn behavior_config_default() {
         let b = BehaviorConfig::default();
-        assert_eq!(b.max_iterations, 10);
+        assert_eq!(b.max_iterations, 50);
         assert!(b.streaming);
         assert!(b.verbose_errors);
         assert!(b.explain_tools);
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(config.security.autonomy_level, "review");
         assert!(config.security.allowed_tools.is_empty());
         assert!(config.security.blocked_tools.is_empty());
-        assert_eq!(config.behavior.max_iterations, 10);
+        assert_eq!(config.behavior.max_iterations, 50);
         assert!(config.behavior.streaming);
         assert!(config.behavior.verbose_errors);
         assert!(config.behavior.explain_tools);

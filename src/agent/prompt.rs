@@ -30,6 +30,7 @@ impl SystemPromptBuilder {
     pub fn build(ctx: &PromptContext<'_>) -> String {
         let mut output = String::with_capacity(2048);
 
+        let language = "## Language\n\nMatch the language of the current user message for replies, progress updates, explanations, and any reasoning text you generate. Follow an explicit language preference when given. Keep commands, paths, identifiers, and quoted output unchanged. The language of these system instructions does not set the response language.";
         let datetime = build_datetime_section();
         let system_info = ctx
             .system_info
@@ -48,6 +49,7 @@ impl SystemPromptBuilder {
         let command_exec = build_command_execution_section();
 
         for section in [
+            language,
             &datetime,
             &system_info,
             &runtime_context,
@@ -365,6 +367,14 @@ mod tests {
             system_info: None,
             deferred_tool_names: &[],
         })
+    }
+
+    #[test]
+    fn system_prompt_follows_user_language_for_replies_and_reasoning() {
+        let text = prompt(&active_model("deepseek", "deepseek-flash"));
+        assert!(text.contains("Match the language of the current user message"));
+        assert!(text.contains("reasoning text"));
+        assert!(text.contains("explicit language preference"));
     }
 
     #[test]

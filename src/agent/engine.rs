@@ -11,7 +11,7 @@ use rig::agent::{
     ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig::message::{AssistantContent, Message, UserContent};
-use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
+use rig::streaming::StreamedAssistantContent;
 use rig::tool::{
     server::{ToolServer, ToolServerHandle},
     DynamicTool,
@@ -85,6 +85,8 @@ struct RuntimeState {
     preamble_dirty: bool,
     tool_descriptions: HashMap<String, Arc<str>>,
     builtin_file_read_active: bool,
+    progress_count: usize,
+    progress_calls: HashMap<String, usize>,
 }
 
 impl RuntimeState {
@@ -338,7 +340,20 @@ impl AgentHook for RuntimeHook {
             Err(error) => return ToolCallAction::skip(format!("Invalid tool arguments: {error}")),
         };
         let (security, description, exempt, prepared) = {
-            let state = self.0.lock().await;
+            let mut state = self.0.lock().await;
+            state.progress_count += 1;
+            let number = state.progress_count;
+            state
+                .progress_calls
+                .insert(event.internal_call_id.to_owned(), number);
+            let summary = crate::console::args_summary(event.tool_name, &args);
+            eprintln!(
+                "{}",
+                crate::console::format_tool_pending(
+                    &format!("#{number} {}", event.tool_name),
+                    &summary
+                )
+            );
             (
                 Arc::clone(&state.security),
                 state.tool_descriptions.get(event.tool_name).cloned(),
@@ -382,10 +397,21 @@ impl AgentHook for RuntimeHook {
         _ctx: &HookContext,
         event: ToolResultEvent<'_>,
     ) -> ToolResultAction {
+        let mut state = self.0.lock().await;
+        let name = state
+            .progress_calls
+            .remove(event.internal_call_id)
+            .map_or_else(
+                || event.tool_name.to_owned(),
+                |number| format!("#{number} {}", event.tool_name),
+            );
+        eprint!(
+            "{}",
+            crate::console::format_tool_call_line(&name, "", event.raw_result.is_success())
+        );
         if !event.raw_result.is_success() {
             return ToolResultAction::keep();
         }
-        let mut state = self.0.lock().await;
         if event.tool_name == "tool_search" {
             state.activate_deferred().await;
         } else if event.tool_name == "shell" {
@@ -462,6 +488,8 @@ impl Agent {
             preamble_dirty: false,
             tool_descriptions: HashMap::new(),
             builtin_file_read_active: true,
+            progress_count: 0,
+            progress_calls: HashMap::new(),
         };
         for tool in tools {
             state.add_tool(tool).await;
@@ -607,27 +635,14 @@ impl Agent {
                     on_chunk(StreamOutputEvent::Content(text.text));
                 }
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                    tool_call,
                     ..
                 }) => {
-                    let args = crate::console::args_summary(
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                    );
-                    on_chunk(StreamOutputEvent::Progress(format!(
-                        "{}\n",
-                        crate::console::format_tool_pending(&tool_call.function.name, &args)
-                    )));
-                }
-                MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult {
-                    tool_result,
-                    ..
-                }) => {
-                    on_chunk(StreamOutputEvent::Progress(format!(
-                        "  {} {} result\n",
-                        crate::console::dim_label("[tool]"),
-                        crate::console::tool_name(&tool_result.name)
-                    )));
+                    on_chunk(StreamOutputEvent::Progress(if visible {
+                        "\n".into()
+                    } else {
+                        String::new()
+                    }));
+                    visible = false;
                 }
                 MultiTurnStreamItem::ToolExecutionCommitted { .. } if visible => {
                     on_chunk(StreamOutputEvent::Clear);

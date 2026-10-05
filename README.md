@@ -347,7 +347,7 @@ whitelist = ["ls", "cat", "grep", "docker *", "systemctl status *"]
 
 [behavior]
 streaming = true             # 是否启用流式输出
-max_iterations = 10          # 每次用户消息的最大工具调用轮数
+max_iterations = 50          # 每次用户消息的最大工具调用轮数
 debug = false               # 是否输出 DEBUG 摘要到 stderr
 verbose_errors = true        # 是否显示详细错误信息
 explain_tools = true         # 是否在系统提示中包含工具使用说明

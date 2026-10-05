@@ -237,10 +237,12 @@ impl StreamPrinter {
     fn print_event(&mut self, event: StreamOutputEvent) {
         match event {
             StreamOutputEvent::Clear => {
+                self.accumulated.clear();
                 let _ = self.stderr.write_all(b"\n");
                 let _ = self.stderr.flush();
             }
             StreamOutputEvent::Progress(text) => {
+                self.accumulated.clear();
                 let _ = self.stderr.write_all(text.as_bytes());
                 let _ = self.stderr.flush();
             }
@@ -282,12 +284,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_printer_ignores_progress_for_accumulation() {
+    fn stream_printer_keeps_only_text_after_the_last_progress_boundary() {
         let mut printer = StreamPrinter::new();
         printer.print_event(StreamOutputEvent::Progress("tool: running...".into()));
         printer.print_event(StreamOutputEvent::Content("visible text".into()));
         printer.print_event(StreamOutputEvent::Progress("tool: done".into()));
-        assert_eq!(printer.take_accumulated(), "visible text");
+        printer.print_event(StreamOutputEvent::Content("final response".into()));
+        assert_eq!(printer.take_accumulated(), "final response");
     }
 
     #[test]

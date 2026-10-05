@@ -209,19 +209,24 @@ impl SecurityManager {
                     platform: std::env::consts::OS,
                 };
                 match reviewer.review(&request).await {
-                    Ok(outcome) if outcome.decision == ReviewDecision::Safe => {
-                        eprintln!("[security] Safety review: automatically approved");
-                        return Ok(());
-                    }
-                    Ok(outcome) => format!(
-                        "{}: {}",
-                        match outcome.decision {
+                    Ok(outcome) => {
+                        let decision = match outcome.decision {
                             ReviewDecision::Safe => "safe",
                             ReviewDecision::Risky => "risky",
                             ReviewDecision::Unknown => "unknown",
-                        },
-                        serde_json::to_string(&outcome.reason).expect("string serialization")
-                    ),
+                        };
+                        let status =
+                            format!("{decision}: {}", escape_terminal_controls(outcome.reason));
+                        if outcome.decision == ReviewDecision::Safe {
+                            eprintln!(
+                                "    {} auto · {} · {status}",
+                                crate::console::success_icon(),
+                                crate::console::tool_name(action.tool_name)
+                            );
+                            return Ok(());
+                        }
+                        status
+                    }
                     Err(error) => error.to_string(),
                 }
             }
@@ -229,7 +234,10 @@ impl SecurityManager {
             (_, true, _) => "MissingUserRequest".to_owned(),
             (_, _, Err(_)) => "UnavailableCwd".to_owned(),
         };
-        eprintln!("[security] Safety review: waiting for human confirmation");
+        eprintln!(
+            "    auto · {} · {status} · waiting for human confirmation",
+            crate::console::tool_name(action.tool_name)
+        );
         let prompt = escape_terminal_controls(format!(
             "{}; safety review: {status}",
             serde_json::to_string(action).map_err(|_| "Unable to serialize safety action")?

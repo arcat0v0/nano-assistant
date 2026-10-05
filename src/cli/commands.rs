@@ -765,7 +765,7 @@ mod tests {
         assert_eq!(config.provider.temperature, 0.7);
         assert!(config.memory.enabled);
         assert_eq!(config.security.mode, "auto");
-        assert_eq!(config.behavior.max_iterations, 10);
+        assert_eq!(config.behavior.max_iterations, 50);
         assert!(!config.behavior.debug);
         assert!(config.behavior.streaming);
     }
