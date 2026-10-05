@@ -7,9 +7,11 @@
 - Local model profiles, `na model` management commands, one-shot model overrides, and interactive `/model` switching with optional saved default. Switching retains conversation and tool state without inheriting credentials from another provider.
 - Built-in DeepSeek, Kimi, GLM, MiMo, and Qwen providers with authenticated live model discovery; `na model discover` and the interactive `/model add` wizard select online models and save local profiles without storing API keys. The wizard is available even when the previous default model cannot initialize.
 - Interactive `/` command palette with arrow-key selection and Right-arrow completion, plus a `/model` submenu for profile switching, provider addition, and optional default selection.
-- `na chat --mode auto` reviews every operation except the actual built-in file reader. Valid safe decisions auto-approve; uncertain, risky, failed, or timed-out reviews require fresh human confirmation. Skills review their expanded execution plans, and PTY/MCP operations use the same gate.
+- `na chat --mode auto` reviews every operation except the actual built-in file reader. Valid safe decisions auto-approve; failed or timed-out reviews require fresh human confirmation. Skills review their expanded execution plans, and PTY/MCP operations use the same gate.
+- The system prompt now requires dated, append-only backups under ~/Backup before irreversible changes to user or production data.
 - A session-fixed, isolated safety reviewer uses `security.review_profile` when explicitly configured, or the startup main model otherwise; it has no tools or shared conversation history.
 - MIT and Apache-2.0 license texts, included in newly built release archives, with licensing and safety disclaimers in the README.
+- Conversation sessions persist after every completed turn under the configuration directory; `/resume` in interactive mode lists past sessions (newest first, with model, timestamp, and message preview) and continues the selected one, while `/clear` starts a fresh session.
 
 ### Changed
 
@@ -23,6 +25,11 @@
 - Chat startup now stops on unreadable or malformed existing configuration, invalid selected security modes, and unusable explicitly configured safety models instead of silently falling back to direct execution.
 - Auto safety review is now the default for new and unspecified security configuration; explicitly configured modes and CLI overrides remain effective.
 - Default Auto preserves first-run DeepSeek and model-add onboarding when no usable main-model credential exists. Its implicit reviewer initializes from the first successfully configured main model before chat execution, without requiring a separate review profile.
+- Auto review now returns risky/unknown feedback to the main model for revised proposals, carrying up to two previous rejected actions and reasons into review. Only three consecutive non-approvals prompt for human confirmation; approval, a new user request, or human intervention resets the dialogue.
+- Auto safety review retries malformed reviewer replies up to twice before involving the user, returning the rejection reason and a snippet of the invalid reply so the reviewer can correct its output. Human confirmation is now required only after three consecutive unusable responses; request failures and timeouts still confirm immediately.
+- Auto safety review now scores actions on a 1-100 risk scale: 1-9 auto-approves, 10-49 returns to the main model for revision, 50-69 auto-approves only when the latest user message explicitly confirms the destructive scope, 70-89 always requires live human confirmation, and 90-100 is prohibited outright, even with human approval. Commands that modify or delete existing files under ~/Backup are always prohibited.
+- Review context sections are wrapped in per-request random boundary tokens so forged confirmations embedded in tool arguments or prior rejections cannot impersonate the genuine user_request section.
+- Tool calls render as bordered blocks (⚒ header, 🛡 review verdict, ✓/✗ result) with color-coded risk words, and confirmation prompts show a readable action summary behind a ⚠ [y/N] flag instead of a raw JSON dump.
 
 ### Fixed
 
@@ -30,6 +37,7 @@
 - Conversation history is trimmed by complete user turns so a retained tool result keeps its matching call.
 - Dynamic skill, knowledge, and MCP tool names now meet provider function-name rules without losing their original backend routing, preventing DeepSeek from rejecting requests containing dotted tool names.
 - The installer accepts release archives containing optional license files while rejecting unexpected paths and duplicate entries before replacing an existing installation.
+- The system prompt now states the reply-language rule as an absolute requirement and repeats it as the closing section, so Chinese requests no longer draw English final answers from smaller models after English-heavy tool output.
 
 ## v0.3.1 - 2026-04-13
 

@@ -39,10 +39,19 @@ pub fn error_icon() -> String {
     format!("{FG_RED}✗{RESET}")
 }
 
-/// Style for the tool-in-progress indicator: dim yellow ⏳.
 #[inline]
-pub fn spinner_icon() -> String {
-    format!("{FG_YELLOW}⏳{RESET}")
+pub fn green(text: &str) -> String {
+    format!("{FG_GREEN}{text}{RESET}")
+}
+
+#[inline]
+pub fn yellow(text: &str) -> String {
+    format!("{FG_YELLOW}{text}{RESET}")
+}
+
+#[inline]
+pub fn red(text: &str) -> String {
+    format!("{FG_RED}{text}{RESET}")
 }
 
 /// Dim prefix label like `[cli]`.
@@ -51,31 +60,40 @@ pub fn dim_label(label: &str) -> String {
     format!("{DIM}{FG_BRIGHT_BLACK}{label}{RESET}")
 }
 
-/// Format a single-line tool call summary.
+#[inline]
+pub fn review_note(text: &str) -> String {
+    format!("  {}  🛡 {text}", dim_label("│"))
+}
+
+#[inline]
+pub fn confirm_prompt() -> String {
+    format!("{BOLD}{FG_YELLOW}⚠ [y/N]{RESET}")
+}
+
+/// Format the closing line of a tool block.
 ///
 /// Output:
 /// ```text
-///   ✓ shell · uname -a · result
+///   ╰─ ✓ shell · result
 /// ```
-pub fn format_tool_call_line(name: &str, args_summary: &str, success: bool) -> String {
+pub fn format_tool_call_line(name: &str, _args_summary: &str, success: bool) -> String {
     let icon = if success {
         success_icon()
     } else {
         error_icon()
     };
-    let args_part = if args_summary.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", tool_args(&compact_text(args_summary)))
-    };
-    format!("  {icon} {}{args_part} · result\n", tool_name(name))
+    format!(
+        "  {} {icon} {} · result\n",
+        dim_label("╰─"),
+        dim_label(name)
+    )
 }
 
-/// Format a tool-call-in-progress line (before execution).
+/// Format the opening line of a tool block (before execution).
 ///
 /// Output:
 /// ```text
-///   ⏳ shell · uname -a
+///   ╭─ ⚒ shell · uname -a
 /// ```
 pub fn format_tool_pending(name: &str, args_summary: &str) -> String {
     let args_part = if args_summary.is_empty() {
@@ -83,7 +101,11 @@ pub fn format_tool_pending(name: &str, args_summary: &str) -> String {
     } else {
         format!(" · {}", tool_args(&compact_text(args_summary)))
     };
-    format!("  {} {}{args_part}", spinner_icon(), tool_name(name))
+    format!(
+        "  {} {}{args_part}",
+        dim_label("╭─"),
+        tool_name(&format!("⚒ {name}"))
+    )
 }
 
 fn compact_text(text: &str) -> String {
@@ -187,9 +209,40 @@ mod tests {
     #[test]
     fn format_tool_call_line_success() {
         let line = format_tool_call_line("shell", "ls -la", true);
+        assert!(line.contains("╰─"));
         assert!(line.contains("shell"));
-        assert!(line.contains("ls -la"));
         assert!(line.contains('\n'));
+    }
+
+    #[test]
+    fn pending_block_opens_with_header() {
+        let line = format_tool_pending("#1 shell", "ls -la");
+        assert!(line.contains("╭─"));
+        assert!(line.contains('⚒'));
+        assert!(line.contains("#1 shell"));
+        assert!(line.contains("ls -la"));
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    #[test]
+    fn review_note_sits_on_block_gutter() {
+        let line = review_note(&format!("{} · risk 4 · fine", green("safe")));
+        assert!(line.contains('│'));
+        assert!(line.contains('🛡'));
+        assert!(line.contains("safe"));
+    }
+
+    #[test]
+    fn verdict_words_carry_distinct_colors() {
+        assert!(green("safe").contains("\x1b[32m"));
+        assert!(yellow("uncertain").contains("\x1b[33m"));
+        assert!(red("blocked").contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn confirm_prompt_is_flagged() {
+        assert!(confirm_prompt().contains('⚠'));
+        assert!(confirm_prompt().contains("[y/N]"));
     }
 
     #[test]

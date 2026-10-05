@@ -726,6 +726,10 @@ impl Agent {
     pub fn history(&self) -> &[Message] {
         &self.history
     }
+    pub fn restore_history(&mut self, messages: Vec<Message>) {
+        self.history = messages;
+        self.trim_history();
+    }
     pub fn clear_history(&mut self) {
         self.history.clear();
     }

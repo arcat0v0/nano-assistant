@@ -320,7 +320,7 @@ fn tui_guides_addition_from_live_models_without_default_model_key() {
             "object": "chat.completion",
             "created": 1,
             "model": "deepseek-zeta",
-            "choices": [{"index":0,"message":{"role":"assistant","content":"{\"decision\":\"safe\",\"reason\":\"bounded requested write\"}"},"finish_reason":"stop"}],
+            "choices": [{"index":0,"message":{"role":"assistant","content":"{\"risk\":5,\"user_confirmed\":false,\"reason\":\"bounded requested write\"}"},"finish_reason":"stop"}],
         }).to_string()),
         (200, completion("deepseek-zeta")),
     ]);
@@ -353,14 +353,20 @@ fn tui_guides_addition_from_live_models_without_default_model_key() {
     assert!(review
         .get("tools")
         .is_none_or(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)));
-    let payload: Value =
-        serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
+    let content = review["messages"][1]["content"].as_str().unwrap();
+    let section = |name: &str| {
+        let marker = format!(": {name}>>>");
+        let open = content.find(&marker).expect("section opens");
+        let body = &content[open + marker.len() + 1..];
+        body[..body.find("\n<<<END ").expect("section closes")].to_string()
+    };
     assert_eq!(
-        payload["user_request"],
+        section("user_request"),
         "Write reviewed to onboarding-marker"
     );
+    let action: Value = serde_json::from_str(&section("action")).unwrap();
     assert_eq!(
-        payload["action"]["resolved"]["command"],
+        action["resolved"]["command"],
         "printf reviewed > onboarding-marker"
     );
     assert!(requests[3].body.as_ref().unwrap()["messages"]

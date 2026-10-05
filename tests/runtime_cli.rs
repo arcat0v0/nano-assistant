@@ -1801,9 +1801,22 @@ fn append_config(path: &Path, text: &str) {
         .unwrap();
 }
 
-fn review_response(decision: &str) -> (String, String) {
+fn review_response(word: &str) -> (String, String) {
+    let risk = match word {
+        "safe" => 5,
+        "unknown" => 30,
+        "risky" => 80,
+        other => panic!("unknown review fixture: {other}"),
+    };
+    review_scored(risk, false)
+}
+
+fn review_scored(risk: u8, user_confirmed: bool) -> (String, String) {
     completion(
-        Some(&json!({"decision":decision,"reason":"bounded write requested by user"}).to_string()),
+        Some(
+            &json!({"risk":risk,"user_confirmed":user_confirmed,"reason":"bounded write requested by user"})
+                .to_string(),
+        ),
         vec![],
     )
 }
@@ -1813,6 +1826,18 @@ fn auto_stream_call(id: &str, name: &str, args: Value) -> (String, String) {
         json!({"id":"auto-stream","object":"chat.completion.chunk","created":1,"model":"local-test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":null}]}),
         json!({"id":"auto-stream","object":"chat.completion.chunk","created":1,"model":"local-test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
     ])
+}
+
+fn review_section(content: &str, name: &str) -> String {
+    let marker = format!(": {name}>>>");
+    let open = content
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing section {name}: {content}"));
+    let body = &content[open + marker.len() + 1..];
+    let end = body
+        .find("\n<<<END ")
+        .unwrap_or_else(|| panic!("unterminated section {name}: {content}"));
+    body[..end].to_string()
 }
 
 fn review_payload(request: &Value) -> Value {
@@ -1830,14 +1855,21 @@ fn review_payload(request: &Value) -> Value {
     );
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[1]["role"], "user");
-    serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap()
+    let content = messages[1]["content"].as_str().unwrap();
+    json!({
+        "user_request": review_section(content, "user_request"),
+        "action": serde_json::from_str::<Value>(&review_section(content, "action")).unwrap(),
+        "cwd": review_section(content, "cwd"),
+        "platform": review_section(content, "platform"),
+        "previous_rejections": serde_json::from_str::<Value>(&review_section(content, "previous_rejections")).unwrap(),
+    })
 }
 
 fn assert_denied(request: &Value, id: &str) {
     assert!(
         tool_result(request, id)
             .to_string()
-            .contains("Execution denied by user after safety review"),
+            .contains("Execution denied"),
         "{request}"
     );
 }
@@ -1901,7 +1933,9 @@ async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation(
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("[y/N]"));
         assert!(
-            stderr.contains("safe") && stderr.contains("bounded write requested by user"),
+            stderr.contains("safe")
+                && stderr.contains("risk 5")
+                && !stderr.contains("bounded write requested by user"),
             "{stderr}"
         );
         assert_eq!(stderr.matches("result").count(), 1, "{stderr}");
@@ -1916,7 +1950,7 @@ async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation(
             .unwrap();
         assert!(system
             .to_string()
-            .contains("Match the language of the current user message"));
+            .contains("Always reply in the same language as the user's most recent message"));
         assert!(reviews[0]
             .to_string()
             .contains("same language as user_request"));
@@ -1932,27 +1966,81 @@ async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation(
 }
 
 #[test]
-fn cli_auto_risky_unknown_eof_and_non_y_require_current_confirmation() {
-    for decision in ["risky", "unknown"] {
+fn cli_auto_review_dialogue_revises_action_before_execution() {
+    for streaming in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut responses = Vec::new();
+        for (id, command) in [
+            ("rejected", "printf rejected > rejected-marker"),
+            ("revised", "printf revised > revised-marker"),
+        ] {
+            let args = json!({"command":command});
+            responses.push(if streaming {
+                auto_stream_call(id, "shell", args)
+            } else {
+                completion(None, vec![tool_call(id, "shell", args)])
+            });
+        }
+        responses.push(if streaming {
+            stream_completion("Finished.")
+        } else {
+            completion(Some("Finished."), vec![])
+        });
+        let main = ScriptedEndpoint::start(responses);
+        let review = AutoEndpoint::start(vec![review_scored(55, false), review_response("safe")]);
+        let path = auto_config(temp.path(), &main.url, &review.url, streaming);
+        let output = run_cli(temp.path(), &path, None, Some("Write revised-marker only"));
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert!(!temp.path().join("rejected-marker").exists());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("revised-marker")).unwrap(),
+            "revised"
+        );
+        let feedback = tool_result(&requests[1], "rejected").to_string();
+        assert!(
+            feedback.contains("bounded write requested by user"),
+            "{feedback}"
+        );
+        assert!(feedback.contains("1/3"), "{feedback}");
+        assert!(feedback.contains("Revise"), "{feedback}");
+        let history = review_payload(&reviews[1])["previous_rejections"].clone();
+        assert_eq!(
+            history[0]["action"]["args"]["command"],
+            "printf rejected > rejected-marker"
+        );
+        assert_eq!(history[0]["risk"], 55);
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn cli_auto_third_rejection_requires_current_confirmation() {
+    for risk in [30u8, 55u8] {
         for input in [Some("n\n"), Some("y\n"), Some("yes\n"), None] {
             let temp = tempfile::tempdir().unwrap();
-            let main = ScriptedEndpoint::start(vec![
-                completion(
+            let mut responses = Vec::new();
+            for id in ["first", "second", "write"] {
+                responses.push(completion(
                     None,
                     vec![tool_call(
-                        "write",
+                        id,
                         "shell",
                         json!({"command":"printf reviewed > marker"}),
                     )],
-                ),
-                completion(Some("Finished."), vec![]),
-            ]);
-            let review = AutoEndpoint::start(vec![review_response(decision)]);
+                ));
+            }
+            responses.push(completion(Some("Finished."), vec![]));
+            let main = ScriptedEndpoint::start(responses);
+            let review = AutoEndpoint::start((0..3).map(|_| review_scored(risk, false)).collect());
             let path = auto_config(temp.path(), &main.url, &review.url, false);
             let output = run_cli(temp.path(), &path, input, Some("Write reviewed to marker"));
             let requests = main.finish();
             review.finish();
             assert_success(&output);
+            assert_denied(&requests[1], "first");
+            assert_denied(&requests[2], "second");
             if input == Some("y\n") {
                 assert_eq!(
                     std::fs::read_to_string(temp.path().join("marker")).unwrap(),
@@ -1960,13 +2048,19 @@ fn cli_auto_risky_unknown_eof_and_non_y_require_current_confirmation() {
                 );
             } else {
                 assert!(!temp.path().join("marker").exists());
-                assert_denied(&requests[1], "write");
+                assert_denied(&requests[3], "write");
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let label = if risk <= 49 {
+                "uncertain"
+            } else {
+                "confirmable"
+            };
             assert!(
-                stderr.contains("shell") && stderr.contains(decision) && stderr.contains("[y/N]"),
+                stderr.contains("shell") && stderr.contains(label) && stderr.contains("[y/N]"),
                 "{stderr}"
             );
+            assert_eq!(stderr.matches("[y/N]").count(), 1, "{stderr}");
         }
     }
 }
@@ -1974,26 +2068,23 @@ fn cli_auto_risky_unknown_eof_and_non_y_require_current_confirmation() {
 #[test]
 fn cli_auto_previous_yes_does_not_authorize_next_tool() {
     let temp = tempfile::tempdir().unwrap();
-    let main = ScriptedEndpoint::start(vec![
-        completion(
+    let mut responses = Vec::new();
+    for (id, command) in [
+        ("first-1", "printf first > first"),
+        ("first-2", "printf first > first"),
+        ("first", "printf first > first"),
+        ("second-1", "printf second > second"),
+        ("second-2", "printf second > second"),
+        ("second", "printf second > second"),
+    ] {
+        responses.push(completion(
             None,
-            vec![tool_call(
-                "first",
-                "shell",
-                json!({"command":"printf first > first"}),
-            )],
-        ),
-        completion(
-            None,
-            vec![tool_call(
-                "second",
-                "shell",
-                json!({"command":"printf second > second"}),
-            )],
-        ),
-        completion(Some("Finished."), vec![]),
-    ]);
-    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("unknown")]);
+            vec![tool_call(id, "shell", json!({"command":command}))],
+        ));
+    }
+    responses.push(completion(Some("Finished."), vec![]));
+    let main = ScriptedEndpoint::start(responses);
+    let review = AutoEndpoint::start((0..6).map(|_| review_response("unknown")).collect());
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(
         temp.path(),
@@ -2002,28 +2093,39 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
         Some("Write the first and second markers"),
     );
     let requests = main.finish();
-    assert_eq!(review.finish().len(), 2);
+    let reviews = review.finish();
+    assert_eq!(
+        review_payload(&reviews[3])["previous_rejections"],
+        json!([])
+    );
     assert_success(&output);
     assert_eq!(
         std::fs::read_to_string(temp.path().join("first")).unwrap(),
         "first"
     );
     assert!(!temp.path().join("second").exists());
-    assert_denied(&requests[2], "second");
+    assert_denied(&requests[6], "second");
 }
 
 #[test]
 fn cli_auto_invalid_protocol_never_automatically_executes() {
     let mut responses = vec![
         completion(Some("{"), vec![]),
-        completion(Some(r#"{"decision":"maybe","reason":"uncertain"}"#), vec![]),
-        completion(Some(r#"{"decision":"safe","reason":"  "}"#), vec![]),
         completion(
-            Some(r#"{"decision":"safe","reason":"ok","extra":true}"#),
+            Some(r#"{"risk":"maybe","user_confirmed":false,"reason":"uncertain"}"#),
             vec![],
         ),
         completion(
-            Some("```json\n{\"decision\":\"safe\",\"reason\":\"ok\"}\n```"),
+            Some(r#"{"risk":5,"user_confirmed":false,"reason":"  "}"#),
+            vec![],
+        ),
+        completion(
+            Some(r#"{"risk":5,"user_confirmed":false,"reason":"ok","extra":true}"#),
+            vec![],
+        ),
+        completion(Some(r#"{"risk":5,"reason":"ok"}"#), vec![]),
+        completion(
+            Some("```json\n{\"risk\":5,\"user_confirmed\":false,\"reason\":\"ok\"}\n```"),
             vec![],
         ),
         completion(
@@ -2047,7 +2149,7 @@ fn cli_auto_invalid_protocol_never_automatically_executes() {
             ),
             completion(Some("Finished."), vec![]),
         ]);
-        let review = AutoEndpoint::start(vec![response]);
+        let review = AutoEndpoint::start(vec![response; 3]);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         let output = run_cli(temp.path(), &path, None, Some("Write marker"));
         let requests = main.finish();
@@ -2059,19 +2161,146 @@ fn cli_auto_invalid_protocol_never_automatically_executes() {
 }
 
 #[test]
+fn cli_auto_invalid_protocol_recovers_on_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "shell",
+                json!({"command":"printf recovered > marker"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![completion(Some("{"), vec![]), review_response("safe")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(temp.path(), &path, None, Some("Write recovered to marker"));
+    main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+        "recovered"
+    );
+    assert_eq!(reviews.len(), 2);
+    let retry = reviews[1]["messages"][1]["content"].as_str().unwrap();
+    assert!(retry.contains("rejected"), "{retry}");
+}
+
+#[test]
+fn cli_auto_confirmed_destructive_action_runs_without_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "shell",
+                json!({"command":"printf confirmed > marker"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_scored(55, true)]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(temp.path(), &path, None, Some("Delete the marker"));
+    main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+        "confirmed"
+    );
+    assert_eq!(reviews.len(), 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("confirmed by user"), "{stderr}");
+}
+
+#[test]
+fn cli_auto_severe_action_goes_straight_to_human_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "shell",
+                json!({"command":"printf gated > marker"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_scored(80, true)]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(temp.path(), &path, Some("y\n"), Some("Wipe the volume"));
+    main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+        "gated"
+    );
+    assert_eq!(reviews.len(), 1, "severe must not loop the reviewer");
+}
+
+#[test]
+fn cli_auto_prohibited_action_blocked_even_with_human_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "shell",
+                json!({"command":"printf forbidden > marker"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_scored(95, true)]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(temp.path(), &path, Some("y\n"), Some("Wipe the disk"));
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert!(!temp.path().join("marker").exists());
+    assert_denied(&requests[1], "write");
+    assert_eq!(reviews.len(), 1, "prohibited must not loop the reviewer");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"), "{stderr}");
+}
+
+#[test]
 fn cli_auto_network_timeout_and_provider_error_are_private_and_confirmable() {
-    for (delay, response, input) in [
-        (Duration::ZERO, None, None),
-        (Duration::from_millis(1300), Some((200, review_response("safe"))), Some("n\n")),
-        (Duration::ZERO, Some((401, ("application/json".into(), r#"{"error":{"message":"FAKE_CREDENTIAL_DO_NOT_LEAK","type":"authentication_error"}}"#.into()))), Some("y\n")),
-        (Duration::ZERO, Some((200, completion(Some("{"), vec![]))), Some("y\n")),
+    for (faults, input) in [
+        (vec![(Duration::ZERO, None)], None),
+        (
+            vec![(
+                Duration::from_millis(1300),
+                Some((200, review_response("safe"))),
+            )],
+            Some("n\n"),
+        ),
+        (
+            vec![(
+                Duration::ZERO,
+                Some((401, ("application/json".into(), r#"{"error":{"message":"FAKE_CREDENTIAL_DO_NOT_LEAK","type":"authentication_error"}}"#.into()))),
+            )],
+            Some("y\n"),
+        ),
+        (
+            vec![(Duration::ZERO, Some((200, completion(Some("{"), vec![])))); 3],
+            Some("y\n"),
+        ),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let main = ScriptedEndpoint::start(vec![
             completion(None, vec![tool_call("write", "shell", json!({"command":"printf reviewed > marker"}))]),
             completion(Some("Finished."), vec![]),
         ]);
-        let review = AutoEndpoint::with_faults(vec![(delay, response)]);
+        let review = AutoEndpoint::with_faults(faults);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         let output = run_cli(temp.path(), &path, input, Some("Write reviewed to marker"));
         let requests = main.finish();
@@ -2170,7 +2399,7 @@ fn cli_auto_shell_skill_reviews_expanded_command_even_when_named_read() {
     for (decision, input, allowed) in [
         ("unknown", Some("n\n"), false),
         ("safe", None, true),
-        ("unknown", Some("y\n"), true),
+        ("unknown", Some("y\n"), false),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let skills = temp.path().join("skills");
@@ -2780,9 +3009,8 @@ fn cli_auto_unspecified_review_profile_uses_independent_fixed_startup_model() {
             assert_eq!(messages.len(), 2);
             assert_eq!(messages[0]["role"], "system");
             assert_eq!(messages[1]["role"], "user");
-            let payload: Value =
-                serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
-            assert_eq!(payload["user_request"], user_request);
+            let content = messages[1]["content"].as_str().unwrap();
+            assert_eq!(review_section(content, "user_request"), user_request);
             assert!(!request.to_string().contains("Private first history."));
         }
         assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
@@ -2923,10 +3151,9 @@ fn cli_auto_default_reviews_when_mode_or_security_section_is_omitted() {
             );
             let requests = main.finish();
             assert_success(&output);
-            let payload: Value =
-                serde_json::from_str(requests[1]["messages"][1]["content"].as_str().unwrap())
-                    .unwrap();
-            assert_eq!(payload["action"]["tool_name"], "shell");
+            let content = requests[1]["messages"][1]["content"].as_str().unwrap();
+            let action: Value = serde_json::from_str(&review_section(content, "action")).unwrap();
+            assert_eq!(action["tool_name"], "shell");
             if decision == "safe" {
                 assert_eq!(
                     std::fs::read_to_string(temp.path().join("default-marker")).unwrap(),

@@ -44,7 +44,7 @@ const PROMPT: &str = "❯ ";
 type TuiEditor = Editor<PaletteHelper, DefaultHistory>;
 
 const SLASH_COMMANDS: &[&str] = &[
-    "/model", "/memory", "/help", "/clear", "/rescan", "/exit", "/quit",
+    "/model", "/memory", "/help", "/clear", "/rescan", "/resume", "/exit", "/quit",
 ];
 
 #[derive(Clone)]
@@ -355,6 +355,86 @@ fn choose_model_menu(
         Err(error) => Err(error.into()),
     }
 }
+fn display_stamp(compact: &str) -> String {
+    let bytes = compact.as_bytes();
+    if compact.len() == 15 && bytes[8] == b'-' {
+        format!(
+            "{}-{}-{} {}:{}",
+            &compact[0..4],
+            &compact[4..6],
+            &compact[6..8],
+            &compact[9..11],
+            &compact[11..13]
+        )
+    } else {
+        compact.to_string()
+    }
+}
+
+fn choose_session_menu(
+    editor: &mut TuiEditor,
+    state: &Arc<Mutex<PaletteState>>,
+    store: &crate::session::SessionStore,
+) -> Option<crate::session::StoredSession> {
+    let sessions = store.list();
+    if sessions.is_empty() {
+        println!("{}", dim("no previous sessions"));
+        return None;
+    }
+    {
+        let mut palette = state.lock();
+        palette.menu = Some(
+            sessions
+                .iter()
+                .map(|session| ModelMenuOption {
+                    label: format!(
+                        "{} · {} · {} ({} msgs)",
+                        display_stamp(&session.updated_at),
+                        session.model,
+                        session.preview,
+                        session.messages
+                    ),
+                    action: ModelMenuAction::Switch(session.id.clone()),
+                })
+                .collect(),
+        );
+        palette.selected = 0;
+        palette.accepted = None;
+        palette.active = true;
+    }
+    let result = editor.readline("Resume ❯ ");
+    let mut palette = state.lock();
+    let selected = palette.accepted.take();
+    let options = palette.menu.take().unwrap();
+    palette.active = false;
+    palette.filter.clear();
+    match result {
+        Ok(line) if matches!(line.trim(), "q" | "back" | "/cancel" | "cancel") => None,
+        Ok(line) if line.trim().is_empty() => match selected {
+            Some(PaletteSelection::Menu(index)) => {
+                let ModelMenuAction::Switch(id) = &options[index].action else {
+                    return None;
+                };
+                match store.load(id) {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        eprintln!("[tui] session load failed: {error:#}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        },
+        Ok(_) => {
+            println!(
+                "{}",
+                warn("use ↑ / ↓ and Enter to choose a session, or q to cancel")
+            );
+            None
+        }
+        Err(_) => None,
+    }
+}
 
 pub async fn run_tui(
     effective_config: Config,
@@ -374,8 +454,14 @@ pub async fn run_tui(
     editor.set_helper(Some(PaletteHelper {
         state: Arc::clone(&palette),
     }));
+
     bind_palette_keys(&mut editor, &palette);
     load_history(&mut editor, &history_path);
+
+    let session_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let session_store = crate::session::SessionStore::new(session_dir);
+    let mut session = session_store.start();
+    let mut pending_history: Option<Vec<rig::completion::Message>> = None;
 
     if io::stdin().is_terminal()
         && io::stdout().is_terminal()
@@ -424,6 +510,38 @@ pub async fn run_tui(
                 match handle_inline_command(&mut agent, line) {
                     InlineCommandResult::Handled => continue,
                     InlineCommandResult::Quit => break,
+                    InlineCommandResult::Cleared => {
+                        session = session_store.start();
+                        continue;
+                    }
+                    InlineCommandResult::Resume => {
+                        if !io::stdin().is_terminal() {
+                            println!("{}", warn("/resume requires an interactive terminal"));
+                            continue;
+                        }
+                        if let Some(stored) =
+                            choose_session_menu(&mut editor, &palette, &session_store)
+                        {
+                            let count = stored.messages.len();
+                            let stamp = display_stamp(&stored.updated_at);
+                            let preview = crate::session::preview_of(&stored.messages);
+                            match &mut agent {
+                                Some(agent) => agent.restore_history(stored.messages),
+                                None => pending_history = Some(stored.messages),
+                            }
+                            session = crate::session::ActiveSession {
+                                id: stored.id,
+                                created_at: stored.created_at,
+                            };
+                            println!(
+                                "{}",
+                                dim(&format!(
+                                    "resumed session from {stamp} · {count} messages · {preview}"
+                                ))
+                            );
+                        }
+                        continue;
+                    }
                     InlineCommandResult::Rescan => {
                         match rescan_system_info().await {
                             Ok(tool_count) => {
@@ -583,6 +701,12 @@ pub async fn run_tui(
                                 }
                             }
                         }
+                        if let Some(messages) = pending_history.take() {
+                            agent
+                                .as_mut()
+                                .expect("model just activated")
+                                .restore_history(messages);
+                        }
                         if let Err(error) = run_prompt(
                             agent.as_mut().expect("model just activated"),
                             prompt,
@@ -593,6 +717,13 @@ pub async fn run_tui(
                         .await
                         {
                             eprintln!("[tui] prompt failed: {error:#}");
+                        }
+                        if let Some(agent) = &agent {
+                            if let Err(error) =
+                                session_store.save(&session, &current_model.model, agent.history())
+                            {
+                                eprintln!("[tui] session save failed: {error:#}");
+                            }
                         }
                     }
                 }
@@ -927,6 +1058,8 @@ async fn run_prompt(
 enum InlineCommandResult<'a> {
     Handled,
     Quit,
+    Cleared,
+    Resume,
     Prompt(&'a str),
     Rescan,
     Model(ModelCommand<'a>),
@@ -971,8 +1104,9 @@ fn handle_inline_command<'a>(agent: &mut Option<Agent>, line: &'a str) -> Inline
             }
             clear_terminal();
             println!("{}", dim("conversation history cleared"));
-            InlineCommandResult::Handled
+            InlineCommandResult::Cleared
         }
+        "resume" | "/resume" => InlineCommandResult::Resume,
         "/help" => {
             print_help();
             InlineCommandResult::Handled
@@ -1281,6 +1415,10 @@ fn print_help() {
     );
     println!("  {}  show current MEMORY.md contents", accent("/memory"));
     println!(
+        "  {} resume a previous conversation session",
+        accent("/resume")
+    );
+    println!(
         "  {}  browse models, profiles, and providers",
         accent("/model")
     );
@@ -1420,11 +1558,24 @@ mod tests {
         let mut agent = None;
         assert!(matches!(
             handle_inline_command(&mut agent, "/clear"),
-            InlineCommandResult::Handled
+            InlineCommandResult::Cleared
         ));
         assert!(matches!(
             handle_inline_command(&mut agent, "clear"),
-            InlineCommandResult::Handled
+            InlineCommandResult::Cleared
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_command_is_recognized() {
+        let mut agent = None;
+        assert!(matches!(
+            handle_inline_command(&mut agent, "/resume"),
+            InlineCommandResult::Resume
+        ));
+        assert!(matches!(
+            handle_inline_command(&mut agent, "resume"),
+            InlineCommandResult::Resume
         ));
     }
 

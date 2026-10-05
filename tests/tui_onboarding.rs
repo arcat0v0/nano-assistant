@@ -695,22 +695,38 @@ fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
 }
 
 #[test]
-fn tui_auto_unknown_requires_current_confirmation() {
+fn tui_auto_third_rejection_requires_current_confirmation() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("review-marker.txt");
     let command = "printf reviewed > review-marker.txt";
     let main = QueuedCompletionFixture::start(vec![
+        queued_stream(None, "deny_first", Some(command)),
+        queued_stream(None, "deny_second", Some(command)),
         queued_stream(None, "call_deny", Some(command)),
         queued_stream(Some("First operation denied."), "", None),
+        queued_stream(None, "allow_first", Some(command)),
+        queued_stream(None, "allow_second", Some(command)),
         queued_stream(None, "call_allow", Some(command)),
         queued_stream(Some("Second operation completed."), "", None),
     ]);
     let reviewer = QueuedCompletionFixture::start(vec![
         queued_completion(
-            r#"{"decision":"unknown","reason":"first action requires current approval"}"#,
+            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
         ),
         queued_completion(
-            r#"{"decision":"unknown","reason":"second action requires current approval"}"#,
+            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
+        ),
+        queued_completion(
+            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
+        ),
+        queued_completion(
+            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
+        ),
+        queued_completion(
+            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
+        ),
+        queued_completion(
+            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
         ),
     ]);
     let config_path = temp.path().join("assistant.toml");
@@ -727,7 +743,6 @@ fn tui_auto_unknown_requires_current_confirmation() {
     let first_start = terminal.output.len();
     terminal.send("Write reviewed into review-marker.txt for the first task.\r");
     terminal.until_from("[y/N]", first_start);
-    terminal.until_from("first action requires current approval", first_start);
     terminal.until_from("shell", first_start);
     terminal.until_from(command, first_start);
     assert!(!marker.exists());
@@ -740,7 +755,6 @@ fn tui_auto_unknown_requires_current_confirmation() {
     let second_start = terminal.output.len();
     terminal.send("Write reviewed into review-marker.txt for the second task.\r");
     terminal.until_from("[y/N]", second_start);
-    terminal.until_from("second action requires current approval", second_start);
     terminal.until_from("shell", second_start);
     terminal.until_from(command, second_start);
     assert!(!marker.exists());
@@ -753,22 +767,23 @@ fn tui_auto_unknown_requires_current_confirmation() {
     assert!(terminal.terminal_restored(), "{}", terminal.text());
 
     let main_requests = main.finish();
-    assert_eq!(main_requests.len(), 4);
+    assert_eq!(main_requests.len(), 8);
     for request in &main_requests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         assert_eq!(request.body.as_ref().unwrap()["stream"], true);
     }
-    let denied_result = main_requests[1].body.as_ref().unwrap()["messages"]
+    let denied_result = main_requests[3].body.as_ref().unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
+        .rev()
         .find(|message| message["role"] == "tool")
         .expect("main model should receive the denied tool result");
     assert!(denied_result["content"]
         .to_string()
-        .contains("Execution denied by user after safety review"));
-    let allowed_result = main_requests[3].body.as_ref().unwrap()["messages"]
+        .contains("Execution denied"));
+    let allowed_result = main_requests[7].body.as_ref().unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
@@ -778,8 +793,11 @@ fn tui_auto_unknown_requires_current_confirmation() {
     assert!(!allowed_result["content"].to_string().contains("denied"));
 
     let review_requests = reviewer.finish();
-    assert_eq!(review_requests.len(), 2);
-    for (request, task) in review_requests.iter().zip(["first", "second"]) {
+    assert_eq!(review_requests.len(), 6);
+    for (request, task) in review_requests
+        .iter()
+        .zip(["first", "first", "first", "second", "second", "second"])
+    {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         let body = request.body.as_ref().unwrap();
@@ -791,14 +809,79 @@ fn tui_auto_unknown_requires_current_confirmation() {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
-        let payload: serde_json::Value =
-            serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
+        let content = messages[1]["content"].as_str().unwrap();
+        let section = |name: &str| {
+            let marker = format!(": {name}>>>");
+            let open = content.find(&marker).expect("section opens");
+            let body = &content[open + marker.len() + 1..];
+            body[..body.find("\n<<<END ").expect("section closes")].to_string()
+        };
         assert_eq!(
-            payload["user_request"],
+            section("user_request"),
             format!("Write reviewed into review-marker.txt for the {task} task.")
         );
-        assert_eq!(payload["action"]["tool_name"], "shell");
-        assert_eq!(payload["action"]["args"]["command"], command);
-        assert_eq!(payload["action"]["resolved"]["command"], command);
+        let action: serde_json::Value = serde_json::from_str(&section("action")).unwrap();
+        assert_eq!(action["tool_name"], "shell");
+        assert_eq!(action["args"]["command"], command);
+        assert_eq!(action["resolved"]["command"], command);
     }
+}
+
+#[test]
+fn tui_resume_restores_saved_session_into_next_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = QueuedCompletionFixture::start(vec![
+        queued_stream(Some("First answer."), "", None),
+        queued_stream(Some("Second answer."), "", None),
+    ]);
+    let config_path = temp.path().join("assistant.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[provider]\nprovider='compatible'\nmodel='local-test-model'\napi_url='{}'\n\n[behavior]\nstreaming=true\nmax_iterations=8\n\n[security]\nmode='direct'\n\n[skills]\nenabled=false\n\n[memory]\nenabled=false\n\n[hub]\nenabled=false\n",
+            main.base_url
+        ),
+    )
+    .unwrap();
+    let sessions = temp.path().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("20261001-090000-deadbeef.json"),
+        r#"{"id":"20261001-090000-deadbeef","created_at":"20261001-090000","updated_at":"20261001-090000","model":"local-test-model","messages":[{"role":"user","content":[{"type":"text","text":"UNIQUE_HISTORY_MARKER"}]},{"role":"assistant","content":[{"type":"text","text":"stored reply"}]}]}"#,
+    )
+    .unwrap();
+
+    let mut terminal = Terminal::start(temp.path(), &config_path, None);
+    terminal.until("❯ ");
+    let first_start = terminal.output.len();
+    terminal.send("hello there\r");
+    terminal.until_from("First answer.", first_start);
+    terminal.until_from("❯ ", first_start);
+
+    let resume_start = terminal.output.len();
+    terminal.send("/resume\r");
+    terminal.until_from("UNIQUE_HISTORY_MARKER", resume_start);
+    terminal.send("\x1b[B\r");
+    terminal.until_from("resumed session", resume_start);
+
+    let second_start = terminal.output.len();
+    terminal.send("again\r");
+    terminal.until_from("Second answer.", second_start);
+    terminal.until_from("❯ ", second_start);
+    terminal.send("/exit\r");
+    wait_for_exit(&mut terminal);
+    assert!(terminal.terminal_restored(), "{}", terminal.text());
+
+    let requests = main.finish();
+    assert_eq!(requests.len(), 2);
+    let first_body = requests[0].body.as_ref().unwrap().to_string();
+    assert!(
+        !first_body.contains("UNIQUE_HISTORY_MARKER"),
+        "fresh session must not contain the stored history: {first_body}"
+    );
+    let second_body = requests[1].body.as_ref().unwrap().to_string();
+    assert!(
+        second_body.contains("UNIQUE_HISTORY_MARKER"),
+        "resumed history must reach the model: {second_body}"
+    );
 }

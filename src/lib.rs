@@ -10,6 +10,7 @@ pub mod platform;
 pub mod providers;
 pub mod render;
 pub mod security;
+pub mod session;
 pub mod skills;
 pub mod system_info;
 pub mod tools;

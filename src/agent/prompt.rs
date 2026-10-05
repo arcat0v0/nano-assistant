@@ -30,7 +30,8 @@ impl SystemPromptBuilder {
     pub fn build(ctx: &PromptContext<'_>) -> String {
         let mut output = String::with_capacity(2048);
 
-        let language = "## Language\n\nMatch the language of the current user message for replies, progress updates, explanations, and any reasoning text you generate. Follow an explicit language preference when given. Keep commands, paths, identifiers, and quoted output unchanged. The language of these system instructions does not set the response language.";
+        let language = "## Language\n\nAlways reply in the same language as the user's most recent message; never default to English. This applies to final answers, progress updates, explanations, and any reasoning text you generate. Follow an explicit language preference when given. Keep commands, paths, identifiers, and quoted output in their original form. The language of these system instructions does not set the response language.";
+        let language_reminder = "## Language Reminder\n\nReply in the language of the user's most recent message (for example, Chinese in, Chinese out), regardless of the language of these instructions, tool output, or earlier conversation.";
         let datetime = build_datetime_section();
         let system_info = ctx
             .system_info
@@ -43,6 +44,7 @@ impl SystemPromptBuilder {
         let skills = build_skills_section(ctx);
         let deferred = build_deferred_tools_section(ctx);
         let safety = build_safety_section();
+        let backup = build_backup_section();
 
         let self_management = build_self_management_section(ctx.config_path);
 
@@ -59,8 +61,10 @@ impl SystemPromptBuilder {
             &skills,
             &deferred,
             &safety,
+            backup,
             &self_management,
             &command_exec,
+            language_reminder,
         ] {
             if section.trim().is_empty() {
                 continue;
@@ -71,6 +75,10 @@ impl SystemPromptBuilder {
 
         output
     }
+}
+
+fn build_backup_section() -> &'static str {
+    "## Backup Policy\n\nBefore any irreversible change to user or production data, copy the affected files into a dated directory under ~/Backup (for example ~/Backup/2026-10-05/). ~/Backup is append-only: add new files only, and never modify, move, or delete anything already inside it."
 }
 
 fn build_model_identity_section(model: &ResolvedModel) -> String {
@@ -103,7 +111,7 @@ fn build_datetime_section() -> String {
 
 /// Convert days since Unix epoch to (year, month, day).
 /// Algorithm from http://howardhinnant.github.io/date_algorithms.html
-fn days_to_date(days_since_epoch: u64) -> (i32, u32, u32) {
+pub(crate) fn days_to_date(days_since_epoch: u64) -> (i32, u32, u32) {
     let z = days_since_epoch as i64 + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
@@ -372,9 +380,30 @@ mod tests {
     #[test]
     fn system_prompt_follows_user_language_for_replies_and_reasoning() {
         let text = prompt(&active_model("deepseek", "deepseek-flash"));
-        assert!(text.contains("Match the language of the current user message"));
+        assert!(
+            text.contains("Always reply in the same language as the user's most recent message")
+        );
+        assert!(text.contains("never default to English"));
         assert!(text.contains("reasoning text"));
         assert!(text.contains("explicit language preference"));
+        let reminder = text
+            .rfind("## Language Reminder")
+            .expect("closing language reminder");
+        assert!(text[reminder..].contains("Chinese in, Chinese out"));
+        assert_eq!(
+            text[reminder..].matches("## ").count(),
+            1,
+            "language reminder must be the final section"
+        );
+    }
+
+    #[test]
+    fn system_prompt_defines_append_only_backup_policy() {
+        let text = prompt(&active_model("deepseek", "deepseek-flash"));
+        assert!(text.contains("## Backup Policy"));
+        assert!(text.contains("~/Backup/2026-"));
+        assert!(text.contains("append-only"));
+        assert!(text.contains("never modify, move, or delete"));
     }
 
     #[test]
