@@ -240,6 +240,8 @@ class ReleasePublisher:
         except ApiError as error:
             if error.status != 404:
                 raise
+            release = None
+        if release is None:
             values = {
                 "tag_name": tag,
                 "target_commitish": commit,
