@@ -185,7 +185,9 @@ fi
 
 [ "$(tar tzf "$TMP_DIR/$ARTIFACT")" = na ] || fatal "archive must contain only the na executable"
 tar xzf "$TMP_DIR/$ARTIFACT" --no-same-owner -C "$TMP_DIR"
-[ -f "$TMP_DIR/na" ] && [ ! -L "$TMP_DIR/na" ] || fatal "invalid executable in archive"
+if [ ! -f "$TMP_DIR/na" ] || [ -L "$TMP_DIR/na" ]; then
+    fatal "invalid executable in archive"
+fi
 mkdir -p "$INSTALL_DIR"
 STAGED_BINARY=$(mktemp "$INSTALL_DIR/.na.XXXXXX")
 install -m 0755 "$TMP_DIR/na" "$STAGED_BINARY"
