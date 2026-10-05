@@ -88,7 +88,13 @@ def prepare_bundle(dist: Path, tag: str, commit: str, installer: Path) -> dict:
             raise ReleaseError(f"invalid build checksum: {name}")
         with tarfile.open(path, "r:gz") as tar:
             members = tar.getmembers()
-            if len(members) != 1 or members[0].name != "na" or not members[0].isfile():
+            names = [member.name for member in members]
+            if (
+                names.count("na") != 1
+                or len(names) != len(set(names))
+                or not set(names) <= {"na", "LICENSE-MIT", "LICENSE-APACHE"}
+                or not all(member.isfile() for member in members)
+            ):
                 raise ReleaseError(f"invalid build archive: {name}")
     if installer.resolve() != (dist / "install.sh").resolve():
         shutil.copyfile(installer, dist / "install.sh")

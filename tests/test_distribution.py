@@ -26,7 +26,7 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def archive(version="0.3.2", executable=True):
+def archive(version="0.3.2", executable=True, extra_files=None):
     payload = f"#!/bin/sh\nprintf 'na {version}\\n'\n".encode()
     if not executable:
         payload = b"invalid executable\n"
@@ -36,6 +36,10 @@ def archive(version="0.3.2", executable=True):
         entry.size = len(payload)
         entry.mode = 0o755
         tar.addfile(entry, io.BytesIO(payload))
+        for name, content in (extra_files or {}).items():
+            entry = tarfile.TarInfo(name)
+            entry.size = len(content)
+            tar.addfile(entry, io.BytesIO(content))
     return output.getvalue()
 
 
@@ -227,6 +231,36 @@ class DistributionServer:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_archive_with_dual_licenses_installs(self):
+        data = archive(extra_files={
+            "LICENSE-MIT": b"MIT license\n",
+            "LICENSE-APACHE": b"Apache license\n",
+        })
+        self.server.files[f"/custom/download/v0.3.2/{ARTIFACT}"] = data
+        self.server.files[f"/custom/download/v0.3.2/{ARTIFACT}.sha256"] = (
+            f"{digest(data)}  {ARTIFACT}\n".encode()
+        )
+        result = self.install(
+            NA_BASE_URL=self.server.base + "/custom", NA_VERSION="0.3.2"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("na 0.3.2", self.binary.read_text())
+        self.assertEqual(self.config.read_text(), "existing configuration")
+
+    def test_unexpected_archive_entries_preserve_existing_installation(self):
+        for name in ("extra.sh", "../escaped", "na", "LICENSE-MIT/extra"):
+            with self.subTest(name=name):
+                data = archive(extra_files={name: b"unexpected\n"})
+                self.server.files[f"/custom/download/v0.3.2/{ARTIFACT}"] = data
+                self.server.files[f"/custom/download/v0.3.2/{ARTIFACT}.sha256"] = (
+                    f"{digest(data)}  {ARTIFACT}\n".encode()
+                )
+                result = self.install(
+                    NA_BASE_URL=self.server.base + "/custom", NA_VERSION="0.3.2"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.binary.read_text(), "old installation")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -532,7 +566,10 @@ class ReleaseTests(unittest.TestCase):
         self.dist = Path(self.temp.name)
         for target in TARGETS:
             name = f"na-{target}.tar.gz"
-            data = archive()
+            data = archive(extra_files={
+                "LICENSE-MIT": (ROOT / "LICENSE-MIT").read_bytes(),
+                "LICENSE-APACHE": (ROOT / "LICENSE-APACHE").read_bytes(),
+            })
             (self.dist / name).write_bytes(data)
             (self.dist / (name + ".sha256")).write_text(f"{digest(data)}  {name}\n")
         self.server = self.enterContext(DistributionServer())
@@ -559,6 +596,17 @@ class ReleaseTests(unittest.TestCase):
         (self.dist / ARTIFACT).write_bytes(b"corrupted")
         with self.assertRaises(self.module.ReleaseError):
             self.prepare()
+
+    def test_prepare_rejects_unexpected_and_duplicate_archive_entries(self):
+        for name in ("extra.sh", "../escaped", "na", "LICENSE-MIT/extra"):
+            with self.subTest(name=name):
+                data = archive(extra_files={name: b"unexpected\n"})
+                (self.dist / ARTIFACT).write_bytes(data)
+                (self.dist / (ARTIFACT + ".sha256")).write_text(
+                    f"{digest(data)}  {ARTIFACT}\n"
+                )
+                with self.assertRaises(self.module.ReleaseError):
+                    self.prepare()
 
     def test_both_platforms_receive_same_bundle_and_retries_are_idempotent(self):
         self.prepare()

@@ -181,8 +181,13 @@ if [ -f "$TMP_DIR/manifest.json" ]; then
     done
 fi
 
-[ "$(tar tzf "$TMP_DIR/$ARTIFACT")" = na ] || fatal "archive must contain only the na executable"
-tar xzf "$TMP_DIR/$ARTIFACT" --no-same-owner -C "$TMP_DIR"
+ARCHIVE_CONTENTS=$(tar tzf "$TMP_DIR/$ARTIFACT") || fatal "cannot read archive"
+printf '%s\n' "$ARCHIVE_CONTENTS" | awk '
+    $0 != "na" && $0 != "LICENSE-MIT" && $0 != "LICENSE-APACHE" { invalid = 1 }
+    ++seen[$0] > 1 { invalid = 1 }
+    END { exit (invalid || seen["na"] != 1) }
+' || fatal "archive must contain na and only optional license files"
+tar xzf "$TMP_DIR/$ARTIFACT" --no-same-owner -C "$TMP_DIR" na
 [ -f "$TMP_DIR/na" ] && [ ! -L "$TMP_DIR/na" ] || fatal "invalid executable in archive"
 mkdir -p "$INSTALL_DIR"
 STAGED_BINARY=$(mktemp "$INSTALL_DIR/.na.XXXXXX")

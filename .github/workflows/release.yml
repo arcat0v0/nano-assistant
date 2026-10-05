@@ -197,7 +197,7 @@ jobs:
         if: steps.previous.outcome != 'success'
         run: |
           set -euo pipefail
-          tar czf "na-${{ matrix.name }}.tar.gz" -C "target/${{ matrix.target }}/release" na
+          tar czf "na-${{ matrix.name }}.tar.gz" LICENSE-MIT LICENSE-APACHE -C "target/${{ matrix.target }}/release" na
           sha256sum "na-${{ matrix.name }}.tar.gz" > "na-${{ matrix.name }}.tar.gz.sha256"
 
       - name: Upload artifact

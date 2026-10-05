@@ -9,6 +9,7 @@
 - Interactive `/` command palette with arrow-key selection and Right-arrow completion, plus a `/model` submenu for profile switching, provider addition, and optional default selection.
 - `na chat --mode auto` reviews every operation except the actual built-in file reader. Valid safe decisions auto-approve; uncertain, risky, failed, or timed-out reviews require fresh human confirmation. Skills review their expanded execution plans, and PTY/MCP operations use the same gate.
 - A session-fixed, isolated safety reviewer uses `security.review_profile` when explicitly configured, or the startup main model otherwise; it has no tools or shared conversation history.
+- MIT and Apache-2.0 license texts, included in newly built release archives, with licensing and safety disclaimers in the README.
 
 ### Changed
 
@@ -28,6 +29,7 @@
 - Tool-edit failures preserve actionable error feedback without modifying files; duplicate matches still require a unique replacement.
 - Conversation history is trimmed by complete user turns so a retained tool result keeps its matching call.
 - Dynamic skill, knowledge, and MCP tool names now meet provider function-name rules without losing their original backend routing, preventing DeepSeek from rejecting requests containing dotted tool names.
+- The installer accepts release archives containing optional license files while rejecting unexpected paths and duplicate entries before replacing an existing installation.
 
 ## v0.3.1 - 2026-04-13
 
