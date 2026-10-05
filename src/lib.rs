@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod console;
 pub mod hub;
+pub mod interaction;
 pub mod knowledge;
 pub mod mcp;
 pub mod memory;

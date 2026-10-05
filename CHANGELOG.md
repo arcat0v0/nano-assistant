@@ -4,18 +4,20 @@
 
 ### Changed
 
-- Auto safety review now uses categorical risk, task authorization, and missing evidence instead of numeric scoring and three repeated submissions. Unknown or high-risk actions request confirmation immediately; unchanged rejected actions are deduplicated within the current request.
+- Auto safety review uses categorical risk, task authorization, and missing evidence. Before asking for confirmation about observable facts, its bounded read-only tools can collect evidence and reassess the same action. High risk still requires an independent confirmation; prohibited and outside-scope actions remain denied.
 - Builtin file writes and edits now prepare isolated filesystem evidence and revalidate the approved target. New files use exclusive creation; changed content, identity, or resolved paths cancel the write. Existing Backup files are blocked in auto mode independently of model approval.
 - Review history records bounded recent actions and their actual outcomes using per-execution receipts. Old file contents remain local, and optional real-model evaluation uses a dedicated non-production profile.
+- Ask and safety confirmation share compact inline terminal cards, with numbered plain-text fallback outside a capable TTY. Stream/tool boundaries preserve earlier conversation and completed summaries. Informational startup subprocesses no longer inherit interactive stdin or outlive their version-query timeout.
 
 ### Added
 
 - Local model profiles, `na model` management commands, one-shot model overrides, and interactive `/model` switching with optional saved default. Switching retains conversation and tool state without inheriting credentials from another provider.
 - Built-in DeepSeek, Kimi, GLM, MiMo, and Qwen providers with authenticated live model discovery; `na model discover` and the interactive `/model add` wizard select online models and save local profiles without storing API keys. The wizard is available even when the previous default model cannot initialize.
 - Interactive `/` command palette with arrow-key selection and Right-arrow completion, plus a `/model` submenu for profile switching, provider addition, and optional default selection.
-- `na chat --mode auto` reviews every operation except the actual built-in file reader. Valid safe decisions auto-approve; failed or timed-out reviews require fresh human confirmation. Skills review their expanded execution plans, and PTY/MCP operations use the same gate.
+- `na chat --mode auto` reviews operations except the actual built-in file reader and clarification-only Ask. Dynamic tools replacing either name receive no built-in exemption. Valid safe decisions auto-approve; failed, timed-out, or budget-exhausted reviews require fresh human confirmation.
 - The system prompt now requires dated, append-only backups under ~/Backup before irreversible changes to user or production data.
-- A session-fixed, isolated safety reviewer uses `security.review_profile` when explicitly configured, or the startup main model otherwise; it has no tools or shared conversation history.
+- A session-fixed, isolated safety reviewer uses `security.review_profile` when explicitly configured, or the startup main model otherwise. It has only `review_path`, `review_archive`, `review_container` (Docker and Podman), and `review_systemd`; no main-model tools, shell execution, or shared conversation history.
+- Built-in `ask` collects real batched single-/multi-select or custom answers. Only selected answers enter this turn's trusted clarification context; answers clarify task scope, never approve execution. Cancellation blocks the remaining tools for that turn, and a new real user turn resets that state.
 - MIT and Apache-2.0 license texts, included in newly built release archives, with licensing and safety disclaimers in the README.
 - Conversation sessions persist after every completed turn under the configuration directory; `/resume` in interactive mode lists past sessions (newest first, with model, timestamp, and message preview) and continues the selected one, while `/clear` starts a fresh session.
 

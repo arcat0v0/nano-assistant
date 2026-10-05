@@ -35,6 +35,8 @@ tempfile = "3.27.0"
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "blocking", "form", "query", "rustls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
 
 # HTML to text conversion (for web_fetch / web_search)
 html2text = "0.14"

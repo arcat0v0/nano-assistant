@@ -275,7 +275,8 @@ pub(crate) fn build_security_manager(
         model,
         resolved.temperature,
         std::time::Duration::from_secs(resolved.timeout_secs),
-    );
+    )
+    .with_protected_config(config_path.to_path_buf());
     Ok(Arc::new(manager.with_reviewer(Arc::new(reviewer))))
 }
 
@@ -448,6 +449,7 @@ async fn run_interactive(
 fn spawn_immediate_ctrl_c_exit() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         if tokio::signal::ctrl_c().await.is_ok() {
+            crate::tui::interaction::restore_terminal_interaction();
             let _ = writeln!(io::stderr());
             std::process::exit(130);
         }

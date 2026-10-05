@@ -6,13 +6,14 @@
 
 - **内置模型提供商**: OpenAI、Anthropic、Gemini、GLM、Ollama、DeepSeek、Kimi、MiMo、Qwen，以及自定义兼容接口；交互向导可在线列出模型
 - **Hub 免费模型接入**: `free/*` 模型可自动走 `nana-hub`，支持 machine 注册、签名请求、配额查询与身份迁移
-- **9 个内置工具**: shell、pty_shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search
+- **10 个内置工具**: shell、pty_shell、file_read、file_write、file_edit、glob_search、content_search、web_fetch、web_search、ask；Ask 用真实用户回答澄清任务目标和数据范围
 - **MCP 协议支持**: 通过 MCP (Model Context Protocol) 接入外部工具服务器（Exa、Context7、Grep.app 等），支持 Stdio/HTTP/SSE 三种传输，延迟加载节省上下文
 - **skills.sh 生态兼容**: 自动扫描 `~/.agents/skills/`，直接使用 skills.sh 社区生态中的 skill
 - **丰富的运维 Skill**: 内置 Linux 发行版管理（Arch/Debian/Fedora/CentOS）、数据库管理、容器编排、服务器安全加固等 domain skill
-- **4 种安全模式**: direct（直接执行）、confirm（逐次确认）、whitelist（白名单）、auto（安全审查后自动确认）
+- **4 种安全模式**: direct（直接执行）、confirm（逐次确认）、whitelist（白名单）、auto（受限只读取证与独立安全审查）；Auto 下高风险始终单次确认，禁止和越界动作不能通过确认放行
 - **持久化记忆**: 基于 Markdown 文件的对话记忆存储
 - **实时流式输出**: Rig 原生文本增量、工具调用与多轮结果实时显示，支持 Ctrl+C 中断
+- **统一终端交互**: Ask 与安全确认使用紧凑内联卡片，支持中文、自定义回答、多选和小终端滚动；非 TTY 自动退为编号文本。取消 Ask 后停止本轮工具执行，不默认采用推荐项
 - **两种使用方式**: 单命令模式 `na "prompt"` + 交互模式 `na`
 - **Windows 基础支持**: 支持 Windows 配置路径、`cmd /C` 执行、以及基于 stdin/stdout 的交互式命令控制
 

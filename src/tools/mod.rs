@@ -1,3 +1,4 @@
+pub mod ask;
 pub mod content_search;
 pub mod file_edit;
 pub(crate) mod file_mutation;
@@ -40,6 +41,13 @@ pub(crate) async fn register_reviewed_file_tools(
     handle
         .add_dynamic_tool(file_edit::FileEditTool::new().into_dynamic(security))
         .await;
+}
+
+pub(crate) async fn register_interactive_tools(
+    handle: &ToolServerHandle,
+    security: std::sync::Arc<crate::security::SecurityManager>,
+) {
+    handle.add_tool(ask::AskTool::new(security)).await;
 }
 
 pub(crate) fn is_protected_skill_path(path: &std::path::Path) -> bool {

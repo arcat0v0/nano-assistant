@@ -260,6 +260,7 @@ async fn detect_single_tool(tool: &str) -> (Option<String>, Option<String>) {
         "nvm" => {
             let version = tokio::process::Command::new("bash")
                 .args(["-lc", "nvm --version"])
+                .stdin(std::process::Stdio::null())
                 .output()
                 .await
                 .ok()
@@ -279,7 +280,11 @@ async fn detect_single_tool(tool: &str) -> (Option<String>, Option<String>) {
 
     let path = tokio::time::timeout(
         Duration::from_millis(500),
-        tokio::process::Command::new("which").arg(cmd).output(),
+        tokio::process::Command::new("which")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()
@@ -291,7 +296,11 @@ async fn detect_single_tool(tool: &str) -> (Option<String>, Option<String>) {
 
     let version = tokio::time::timeout(
         Duration::from_millis(500),
-        tokio::process::Command::new(cmd).arg("--version").output(),
+        tokio::process::Command::new(cmd)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .ok()
@@ -334,6 +343,7 @@ pub async fn detect_installed_tools() -> HashMap<String, ToolInfo> {
 async fn run_cmd(cmd: &str, args: &[&str], default: &str) -> String {
     tokio::process::Command::new(cmd)
         .args(args)
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .ok()
@@ -354,6 +364,7 @@ async fn run_cmd(cmd: &str, args: &[&str], default: &str) -> String {
 async fn run_shell(cmd: &str, default: &str) -> String {
     tokio::process::Command::new("sh")
         .args(["-c", cmd])
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .ok()
@@ -447,6 +458,7 @@ pub async fn detect() -> SystemInfo {
     let gpu_model = gpu_model.trim_start_matches("3D controller: ").to_string();
 
     let virtualization = tokio::process::Command::new("systemd-detect-virt")
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .ok()

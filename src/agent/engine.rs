@@ -68,6 +68,9 @@ fn normalized_path(path: &Path) -> PathBuf {
     }
 }
 
+type OutputBoundarySender = tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>;
+type OutputBoundarySlot = Arc<parking_lot::Mutex<Option<OutputBoundarySender>>>;
+
 struct RuntimeState {
     handle: ToolServerHandle,
     skills: Vec<Skill>,
@@ -85,6 +88,8 @@ struct RuntimeState {
     preamble_dirty: bool,
     tool_descriptions: HashMap<String, Arc<str>>,
     builtin_file_read_active: bool,
+    builtin_ask_active: bool,
+    output_boundary: OutputBoundarySlot,
     progress_count: usize,
     progress_calls: HashMap<String, usize>,
     review_receipts: HashMap<String, ReviewReceipt>,
@@ -97,6 +102,9 @@ impl RuntimeState {
         }
         if tool.name() == "file_read" {
             self.builtin_file_read_active = false;
+        }
+        if tool.name() == "ask" {
+            self.builtin_ask_active = false;
         }
         self.handle.add_dynamic_tool(tool).await;
     }
@@ -288,6 +296,16 @@ impl RuntimeState {
     }
 }
 
+struct OutputBoundaryGuard {
+    slot: OutputBoundarySlot,
+}
+
+impl Drop for OutputBoundaryGuard {
+    fn drop(&mut self) {
+        self.slot.lock().take();
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeHook(Arc<Mutex<RuntimeState>>);
 
@@ -310,6 +328,11 @@ impl AgentHook for RuntimeHook {
         _ctx: &HookContext,
         event: &InvalidToolCallContext,
     ) -> Option<InvalidToolCallAction> {
+        if self.0.lock().await.security.interaction_cancelled() {
+            return Some(InvalidToolCallAction::retry(
+                "User cancelled clarification; do not execute further tools in this turn.",
+            ));
+        }
         let feedback = if !event
             .available_tools
             .iter()
@@ -339,32 +362,50 @@ impl AgentHook for RuntimeHook {
     }
 
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        let args: serde_json::Value = match serde_json::from_str(event.args) {
-            Ok(args) => args,
-            Err(error) => return ToolCallAction::skip(format!("Invalid tool arguments: {error}")),
-        };
-        let (security, description, exempt, prepared) = {
+        let (security, description, exempt, prepared, builtin_ask, boundary, number) = {
             let mut state = self.0.lock().await;
             state.progress_count += 1;
             let number = state.progress_count;
             state
                 .progress_calls
                 .insert(event.internal_call_id.to_owned(), number);
-            let summary = crate::console::args_summary(event.tool_name, &args);
-            eprintln!(
-                "{}",
-                crate::console::format_tool_pending(
-                    &format!("#{number} {}", event.tool_name),
-                    &summary
-                )
-            );
+            let boundary = state.output_boundary.lock().clone();
             (
                 Arc::clone(&state.security),
                 state.tool_descriptions.get(event.tool_name).cloned(),
                 state.builtin_file_read_active && event.tool_name == "file_read",
                 state.security.reviews_in_executor(event.tool_name),
+                state.builtin_ask_active && event.tool_name == "ask",
+                boundary,
+                number,
             )
         };
+        if let Some(boundary) = boundary {
+            let (ack, received) = tokio::sync::oneshot::channel();
+            if boundary.send(ack).is_err() || received.await.is_err() {
+                return ToolCallAction::skip("Execution denied: streaming turn was cancelled");
+            }
+        }
+        if security.interaction_cancelled() {
+            return ToolCallAction::skip(
+                "User cancelled clarification; do not execute further tools in this turn.",
+            );
+        }
+        let args: serde_json::Value = match serde_json::from_str(event.args) {
+            Ok(args) => args,
+            Err(error) => return ToolCallAction::skip(format!("Invalid tool arguments: {error}")),
+        };
+        if builtin_ask {
+            return ToolCallAction::run();
+        }
+        let summary = crate::console::args_summary(event.tool_name, &args);
+        eprintln!(
+            "{}",
+            crate::console::format_tool_pending(
+                &format!("#{number} {}", event.tool_name),
+                &summary
+            )
+        );
         if security.mode() == SecurityMode::Auto && (exempt || prepared) {
             return ToolCallAction::run();
         }
@@ -415,6 +456,10 @@ impl AgentHook for RuntimeHook {
         state
             .security
             .record_execution(receipt.as_ref(), event.raw_result.is_success());
+        if state.builtin_ask_active && event.tool_name == "ask" {
+            state.progress_calls.remove(event.internal_call_id);
+            return ToolResultAction::keep();
+        }
         let name = state
             .progress_calls
             .remove(event.internal_call_id)
@@ -489,6 +534,7 @@ impl Agent {
         let handle = ToolServer::new().run();
         tools::register_builtin_tools(&handle).await;
         tools::register_reviewed_file_tools(&handle, Arc::clone(&security)).await;
+        tools::register_interactive_tools(&handle, Arc::clone(&security)).await;
         let mut state = RuntimeState {
             handle: handle.clone(),
             skills,
@@ -506,6 +552,8 @@ impl Agent {
             preamble_dirty: false,
             tool_descriptions: HashMap::new(),
             builtin_file_read_active: true,
+            builtin_ask_active: true,
+            output_boundary: Arc::new(parking_lot::Mutex::new(None)),
             progress_count: 0,
             progress_calls: HashMap::new(),
             review_receipts: HashMap::new(),
@@ -636,6 +684,12 @@ impl Agent {
                 self.history.len()
             );
         }
+        let (boundary_sender, mut boundaries) = tokio::sync::mpsc::unbounded_channel();
+        let boundary_slot = Arc::clone(&self.state.lock().await.output_boundary);
+        *boundary_slot.lock() = Some(boundary_sender);
+        let _boundary_guard = OutputBoundaryGuard {
+            slot: boundary_slot,
+        };
         let mut stream = self
             .rig
             .runner(prompt)
@@ -647,7 +701,21 @@ impl Agent {
             .await;
         let mut final_response = None;
         let mut visible = false;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                request = boundaries.recv() => {
+                    if let Some(ack) = request {
+                        on_chunk(StreamOutputEvent::Progress(if visible { "\n".into() } else { String::new() }));
+                        visible = false;
+                        let _ = ack.send(());
+                    }
+                    continue;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item? {
                 MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text)) => {
                     visible = true;

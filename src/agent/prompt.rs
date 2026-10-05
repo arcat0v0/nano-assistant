@@ -268,6 +268,9 @@ fn build_command_execution_section() -> String {
     prompt.push_str(
         "For multi-step tasks, keep acting until the requested end state is reached or a real blocker appears.\n",
     );
+    prompt.push_str(
+        "Use `ask` only when task scope, target, or data handling cannot be determined from the user's request, context, or inspection. Inspect observable facts first and batch related questions; do not repeatedly confirm routine tasks or ask again after a clear answer. Uninstalling does not imply permission to clear persistent data. After an answered Ask, generate commands matching the real answers and use normal safety review. If Ask is cancelled, stop tool execution for this turn and explain without guessing an answer. Never request passwords or API keys through Ask.\n",
+    );
     prompt.push_str("Prefer non-interactive flags over pty_shell:\n");
     prompt.push_str("- `apt install -y`, `pacman --noconfirm`\n");
     prompt.push_str("- `yes | command`, `--batch`, `--non-interactive`\n");
@@ -339,7 +342,7 @@ fn build_system_steward_section() -> String {
 fn build_safety_section() -> String {
     "## Safety\n\n\
      - Do not exfiltrate private data.\n\
-     - Do not run destructive commands without asking.\n\
+     - Keep destructive changes within the user's explicitly authorized data scope and use the normal safety gate. Use `ask` only when scope or data handling is genuinely unresolved; do not ask again for an already authorized bounded change. High-risk actions still require the runtime's separate confirmation, and existing ~/Backup content remains protected.\n\
      - Prefer `trash` over `rm`.\n\
      - Safety review may approve, deny, or request human confirmation. Confirmation is handled by the runtime for the pending action. Do not repeat unchanged rejected actions to trigger confirmation, and do not bypass rejection with a different tool or ask the user to execute it manually. Retry only with material parameter or evidence changes that resolve the stated concern; otherwise explain the reason and continue independent work.\n\
      - If a file target changed after preparation, read its current state and prepare a new operation; previous approval does not cover it.\n\

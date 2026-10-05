@@ -254,6 +254,218 @@ fn queued_stream(
     ("text/event-stream", body)
 }
 
+fn queued_tool_stream(
+    content: Option<&str>,
+    call_id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (&'static str, String) {
+    let mut deltas = Vec::new();
+    if let Some(content) = content {
+        deltas.push(serde_json::json!({"role":"assistant","content":content}));
+    }
+    deltas.push(serde_json::json!({
+        "role":"assistant",
+        "tool_calls":[{"index":0,"id":call_id,"type":"function",
+            "function":{"name":name,"arguments":arguments.to_string()}}]
+    }));
+    let mut body = deltas
+        .into_iter()
+        .map(|delta| {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({
+                    "id":"fixture","object":"chat.completion.chunk","created":1,
+                    "model":"local-test-model",
+                    "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+                })
+            )
+        })
+        .collect::<String>();
+    body.push_str(&format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({
+            "id":"fixture","object":"chat.completion.chunk","created":1,
+            "model":"local-test-model",
+            "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+        })
+    ));
+    ("text/event-stream", body)
+}
+
+fn assert_review_tools(body: &serde_json::Value) {
+    let mut names = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "review_archive",
+            "review_container",
+            "review_path",
+            "review_systemd"
+        ]
+    );
+}
+
+fn ask_config(home: &Path, base_url: &str) -> PathBuf {
+    let path = home.join("assistant.toml");
+    fs::write(
+        &path,
+        format!(
+            "[provider]\nprovider='compatible'\nmodel='local-test-model'\napi_url='{base_url}'\n\n[behavior]\nstreaming=true\nmax_iterations=12\n\n[security]\nmode='direct'\n\n[skills]\nenabled=false\n\n[memory]\nenabled=false\n\n[hub]\nenabled=false\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn policy_question() -> serde_json::Value {
+    serde_json::json!({
+        "id":"policy","header":"数据处理","question":"选择持久数据策略",
+        "options":[
+            {"id":"remove","label":"清除数据","description":"只删除本次临时数据"},
+            {"id":"keep","label":"保留数据","description":"保留未选择清除的数据"}
+        ],
+        "recommended":"keep"
+    })
+}
+
+fn tool_result(request: &Request, call_id: &str) -> serde_json::Value {
+    let message = request.body.as_ref().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == call_id)
+        .unwrap_or_else(|| panic!("missing result for {call_id}"));
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        serde_json::from_str(text).unwrap()
+    } else {
+        let text = content
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|part| part["text"].as_str())
+            .unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+}
+
+fn rendered_terminal_text(output: &[u8], columns: usize) -> String {
+    let text = String::from_utf8_lossy(output);
+    let mut chars = text.chars().peekable();
+    let mut lines = vec![vec![' '; columns]];
+    let (mut row, mut column) = (0usize, 0usize);
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    let mut args = String::new();
+                    let mut command = '\0';
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            command = c;
+                            break;
+                        }
+                        args.push(c);
+                    }
+                    let values = args
+                        .split(';')
+                        .map(|n| n.parse::<usize>().unwrap_or(0))
+                        .collect::<Vec<_>>();
+                    let n = values.first().copied().unwrap_or(0);
+                    match command {
+                        'A' => row = row.saturating_sub(n.max(1)),
+                        'B' | 'e' => row += n.max(1),
+                        'C' | 'a' => column = (column + n.max(1)).min(columns - 1),
+                        'D' => column = column.saturating_sub(n.max(1)),
+                        'E' => {
+                            row += n.max(1);
+                            column = 0;
+                        }
+                        'F' => {
+                            row = row.saturating_sub(n.max(1));
+                            column = 0;
+                        }
+                        'G' | '`' => column = n.max(1) - 1,
+                        'H' | 'f' => {
+                            row = n.max(1) - 1;
+                            column = values.get(1).copied().unwrap_or(1).max(1) - 1;
+                        }
+                        'K' if row < lines.len() => {
+                            let col = column.min(columns - 1);
+                            match n {
+                                1 => lines[row][..=col].fill(' '),
+                                2 => lines[row].fill(' '),
+                                _ => lines[row][col..].fill(' '),
+                            }
+                        }
+                        'J' => {
+                            if n == 2 || n == 3 {
+                                lines.iter_mut().for_each(|line| line.fill(' '));
+                            } else if n == 0 && row < lines.len() {
+                                lines[row][column.min(columns - 1)..].fill(' ');
+                                lines
+                                    .iter_mut()
+                                    .skip(row + 1)
+                                    .for_each(|line| line.fill(' '));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '\r' => column = 0,
+            '\n' => row += 1,
+            '\x08' => column = column.saturating_sub(1),
+            ch if ch.is_control() => {}
+            ch => {
+                let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if width == 0 {
+                    continue;
+                }
+                if column + width > columns {
+                    row += 1;
+                    column = 0;
+                }
+                while lines.len() <= row {
+                    lines.push(vec![' '; columns]);
+                }
+                lines[row][column] = ch;
+                for cell in lines[row].iter_mut().skip(column + 1).take(width - 1) {
+                    *cell = '\0';
+                }
+                column += width;
+            }
+        }
+    }
+    lines
+        .iter()
+        .map(|line| line.iter().filter(|c| **c != '\0').collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn read_request(stream: &mut TcpStream) -> Request {
     let mut bytes = Vec::new();
     let header_end = loop {
@@ -308,6 +520,17 @@ impl Terminal {
         columns: u16,
         rows: u16,
     ) -> Self {
+        Self::start_with_prompt(home, config, deepseek_key, columns, rows, None)
+    }
+
+    fn start_with_prompt(
+        home: &Path,
+        config: &Path,
+        deepseek_key: Option<&str>,
+        columns: u16,
+        rows: u16,
+        prompt: Option<&str>,
+    ) -> Self {
         let pty = openpty(
             Some(&Winsize {
                 ws_row: rows,
@@ -340,6 +563,9 @@ impl Terminal {
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(slave));
+        if let Some(prompt) = prompt {
+            command.arg(prompt);
+        }
         if let Some(key) = deepseek_key {
             command.env("DEEPSEEK_API_KEY", key);
         }
@@ -731,7 +957,7 @@ fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
 fn tui_auto_first_uncertainty_requires_current_confirmation() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("review-marker.txt");
-    let command = "printf reviewed > review-marker.txt";
+    let command = "printf reviewed > review-marker.txt\n# FULL_ACTION_DETAIL_ONLY";
     let main = QueuedCompletionFixture::start(vec![
         queued_stream(None, "call_deny", Some(command)),
         queued_stream(Some("First operation denied."), "", None),
@@ -759,24 +985,25 @@ fn tui_auto_first_uncertainty_requires_current_confirmation() {
     terminal.until("❯ ");
     let first_start = terminal.output.len();
     terminal.send("Write reviewed into review-marker.txt for the first task.\r");
-    terminal.until_from("[y/N]", first_start);
+    terminal.until_from("需要确认", first_start);
     terminal.until_from("shell", first_start);
-    terminal.until_from(command, first_start);
     assert!(!marker.exists());
     let denied_start = terminal.output.len();
-    terminal.send("n\r");
+    terminal.send("\r");
     terminal.until_from("First operation denied.", denied_start);
     terminal.until_from("❯ ", denied_start);
     assert!(!marker.exists());
 
     let second_start = terminal.output.len();
     terminal.send("Write reviewed into review-marker.txt for the second task.\r");
-    terminal.until_from("[y/N]", second_start);
+    terminal.until_from("需要确认", second_start);
     terminal.until_from("shell", second_start);
-    terminal.until_from(command, second_start);
     assert!(!marker.exists());
     let allowed_start = terminal.output.len();
-    terminal.send("y\r");
+    terminal.send("d");
+    terminal.until_from("FULL_ACTION_DETAIL_ONLY", allowed_start);
+    terminal.send("\x1b");
+    terminal.send("y");
     terminal.until_from("Second operation completed.", allowed_start);
     terminal.until_from("❯ ", allowed_start);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "reviewed");
@@ -816,14 +1043,14 @@ fn tui_auto_first_uncertainty_requires_current_confirmation() {
         assert_eq!(request.path, "/v1/chat/completions");
         let body = request.body.as_ref().unwrap();
         assert_eq!(body["model"], "safety-test-model");
-        assert!(body.get("tools").is_none_or(|tools| {
-            tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
-        }));
+        assert_review_tools(body);
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
-        let content = messages[1]["content"].as_str().unwrap();
+        let content = messages
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains(": user_request>>>"))
+            .unwrap();
         let section = |name: &str| {
             let marker = format!(": {name}>>>");
             let open = content.find(&marker).expect("section opens");
@@ -897,5 +1124,310 @@ fn tui_resume_restores_saved_session_into_next_turn() {
     assert!(
         second_body.contains("UNIQUE_HISTORY_MARKER"),
         "resumed history must reach the model: {second_body}"
+    );
+}
+
+#[test]
+fn tui_ask_stream_recommended_waits_for_answer_before_execution_at_all_widths() {
+    for columns in [80, 40, 24] {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("keep.txt"), "untouched").unwrap();
+        fs::write(temp.path().join("remove.txt"), "temporary").unwrap();
+        let main = QueuedCompletionFixture::start(vec![
+            queued_tool_stream(
+                Some("Before clarification."),
+                "policy",
+                "ask",
+                serde_json::json!({"questions":[policy_question()]}),
+            ),
+            queued_stream(
+                None,
+                "execute",
+                Some("rm remove.txt; printf completed > marker.txt"),
+            ),
+            queued_stream(Some("After clarification."), "", None),
+        ]);
+        let config_path = ask_config(temp.path(), &main.base_url);
+        let mut terminal = Terminal::start_with_size(temp.path(), &config_path, None, columns, 24);
+        terminal.until("❯ ");
+        let start = terminal.output.len();
+        terminal.send("Remove only the temporary data after asking me.\r");
+        terminal.until_from("选择持久数据策略", start);
+        terminal.collect_for(Duration::from_millis(150));
+        assert!(temp.path().join("remove.txt").exists());
+        assert!(!temp.path().join("marker.txt").exists());
+        assert!(terminal.text()[start..].contains("Before clarification."));
+        terminal.send("\x1b[A\r");
+        terminal.until_from("After clarification.", start);
+        terminal.until_from("❯ ", start);
+        assert!(!temp.path().join("remove.txt").exists());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("keep.txt")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("marker.txt")).unwrap(),
+            "completed"
+        );
+        assert!(terminal.text()[start..].contains("已补充"));
+        let rendered = rendered_terminal_text(&terminal.output[start..], columns as usize);
+        assert!(rendered.contains("Before clarification."), "{rendered}");
+        assert!(rendered.contains("已补充"), "{rendered}");
+        assert!(rendered.contains("清除数据"), "{rendered}");
+        assert!(rendered.contains("After clarification."), "{rendered}");
+        wait_for_exit(&mut terminal);
+        assert!(terminal.terminal_restored());
+        let requests = main.finish();
+        let result = tool_result(&requests[1], "policy");
+        assert_eq!(result["status"], "answered");
+        assert_eq!(
+            result["answers"][0]["selected"],
+            serde_json::json!(["remove"])
+        );
+        assert!(result["answers"][0]["custom"].is_null());
+    }
+}
+
+#[test]
+fn tui_ask_multi_chinese_paste_shift_tab_and_resize_preserve_answers() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = QueuedCompletionFixture::start(vec![
+        queued_tool_stream(
+            Some("Persistent conversation above the card."),
+            "batch",
+            "ask",
+            serde_json::json!({"questions":[
+                policy_question(),
+                {"id":"features","question":"选择需要保留的功能","multi":true,
+                 "options":[{"id":"tls","label":"证书"},{"id":"sites","label":"站点"}]},
+                {"id":"path","question":"输入中文备份路径"}
+            ]}),
+        ),
+        queued_stream(Some("Batch recorded."), "", None),
+        queued_stream(Some("Next turn works."), "", None),
+    ]);
+    let config_path = ask_config(temp.path(), &main.base_url);
+    let mut terminal = Terminal::start_with_size(temp.path(), &config_path, None, 80, 24);
+    terminal.until("❯ ");
+    let start = terminal.output.len();
+    terminal.send("Clarify the backup preferences.\r");
+    terminal.until_from("选择持久数据策略", start);
+    terminal.send("\r");
+    terminal.until_from("选择需要保留的功能", start);
+    let revisit = terminal.output.len();
+    terminal.send("\x1b[Z");
+    terminal.until_from("选择持久数据策略", revisit);
+    let multi = terminal.output.len();
+    terminal.send("\x1b[A\r");
+    terminal.until_from("选择需要保留的功能", multi);
+    terminal.send(" \x1b[B \x1b[B\r");
+    terminal.collect_for(Duration::from_millis(100));
+    terminal.send("\x1b[200~中文补充\n第二行\x1b[201~");
+    terminal.collect_for(Duration::from_millis(100));
+    assert!(!terminal.text()[start..].contains("Batch recorded."));
+    terminal.send("\r");
+    terminal.collect_for(Duration::from_millis(100));
+    terminal.send("\r");
+    terminal.until_from("输入中文备份路径", start);
+    terminal.send("\x1b[200~/备份/中文目录\x1b[201~");
+    terminal.resize(40, 6);
+    terminal.collect_for(Duration::from_millis(150));
+    terminal.send("\x1b[H\x1b[C\x1b[3~");
+    terminal.send("\x1b[F");
+    terminal.resize(24, 6);
+    terminal.collect_for(Duration::from_millis(150));
+    terminal.send("\r");
+    terminal.until_from("Batch recorded.", start);
+    terminal.until_from("❯ ", start);
+    let next = terminal.output.len();
+    terminal.send("next real user turn\r");
+    terminal.until_from("Next turn works.", next);
+    terminal.until_from("❯ ", next);
+    wait_for_exit(&mut terminal);
+    assert!(terminal.terminal_restored());
+    let requests = main.finish();
+    let result = tool_result(&requests[1], "batch");
+    assert_eq!(result["status"], "answered");
+    let answers = result["answers"].as_array().unwrap();
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[0]["selected"], serde_json::json!(["remove"]));
+    assert_eq!(answers[1]["selected"], serde_json::json!(["tls", "sites"]));
+    assert_eq!(answers[1]["custom"], "中文补充 第二行");
+    assert_eq!(answers[2]["custom"], "/份/中文目录");
+}
+
+#[test]
+fn tui_ask_escape_ctrl_c_and_eof_cancel_batch_block_tools_and_recover_next_turn() {
+    for (key, reason) in [
+        ("\x1b", "cancelled"),
+        ("\x03", "interrupted"),
+        ("\x04", "eof"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = QueuedCompletionFixture::start(vec![
+            queued_tool_stream(
+                None,
+                "cancel",
+                "ask",
+                serde_json::json!({
+                    "questions":[policy_question(), {"id":"path","question":"未回答的路径"}]
+                }),
+            ),
+            queued_stream(
+                None,
+                "blocked_shell",
+                Some("printf forbidden > forbidden.txt"),
+            ),
+            queued_tool_stream(
+                None,
+                "blocked_write",
+                "file_write",
+                serde_json::json!({
+                    "path":"forbidden-write.txt","content":"forbidden"
+                }),
+            ),
+            queued_stream(Some("Cancelled clarification."), "", None),
+            queued_stream(None, "new_turn", Some("printf recovered > recovered.txt")),
+            queued_stream(Some("Recovered after cancellation."), "", None),
+        ]);
+        let config_path = ask_config(temp.path(), &main.base_url);
+        let mut terminal = Terminal::start_with_size(temp.path(), &config_path, None, 40, 24);
+        terminal.until("❯ ");
+        let start = terminal.output.len();
+        terminal.send("Ask before doing anything.\r");
+        terminal.until_from("选择持久数据策略", start);
+        terminal.send("\r");
+        terminal.until_from("未回答的路径", start);
+        terminal.resize(40, 6);
+        terminal.collect_for(Duration::from_millis(100));
+        terminal.send(key);
+        terminal.until_from("Cancelled clarification.", start);
+        terminal.until_from("❯ ", start);
+        assert!(!temp.path().join("forbidden.txt").exists());
+        assert!(!temp.path().join("forbidden-write.txt").exists());
+        let next = terminal.output.len();
+        terminal.send("Write recovered into recovered.txt now.\r");
+        terminal.until_from("Recovered after cancellation.", next);
+        terminal.until_from("❯ ", next);
+        assert_eq!(
+            fs::read_to_string(temp.path().join("recovered.txt")).unwrap(),
+            "recovered"
+        );
+        wait_for_exit(&mut terminal);
+        assert!(terminal.terminal_restored());
+        let requests = main.finish();
+        let result = tool_result(&requests[1], "cancel");
+        assert_eq!(
+            result,
+            serde_json::json!({"status":"cancelled","reason":reason})
+        );
+        for index in [2, 3] {
+            let messages = requests[index].body.as_ref().unwrap()["messages"]
+                .as_array()
+                .unwrap();
+            let last = messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            assert!(last["content"].to_string().contains(
+                "User cancelled clarification; do not execute further tools in this turn."
+            ));
+        }
+    }
+}
+
+#[test]
+fn tui_ask_signal_interrupt_restores_cooked_terminal_before_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = QueuedCompletionFixture::start(vec![queued_tool_stream(
+        None,
+        "interrupt",
+        "ask",
+        serde_json::json!({
+            "questions":[policy_question()]
+        }),
+    )]);
+    let config_path = ask_config(temp.path(), &main.base_url);
+    let mut terminal = Terminal::start_with_prompt(
+        temp.path(),
+        &config_path,
+        None,
+        80,
+        24,
+        Some("Ask and wait for my answer."),
+    );
+    terminal.until("选择持久数据策略");
+    assert!(!terminal.terminal_restored());
+    assert_eq!(
+        unsafe { libc::kill(terminal.child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = terminal.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupt did not exit: {}",
+            terminal.text()
+        );
+        terminal.collect_for(Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(130));
+    assert!(terminal.terminal_restored(), "{}", terminal.text());
+    assert_eq!(main.finish().len(), 1);
+}
+
+#[test]
+fn tui_ask_long_selected_description_remains_scrollable_in_short_terminal() {
+    let temp = tempfile::tempdir().unwrap();
+    let description = format!(
+        "{}\nVISIBLE_DESCRIPTION_END",
+        "可查看完整影响范围，".repeat(12)
+    );
+    let main = QueuedCompletionFixture::start(vec![
+        queued_tool_stream(
+            None,
+            "scroll",
+            "ask",
+            serde_json::json!({
+                "questions":[{
+                    "id":"scope","question":"核实选项完整说明",
+                    "options":[
+                        {"id":"keep","label":"保留","description":description},
+                        {"id":"remove","label":"删除"}
+                    ],
+                    "recommended":"keep"
+                }]
+            }),
+        ),
+        queued_stream(Some("Scrollable answer recorded."), "", None),
+    ]);
+    let config_path = ask_config(temp.path(), &main.base_url);
+    let mut terminal = Terminal::start_with_size(temp.path(), &config_path, None, 80, 24);
+    terminal.until("❯ ");
+    let start = terminal.output.len();
+    terminal.send("Ask about the data scope.\r");
+    terminal.until_from("核实选项完整说明", start);
+    terminal.resize(40, 6);
+    terminal.collect_for(Duration::from_millis(100));
+    let scroll = terminal.output.len();
+    for _ in 0..12 {
+        terminal.send("\x1b[6~");
+        terminal.collect_for(Duration::from_millis(20));
+    }
+    terminal.until_from("VISIBLE_DESCRIPTION_END", scroll);
+    terminal.send("\x1b[5~\r");
+    terminal.until_from("Scrollable answer recorded.", start);
+    terminal.until_from("❯ ", start);
+    wait_for_exit(&mut terminal);
+    assert!(terminal.terminal_restored());
+    let requests = main.finish();
+    let result = tool_result(&requests[1], "scroll");
+    assert_eq!(
+        result["answers"][0]["selected"],
+        serde_json::json!(["keep"])
     );
 }

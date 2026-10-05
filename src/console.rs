@@ -65,11 +65,6 @@ pub fn review_note(text: &str) -> String {
     format!("  {}  🛡 {text}", dim_label("│"))
 }
 
-#[inline]
-pub fn confirm_prompt() -> String {
-    format!("{BOLD}{FG_YELLOW}⚠ [y/N]{RESET}")
-}
-
 /// Format the closing line of a tool block.
 ///
 /// Output:
@@ -237,12 +232,6 @@ mod tests {
         assert!(green("safe").contains("\x1b[32m"));
         assert!(yellow("uncertain").contains("\x1b[33m"));
         assert!(red("blocked").contains("\x1b[31m"));
-    }
-
-    #[test]
-    fn confirm_prompt_is_flagged() {
-        assert!(confirm_prompt().contains('⚠'));
-        assert!(confirm_prompt().contains("[y/N]"));
     }
 
     #[test]

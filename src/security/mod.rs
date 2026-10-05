@@ -1,10 +1,16 @@
+pub(crate) mod evidence;
 pub(crate) mod review;
 pub mod whitelist;
 
 use crate::config::schema::SecurityConfig;
+use crate::interaction::{
+    AskCancelReason, AskRequest, AskResult, ConfirmationRequest, HumanInteraction,
+};
+#[cfg(test)]
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use review::{ActionRecord, ReviewDecision, ReviewRequest, SafetyReviewer};
+use review::{ActionRecord, ReviewDecision, ReviewRequest, SafetyReviewer, UserClarification};
+use rig::tool::ToolExecutionError;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -37,7 +43,6 @@ pub struct ToolAction<'a> {
 struct AutoReviewState {
     reviewer: RwLock<Option<Arc<dyn SafetyReviewer>>>,
     prepared_tools: RwLock<HashSet<String>>,
-    context: RwLock<ReviewContext>,
     review_gate: tokio::sync::Mutex<()>,
 }
 
@@ -45,8 +50,12 @@ struct AutoReviewState {
 struct ReviewContext {
     user_request: Arc<str>,
     generation: u64,
-    denied: VecDeque<(String, String)>,
+    denied: VecDeque<(String, u64, String)>,
     history: VecDeque<ActionRecord>,
+    interaction_cancelled: bool,
+    successful_ask_batches: usize,
+    clarifications: Vec<UserClarification>,
+    clarification_revision: u64,
 }
 
 impl ReviewContext {
@@ -86,7 +95,8 @@ impl ReviewContext {
     }
 
     fn deny(&mut self, fingerprint: String, reason: String) {
-        self.denied.push_back((fingerprint, reason));
+        self.denied
+            .push_back((fingerprint, self.clarification_revision, reason));
         if self.denied.len() > 32 {
             self.denied.pop_front();
         }
@@ -148,34 +158,12 @@ pub enum SecurityDecision {
     Deny(String),
 }
 
-#[async_trait]
-pub trait UserConfirmation: Send + Sync {
-    async fn confirm(&self, action: &str) -> bool;
-}
-
-pub struct StdioConfirmation;
-
-#[async_trait]
-impl UserConfirmation for StdioConfirmation {
-    async fn confirm(&self, action: &str) -> bool {
-        eprintln!(
-            "  {}  {} {action}",
-            crate::console::dim_label("│"),
-            crate::console::confirm_prompt()
-        );
-        let mut input = String::new();
-        match std::io::stdin().read_line(&mut input) {
-            Ok(_) => input.trim().to_lowercase() == "y",
-            Err(_) => false,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct SecurityManager {
     mode: SecurityMode,
     whitelist: Vec<String>,
-    confirmer: Arc<dyn UserConfirmation>,
+    interaction: Arc<dyn HumanInteraction>,
+    context: Arc<RwLock<ReviewContext>>,
     auto: Option<Arc<AutoReviewState>>,
 }
 
@@ -184,7 +172,8 @@ impl SecurityManager {
         Self {
             mode,
             whitelist: Vec::new(),
-            confirmer: Arc::new(StdioConfirmation),
+            interaction: Arc::new(crate::tui::interaction::TerminalInteraction::default()),
+            context: Arc::new(RwLock::new(ReviewContext::default())),
             auto: (mode == SecurityMode::Auto).then(|| Arc::new(AutoReviewState::default())),
         }
     }
@@ -194,8 +183,8 @@ impl SecurityManager {
         self
     }
 
-    pub fn with_confirmer(mut self, confirmer: Arc<dyn UserConfirmation>) -> Self {
-        self.confirmer = confirmer;
+    pub fn with_interaction(mut self, interaction: Arc<dyn HumanInteraction>) -> Self {
+        self.interaction = interaction;
         self
     }
 
@@ -248,15 +237,124 @@ impl SecurityManager {
     }
 
     pub(crate) fn set_user_request(&self, request: &str) {
-        if let Some(auto) = &self.auto {
-            let mut context = auto.context.write();
-            let generation = context.generation.wrapping_add(1);
-            *context = ReviewContext {
-                user_request: Arc::from(request),
-                generation,
-                ..Default::default()
-            };
+        let mut context = self.context.write();
+        let generation = context.generation.wrapping_add(1);
+        *context = ReviewContext {
+            user_request: Arc::from(request),
+            generation,
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn interaction_cancelled(&self) -> bool {
+        self.context.read().interaction_cancelled
+    }
+
+    fn check_interaction(&self) -> Result<(), String> {
+        if self.interaction_cancelled() {
+            Err(CLARIFICATION_CANCELLED.into())
+        } else {
+            Ok(())
         }
+    }
+
+    pub(crate) async fn ask(&self, request: &AskRequest) -> Result<AskResult, ToolExecutionError> {
+        request
+            .validate()
+            .map_err(ToolExecutionError::invalid_args)?;
+        let generation = {
+            let context = self.context.read();
+            if context.interaction_cancelled {
+                return Err(ToolExecutionError::other(CLARIFICATION_CANCELLED));
+            }
+            let maximum_bytes = request
+                .questions
+                .iter()
+                .map(|q| {
+                    serde_json::to_vec(&serde_json::json!({
+                        "question_id": q.id, "question": q.question,
+                        "selected_options": if q.multi { &q.options[..] } else { &[] },
+                        "custom": "",
+                    }))
+                    .expect("serializable clarification")
+                    .len()
+                        + 2048 * 6
+                        + 1
+                })
+                .sum::<usize>();
+            if context.successful_ask_batches >= 8
+                || serde_json::to_vec(&context.clarifications)
+                    .expect("serializable clarifications")
+                    .len()
+                    + maximum_bytes
+                    > 64 * 1024
+            {
+                return Err(ToolExecutionError::invalid_args(
+                    "Clarification capacity exceeded",
+                ));
+            }
+            context.generation
+        };
+        let result = self.interaction.ask(request).await;
+        if let AskResult::Answered { answers } = &result {
+            request
+                .validate_answers(answers)
+                .map_err(ToolExecutionError::invalid_args)?;
+        }
+        let mut context = self.context.write();
+        if context.generation != generation {
+            return Ok(AskResult::Cancelled {
+                reason: AskCancelReason::Unavailable,
+            });
+        }
+        if context.interaction_cancelled {
+            return Ok(AskResult::Cancelled {
+                reason: AskCancelReason::Unavailable,
+            });
+        }
+        match &result {
+            AskResult::Answered { answers } => {
+                let additions = answers
+                    .iter()
+                    .map(|answer| {
+                        let question = request
+                            .questions
+                            .iter()
+                            .find(|q| q.id == answer.question_id)
+                            .expect("validated answer");
+                        UserClarification {
+                            question_id: question.id.clone(),
+                            question: question.question.clone(),
+                            selected_options: question
+                                .options
+                                .iter()
+                                .filter(|o| answer.selected.contains(&o.id))
+                                .cloned()
+                                .collect(),
+                            custom: answer.custom.clone(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let existing_bytes = serde_json::to_vec(&context.clarifications)
+                    .expect("serializable clarifications")
+                    .len();
+                let added_bytes = serde_json::to_vec(&additions)
+                    .expect("serializable clarifications")
+                    .len();
+                let combined_bytes = existing_bytes + added_bytes - 2
+                    + usize::from(!context.clarifications.is_empty());
+                if context.successful_ask_batches >= 8 || combined_bytes > 64 * 1024 {
+                    return Err(ToolExecutionError::invalid_args(
+                        "Clarification capacity exceeded",
+                    ));
+                }
+                context.clarifications.extend(additions);
+                context.successful_ask_batches += 1;
+                context.clarification_revision = context.clarification_revision.wrapping_add(1);
+            }
+            AskResult::Cancelled { .. } => context.interaction_cancelled = true,
+        }
+        Ok(result)
     }
 
     pub(crate) fn register_prepared_tool(&self, name: &str) {
@@ -274,8 +372,8 @@ impl SecurityManager {
     }
 
     pub(crate) fn record_execution(&self, receipt: Option<&ReviewReceipt>, succeeded: bool) {
-        if let (Some(auto), Some(receipt)) = (&self.auto, receipt) {
-            let mut context = auto.context.write();
+        if let Some(receipt) = receipt {
+            let mut context = self.context.write();
             if context.generation != receipt.generation {
                 return;
             }
@@ -308,10 +406,15 @@ impl SecurityManager {
         action: &ToolAction<'_>,
         preview: &str,
     ) -> Result<Option<ReviewReceipt>, String> {
+        self.check_interaction()?;
         if self.mode == SecurityMode::Auto {
             self.authorize_auto_with_preview(action, Some(preview))
                 .await
                 .map(Some)
+        } else if self.mode == SecurityMode::Confirm {
+            self.confirm_action(action, Some(preview))
+                .await
+                .map(|_| None)
         } else {
             self.authorize(action).await.map(|_| None)
         }
@@ -321,6 +424,7 @@ impl SecurityManager {
         &self,
         action: &ToolAction<'_>,
     ) -> Result<Option<ReviewReceipt>, String> {
+        self.check_interaction()?;
         if self.mode == SecurityMode::Auto {
             self.authorize_auto_with_preview(action, None)
                 .await
@@ -338,23 +442,33 @@ impl SecurityManager {
         let auto = self.auto.as_ref().expect("auto mode has state");
         let _gate = auto.review_gate.lock().await;
         let fingerprint = action_fingerprint(action);
-        let (user_request, generation, history) = {
-            let context = auto.context.read();
-            if let Some((_, reason)) = context.denied.iter().find(|(key, _)| key == &fingerprint) {
+        let (user_request, generation, revision, history, clarifications) = {
+            let context = self.context.read();
+            if context.interaction_cancelled {
+                return Err(CLARIFICATION_CANCELLED.into());
+            }
+            if let Some((_, _, reason)) = context.denied.iter().find(|(key, revision, _)| {
+                key == &fingerprint && *revision == context.clarification_revision
+            }) {
                 return Err(format!("{reason} Unchanged action and evidence were already rejected; do not resubmit or bypass using another tool."));
             }
             (
                 Arc::clone(&context.user_request),
                 context.generation,
+                context.clarification_revision,
                 context.history.iter().cloned().collect::<Vec<_>>(),
+                context.clarifications.clone(),
             )
         };
+        let mut missing_evidence = Vec::new();
+        let mut risk_label = None;
         let reviewer = auto.reviewer.read().clone();
         let cwd = std::env::current_dir();
         let (mut decision, mut detail) = match (reviewer, user_request.is_empty(), cwd) {
             (Some(reviewer), false, Ok(cwd)) => {
                 let request = ReviewRequest {
                     user_request: &user_request,
+                    clarifications: &clarifications,
                     action,
                     cwd: &cwd,
                     platform: std::env::consts::OS,
@@ -362,14 +476,9 @@ impl SecurityManager {
                 };
                 match reviewer.review(&request).await {
                     Ok(outcome) => {
-                        let mut detail = outcome.reason.clone();
-                        if !outcome.missing_evidence.is_empty() {
-                            detail.push_str(&format!(
-                                " · missing evidence: {}",
-                                outcome.missing_evidence.join("; ")
-                            ));
-                        }
-                        (outcome.decision(), detail)
+                        missing_evidence = outcome.missing_evidence.clone();
+                        risk_label = Some(format!("{:?}", outcome.risk).to_lowercase());
+                        (outcome.decision(), outcome.reason)
                     }
                     Err(error) => (
                         ReviewDecision::AskUser,
@@ -387,9 +496,7 @@ impl SecurityManager {
                 detail = "Existing files under ~/Backup are protected by safety policy".into();
             }
         }
-        if auto.context.read().generation != generation {
-            return Err("Execution denied: user request changed during safety review".into());
-        }
+        self.check_review_version(generation, revision, "safety review")?;
         let (result, status) = match decision {
             ReviewDecision::Allow => {
                 eprintln!(
@@ -410,31 +517,27 @@ impl SecurityManager {
                 (Err(format!("Execution denied by safety policy: {detail}. Do not repeat or bypass this action; explain the reason and only submit a materially changed action that resolves the concern.")), "denied")
             }
             ReviewDecision::AskUser => {
-                eprintln!(
-                    "{}",
-                    crate::console::review_note(&format!(
-                        "{} · {}",
-                        crate::console::yellow("waiting for human confirmation"),
-                        escape_terminal_controls(detail.clone())
-                    ))
-                );
-                let serialized = confirmation_action(action);
-                let prompt = escape_terminal_controls(format!(
-                    "{serialized}; safety review: {detail}{}",
-                    preview
-                        .map(|p| format!("; local changes: {p}"))
-                        .unwrap_or_default()
-                ));
-                if self.confirmer.confirm(&prompt).await {
+                let mut request = confirmation_action(action);
+                request.reason = Some(detail.clone());
+                request.missing_evidence = missing_evidence;
+                request.risk_label = risk_label;
+                request.preview = preview.map(str::to_owned);
+                if self.interaction.confirm(&request).await {
                     (Ok(()), "approved")
                 } else {
                     (Err(format!("Execution denied by user after safety review: {detail}. Do not repeat this unchanged action or bypass review.")), "user_rejected")
                 }
             }
         };
-        let mut context = auto.context.write();
+        let mut context = self.context.write();
         if context.generation != generation {
             return Err("Execution denied: user request changed during confirmation".into());
+        }
+        if context.clarification_revision != revision {
+            return Err("Execution denied: user clarification changed during safety review".into());
+        }
+        if context.interaction_cancelled {
+            return Err(CLARIFICATION_CANCELLED.into());
         }
         let receipt = ReviewReceipt {
             generation,
@@ -446,27 +549,58 @@ impl SecurityManager {
         }
         result.map(|_| receipt)
     }
+    fn check_review_version(
+        &self,
+        generation: u64,
+        revision: u64,
+        stage: &str,
+    ) -> Result<(), String> {
+        let context = self.context.read();
+        if context.generation != generation {
+            return Err(format!(
+                "Execution denied: user request changed during {stage}"
+            ));
+        }
+        if context.clarification_revision != revision {
+            return Err("Execution denied: user clarification changed during safety review".into());
+        }
+        if context.interaction_cancelled {
+            return Err(CLARIFICATION_CANCELLED.into());
+        }
+        Ok(())
+    }
     fn extract_command(args: &serde_json::Value) -> Option<&str> {
         args.get("command").and_then(|v| v.as_str())
     }
 
+    async fn confirm_action(
+        &self,
+        action: &ToolAction<'_>,
+        preview: Option<&str>,
+    ) -> Result<(), String> {
+        self.check_interaction()?;
+        let (generation, revision) = {
+            let context = self.context.read();
+            (context.generation, context.clarification_revision)
+        };
+        let mut request = confirmation_action(action);
+        request.preview = preview.map(str::to_owned);
+        let allowed = self.interaction.confirm(&request).await;
+        self.check_review_version(generation, revision, "confirmation")?;
+        if allowed {
+            Ok(())
+        } else {
+            Err("Execution denied by user".into())
+        }
+    }
+
     pub async fn authorize(&self, action: &ToolAction<'_>) -> Result<(), String> {
-        let tool_name = action.tool_name;
+        self.check_interaction()?;
         let args = action.args;
         match self.mode {
             SecurityMode::Direct => Ok(()),
             SecurityMode::Auto => self.authorize_auto(action).await,
-            SecurityMode::Confirm => {
-                let action = match Self::extract_command(args) {
-                    Some(command) => format!("{tool_name}: {command}"),
-                    None => format!("{tool_name}: {args}"),
-                };
-                if self.confirmer.confirm(&action).await {
-                    Ok(())
-                } else {
-                    Err("Execution denied by user".into())
-                }
-            }
+            SecurityMode::Confirm => self.confirm_action(action, None).await,
             SecurityMode::Whitelist => {
                 let command = Self::extract_command(args)
                     .ok_or_else(|| "no command found in args".to_string())?;
@@ -479,28 +613,70 @@ impl SecurityManager {
     }
 }
 
-fn confirmation_action(action: &ToolAction<'_>) -> String {
-    let mut display = format!("{} · {}", action.tool_name, action.args);
-    match &action.resolved {
+const CLARIFICATION_CANCELLED: &str =
+    "User cancelled clarification; do not execute further tools in this turn.";
+
+fn confirmation_action(action: &ToolAction<'_>) -> ConfirmationRequest {
+    let details = match &action.resolved {
         Some(ResolvedAction::Shell {
             command,
             shell,
             flag,
         }) => {
-            display.push_str(&format!("; executes {shell} {flag}: {command}"));
+            let mut details = format!("{shell} {flag}:\n{command}");
+            let arguments = match action.args.as_object() {
+                Some(args)
+                    if args.get("command").and_then(serde_json::Value::as_str)
+                        == Some(*command) =>
+                {
+                    let remaining = args
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "command")
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    (!remaining.is_empty()).then(|| {
+                        serde_json::to_string_pretty(&remaining).expect("serializable args")
+                    })
+                }
+                _ => Some(serde_json::to_string_pretty(action.args).expect("serializable args")),
+            };
+            if let Some(arguments) = arguments {
+                details.push_str(&format!("\nArguments:\n{arguments}"));
+            }
+            details
         }
-        Some(ResolvedAction::HttpGet { url }) => {
-            display.push_str(&format!("; GET {url}"));
+        Some(ResolvedAction::HttpGet { url }) => format!("GET {url}"),
+        Some(ResolvedAction::FileMutation { evidence }) => format!(
+            "{} {}\n{}",
+            evidence["operation"],
+            evidence["resolved_path"],
+            serde_json::to_string_pretty(action.args).expect("serializable args")
+        ),
+        None => serde_json::to_string_pretty(action.args).expect("serializable args"),
+    };
+    let summary = match &action.resolved {
+        Some(ResolvedAction::Shell { command, .. }) => {
+            command.lines().next().unwrap_or(command).to_string()
         }
+        Some(ResolvedAction::HttpGet { url }) => format!("GET {url}"),
         Some(ResolvedAction::FileMutation { evidence }) => {
-            display.push_str(&format!(
-                "; {} {}",
-                evidence["operation"], evidence["resolved_path"]
-            ));
+            format!("{} {}", evidence["operation"], evidence["resolved_path"])
         }
-        None => {}
+        None => action
+            .args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(action.tool_name)
+            .to_string(),
+    };
+    ConfirmationRequest {
+        tool_name: action.tool_name.to_owned(),
+        summary,
+        details,
+        reason: None,
+        missing_evidence: Vec::new(),
+        risk_label: None,
+        preview: None,
     }
-    display
 }
 
 fn escape_terminal_controls(text: String) -> String {
@@ -527,6 +703,306 @@ fn escape_terminal_controls(text: String) -> String {
 mod tests {
     use super::*;
 
+    struct AnswerInteraction(AskResult);
+    #[async_trait]
+    impl HumanInteraction for AnswerInteraction {
+        async fn ask(&self, _: &AskRequest) -> AskResult {
+            self.0.clone()
+        }
+        async fn confirm(&self, _: &ConfirmationRequest) -> bool {
+            false
+        }
+    }
+
+    fn text_request() -> AskRequest {
+        serde_json::from_value(
+            serde_json::json!({"questions":[{"id":"detail","question":"Which data?"}]}),
+        )
+        .unwrap()
+    }
+
+    fn answered() -> AskResult {
+        AskResult::Answered {
+            answers: vec![crate::interaction::AskAnswer {
+                question_id: "detail".into(),
+                selected: vec![],
+                custom: Some("keep data".into()),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_ask_is_bounded_and_preserves_history() {
+        let manager = SecurityManager::new(SecurityMode::Direct)
+            .with_interaction(Arc::new(AnswerInteraction(answered())));
+        manager.set_user_request("original");
+        for _ in 0..8 {
+            manager.ask(&text_request()).await.unwrap();
+        }
+        assert!(manager.ask(&text_request()).await.is_err());
+        let context = manager.context.read();
+        assert_eq!(&*context.user_request, "original");
+        assert_eq!(context.clarification_revision, 8);
+        assert_eq!(context.clarifications.len(), 8);
+        assert!(!context.interaction_cancelled);
+    }
+
+    #[tokio::test]
+    async fn cancelled_ask_blocks_all_modes_and_next_turn_resets() {
+        for mode in [
+            SecurityMode::Direct,
+            SecurityMode::Confirm,
+            SecurityMode::Auto,
+            SecurityMode::Whitelist,
+        ] {
+            let manager = SecurityManager::new(mode).with_interaction(Arc::new(AnswerInteraction(
+                AskResult::Cancelled {
+                    reason: AskCancelReason::Eof,
+                },
+            )));
+            manager.set_user_request("first");
+            manager.ask(&text_request()).await.unwrap();
+            let args = serde_json::json!({"command":"echo hi"});
+            let action = ToolAction {
+                tool_name: "shell",
+                args: &args,
+                description: None,
+                resolved: None,
+            };
+            assert_eq!(
+                manager.authorize(&action).await.unwrap_err(),
+                CLARIFICATION_CANCELLED
+            );
+            assert!(manager.ask(&text_request()).await.is_err());
+            manager.set_user_request("second");
+            assert!(!manager.interaction_cancelled());
+            assert!(manager.context.read().clarifications.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_answers_and_capacity_fail_without_cancelling() {
+        let manager = SecurityManager::new(SecurityMode::Direct).with_interaction(Arc::new(
+            AnswerInteraction(AskResult::Answered { answers: vec![] }),
+        ));
+        assert!(manager.ask(&text_request()).await.is_err());
+        assert!(!manager.interaction_cancelled());
+        manager
+            .context
+            .write()
+            .clarifications
+            .push(review::UserClarification {
+                question_id: "old".into(),
+                question: "x".repeat(64 * 1024),
+                selected_options: vec![],
+                custom: None,
+            });
+        assert!(manager.ask(&text_request()).await.is_err());
+        assert!(!manager.interaction_cancelled());
+    }
+
+    struct PausedInteraction {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl HumanInteraction for PausedInteraction {
+        async fn ask(&self, _: &AskRequest) -> AskResult {
+            self.entered.notify_one();
+            self.release.notified().await;
+            answered()
+        }
+        async fn confirm(&self, _: &ConfirmationRequest) -> bool {
+            self.entered.notify_one();
+            self.release.notified().await;
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_ask_does_not_cancel_or_authorize_new_turn() {
+        let interaction = Arc::new(PausedInteraction {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = Arc::new(
+            SecurityManager::new(SecurityMode::Direct).with_interaction(interaction.clone()),
+        );
+        manager.set_user_request("first");
+        let asking = manager.clone();
+        let task = tokio::spawn(async move { asking.ask(&text_request()).await });
+        interaction.entered.notified().await;
+        manager.set_user_request("second");
+        interaction.release.notify_one();
+        assert_eq!(
+            task.await.unwrap().unwrap(),
+            AskResult::Cancelled {
+                reason: AskCancelReason::Unavailable
+            }
+        );
+        assert!(!manager.interaction_cancelled());
+        assert!(manager.context.read().clarifications.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_confirmation_cannot_approve_changed_generation_or_revision() {
+        for mode in [SecurityMode::Confirm, SecurityMode::Auto] {
+            for change_revision in [false, true] {
+                let interaction = Arc::new(PausedInteraction {
+                    entered: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                });
+                let manager = Arc::new(
+                    SecurityManager::new(mode)
+                        .with_reviewer(fixed(
+                            review::Risk::High,
+                            review::Authorization::WithinScope,
+                        ))
+                        .with_interaction(interaction.clone()),
+                );
+                manager.set_user_request("first");
+                let executing = manager.clone();
+                let task = tokio::spawn(async move {
+                    let args = serde_json::json!({"command":"echo hi"});
+                    executing
+                        .authorize(&ToolAction {
+                            tool_name: "shell",
+                            args: &args,
+                            description: None,
+                            resolved: None,
+                        })
+                        .await
+                });
+                interaction.entered.notified().await;
+                if change_revision {
+                    let asking = manager
+                        .as_ref()
+                        .clone()
+                        .with_interaction(Arc::new(AnswerInteraction(answered())));
+                    asking.ask(&text_request()).await.unwrap();
+                } else {
+                    manager.set_user_request("second");
+                }
+                interaction.release.notify_one();
+                assert!(task
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .contains(if change_revision {
+                        "clarification changed"
+                    } else {
+                        "request changed"
+                    }));
+                assert!(manager.context.read().history.is_empty());
+                assert!(manager.context.read().denied.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_clarification_versions_denials_without_erasing_history() {
+        let reviewer = fixed(review::Risk::Unknown, review::Authorization::WithinScope);
+        let manager = SecurityManager::new(SecurityMode::Auto)
+            .with_reviewer(reviewer.clone())
+            .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                vec![false, true].into(),
+            ))));
+        manager.set_user_request("original");
+        let args = serde_json::json!({"command":"echo hi"});
+        let action = ToolAction {
+            tool_name: "shell",
+            args: &args,
+            description: None,
+            resolved: None,
+        };
+        assert!(manager.authorize(&action).await.is_err());
+        assert!(manager.authorize(&action).await.is_err());
+        manager.ask(&text_request()).await.unwrap();
+        assert_eq!(manager.context.read().history.len(), 1);
+        assert_eq!(manager.context.read().denied.len(), 1);
+        manager.authorize(&action).await.unwrap();
+        assert_eq!(reviewer.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(manager.context.read().history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn trusted_clarifications_store_only_actual_selected_option_snapshots() {
+        let request: AskRequest = serde_json::from_value(serde_json::json!({"questions":[{
+            "id":"policy","question":"Handle data?", "options":[
+                {"id":"keep","label":"Keep","description":"Keep persistent data"},
+                {"id":"delete","label":"Delete","description":"Delete everything"}
+            ],"recommended":"delete"
+        }]}))
+        .unwrap();
+        let manager = SecurityManager::new(SecurityMode::Direct).with_interaction(Arc::new(
+            AnswerInteraction(AskResult::Answered {
+                answers: vec![crate::interaction::AskAnswer {
+                    question_id: "policy".into(),
+                    selected: vec!["keep".into()],
+                    custom: None,
+                }],
+            }),
+        ));
+        manager.set_user_request("uninstall");
+        manager.ask(&request).await.unwrap();
+        let context = manager.context.read();
+        assert_eq!(&*context.user_request, "uninstall");
+        let selected = &context.clarifications[0].selected_options;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "keep");
+        assert_eq!(
+            selected[0].description.as_deref(),
+            Some("Keep persistent data")
+        );
+        assert!(!serde_json::to_string(&context.clarifications)
+            .unwrap()
+            .contains("Delete everything"));
+    }
+
+    #[tokio::test]
+    async fn clarification_during_review_invalidates_decision_without_caching() {
+        struct ClarifyingReviewer(SecurityManager);
+        #[async_trait]
+        impl SafetyReviewer for ClarifyingReviewer {
+            async fn review(
+                &self,
+                request: &ReviewRequest<'_>,
+            ) -> Result<review::ReviewOutcome, review::ReviewError> {
+                assert!(request.clarifications.is_empty());
+                self.0.ask(&text_request()).await.unwrap();
+                Ok(review::ReviewOutcome {
+                    risk: review::Risk::Medium,
+                    authorization: review::Authorization::WithinScope,
+                    reason: "bounded".into(),
+                    missing_evidence: vec![],
+                })
+            }
+        }
+        let manager = SecurityManager::new(SecurityMode::Auto)
+            .with_interaction(Arc::new(AnswerInteraction(answered())));
+        manager.set_user_request("original");
+        let mut clarifying = SecurityManager::new(SecurityMode::Direct)
+            .with_interaction(Arc::new(AnswerInteraction(answered())));
+        clarifying.context = Arc::clone(&manager.context);
+        manager.install_reviewer(Arc::new(ClarifyingReviewer(clarifying)));
+        let args = serde_json::json!({"command":"echo hi"});
+        let action = ToolAction {
+            tool_name: "shell",
+            args: &args,
+            description: None,
+            resolved: None,
+        };
+        assert!(manager
+            .authorize(&action)
+            .await
+            .unwrap_err()
+            .contains("clarification changed"));
+        assert_eq!(manager.context.read().clarification_revision, 1);
+        assert!(manager.context.read().denied.is_empty());
+        assert!(manager.context.read().history.is_empty());
+    }
+
     struct FixedReviewer(review::ReviewOutcome, std::sync::atomic::AtomicUsize);
     #[async_trait]
     impl SafetyReviewer for FixedReviewer {
@@ -541,9 +1017,11 @@ mod tests {
 
     struct ConfirmSequence(parking_lot::Mutex<std::collections::VecDeque<bool>>);
     #[async_trait]
-    impl UserConfirmation for ConfirmSequence {
-        async fn confirm(&self, action: &str) -> bool {
-            assert!(!action.chars().any(char::is_control));
+    impl HumanInteraction for ConfirmSequence {
+        async fn ask(&self, _: &AskRequest) -> AskResult {
+            answered()
+        }
+        async fn confirm(&self, _: &ConfirmationRequest) -> bool {
             self.0.lock().pop_front().expect("unexpected confirmation")
         }
     }
@@ -565,7 +1043,7 @@ mod tests {
         let reviewer = fixed(review::Risk::Unknown, review::Authorization::WithinScope);
         let manager = SecurityManager::new(SecurityMode::Auto)
             .with_reviewer(reviewer.clone())
-            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+            .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                 vec![false, true].into(),
             ))));
         manager.set_user_request("first");
@@ -593,7 +1071,7 @@ mod tests {
         assert_eq!(reviewer.1.load(std::sync::atomic::Ordering::SeqCst), 2);
         manager.set_user_request("second");
         manager
-            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+            .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                 vec![true].into(),
             ))))
             .authorize(&action)
@@ -614,7 +1092,7 @@ mod tests {
         ] {
             let manager = SecurityManager::new(SecurityMode::Auto)
                 .with_reviewer(fixed(risk, authorization))
-                .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                     vec![].into(),
                 ))));
             manager.set_user_request("first");
@@ -650,12 +1128,11 @@ mod tests {
         let two = two.unwrap();
         manager.record_execution(two.as_ref(), false);
         manager.record_execution(one.as_ref(), true);
-        let auto = manager.auto.as_ref().unwrap();
-        assert_eq!(auto.context.read().history[0].status, "executed");
-        assert_eq!(auto.context.read().history[1].status, "failed");
+        assert_eq!(manager.context.read().history[0].status, "executed");
+        assert_eq!(manager.context.read().history[1].status, "failed");
         manager.set_user_request("second");
         manager.record_execution(one.as_ref(), true);
-        assert!(auto.context.read().history.is_empty());
+        assert!(manager.context.read().history.is_empty());
     }
 
     #[test]
@@ -708,7 +1185,7 @@ mod tests {
         let manager = Arc::new(
             SecurityManager::new(SecurityMode::Auto)
                 .with_reviewer(reviewer.clone())
-                .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                     vec![].into(),
                 )))),
         );
@@ -729,14 +1206,7 @@ mod tests {
         manager.set_user_request("second");
         reviewer.release.notify_one();
         assert!(task.await.unwrap().unwrap_err().contains("request changed"));
-        assert!(manager
-            .auto
-            .as_ref()
-            .unwrap()
-            .context
-            .read()
-            .history
-            .is_empty());
+        assert!(manager.context.read().history.is_empty());
     }
 
     #[tokio::test]
@@ -748,13 +1218,13 @@ mod tests {
             description: None,
             resolved: None,
         };
-        let manager = SecurityManager::new(SecurityMode::Auto).with_confirmer(Arc::new(
+        let manager = SecurityManager::new(SecurityMode::Auto).with_interaction(Arc::new(
             ConfirmSequence(parking_lot::Mutex::new(vec![false].into())),
         ));
         assert!(manager.authorize(&action).await.is_err());
         let manager = SecurityManager::new(SecurityMode::Auto)
             .with_reviewer(fixed(review::Risk::Low, review::Authorization::WithinScope))
-            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+            .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                 vec![false].into(),
             ))));
         assert!(manager.authorize(&action).await.is_err());
@@ -859,12 +1329,17 @@ mod tests {
     async fn confirmation_denial_prevents_execution() {
         struct DenyAll;
         #[async_trait]
-        impl UserConfirmation for DenyAll {
-            async fn confirm(&self, _command: &str) -> bool {
+        impl HumanInteraction for DenyAll {
+            async fn ask(&self, _: &AskRequest) -> AskResult {
+                AskResult::Cancelled {
+                    reason: AskCancelReason::Unavailable,
+                }
+            }
+            async fn confirm(&self, _: &ConfirmationRequest) -> bool {
                 false
             }
         }
-        let mgr = SecurityManager::new(SecurityMode::Confirm).with_confirmer(Arc::new(DenyAll));
+        let mgr = SecurityManager::new(SecurityMode::Confirm).with_interaction(Arc::new(DenyAll));
         assert_eq!(
             mgr.authorize(&ToolAction {
                 tool_name: "shell",

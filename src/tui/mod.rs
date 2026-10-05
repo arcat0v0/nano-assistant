@@ -36,6 +36,7 @@ use crate::hub::{maybe_render_ad, model_routes_via_hub};
 use crate::security::SecurityManager;
 use rig::agent::model::ModelHandle;
 
+pub mod interaction;
 mod onboarding;
 mod resources;
 
@@ -752,11 +753,14 @@ async fn activate_model(
     security: &Arc<SecurityManager>,
 ) {
     if security.needs_reviewer() {
-        security.install_reviewer(Arc::new(crate::security::review::ModelSafetyReviewer::new(
-            model.clone(),
-            resolved_model.temperature,
-            Duration::from_secs(resolved_model.timeout_secs),
-        )));
+        security.install_reviewer(Arc::new(
+            crate::security::review::ModelSafetyReviewer::new(
+                model.clone(),
+                resolved_model.temperature,
+                Duration::from_secs(resolved_model.timeout_secs),
+            )
+            .with_protected_config(config_path.to_path_buf()),
+        ));
     }
     if let Some(agent) = agent {
         agent.switch_model(model, resolved_model, config).await;
