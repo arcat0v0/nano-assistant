@@ -1490,3 +1490,100 @@ fn tui_without_configured_default_key_can_enter_model_onboarding() {
     assert_success(&output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("/model add"));
 }
+
+#[test]
+fn startup_creates_missing_config_and_preserves_it_on_restart() {
+    for directory_exists in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".config/nano-assistant/config.toml");
+        if directory_exists {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let launch = || {
+            let mut child = Command::new(env!("CARGO_BIN_EXE_na"))
+                .current_dir(temp.path())
+                .env("HOME", temp.path())
+                .env("XDG_CONFIG_HOME", temp.path().join(".config"))
+                .env_remove("NA_PROVIDER")
+                .env_remove("NA_MODEL")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(b"/exit\n").unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let output = launch();
+        assert!(output.status.success(), "{:?}", output);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let config: nano_assistant::config::Config = toml::from_str(&source).unwrap();
+        assert_eq!(config.provider.provider.as_deref(), Some("deepseek"));
+        assert_eq!(config.provider.model.as_deref(), Some("deepseek-flash"));
+        assert!(config.provider.api_key.is_none());
+        assert_eq!(config.security.mode, "direct");
+        assert!(config.memory.enabled);
+        assert!(config.behavior.streaming);
+        let custom = source.replace("deepseek-flash", "user-selected-model");
+        std::fs::write(&path, &custom).unwrap();
+        let output = launch();
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+}
+
+#[test]
+fn startup_initializes_custom_config_before_a_missing_key_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("custom/config.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_na"))
+        .args(["chat", "--config-path"])
+        .arg(&path)
+        .arg("hello")
+        .env_remove("NA_API_KEY")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("NA_PROVIDER")
+        .env_remove("NA_MODEL")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("deepseek API key not set"));
+    let config: nano_assistant::config::Config =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(config.provider.model.as_deref(), Some("deepseek-flash"));
+}
+
+#[test]
+fn startup_reports_config_creation_failure_without_entering_chat() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("not-a-directory");
+    std::fs::write(&parent, "preserve this file").unwrap();
+    let output = run_cli(
+        temp.path(),
+        &parent.join("config.toml"),
+        Some("/exit\n"),
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not-a-directory"));
+    assert_eq!(
+        std::fs::read_to_string(&parent).unwrap(),
+        "preserve this file"
+    );
+}
+
+#[test]
+fn informational_flags_and_removed_config_flag_do_not_create_config() {
+    let temp = tempfile::tempdir().unwrap();
+    for (flag, succeeds) in [("--help", true), ("--version", true), ("--config", false)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_na"))
+            .arg(flag)
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join(".config"))
+            .env("EDITOR", "/bin/true")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), succeeds, "{:?}", output);
+        assert!(!temp.path().join(".config").exists());
+    }
+}

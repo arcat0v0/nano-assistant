@@ -8,7 +8,39 @@ pub use schema::{
     ModelProfile, ModelsConfig, ProviderConfig, SecurityConfig, SkillsConfig,
 };
 
+use std::io::Write;
 use std::path::Path;
+
+use anyhow::Context;
+
+pub fn load_or_initialize_config(path: &Path) -> anyhow::Result<Config> {
+    if path.exists() {
+        return Ok(load_config_or_default(path));
+    }
+
+    let config = Config::first_run_default();
+    let serialized = toml::to_string_pretty(&config)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating config directory {}", parent.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating config {}", path.display()))?;
+    temporary.write_all(serialized.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(config),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(load_config_or_default(path))
+        }
+        Err(error) => {
+            Err(error.error).with_context(|| format!("creating config {}", path.display()))
+        }
+    }
+}
 
 pub fn load_config_or_default(path: &Path) -> Config {
     if path.exists() {

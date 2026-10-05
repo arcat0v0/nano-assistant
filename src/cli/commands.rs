@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 use crate::agent::turn_streamed_to_stdout;
@@ -9,7 +8,9 @@ use crate::config::models::{
     add_profile, list_profiles, remove_profile, resolve_selection, set_default_profile,
 };
 use crate::config::schema::default_config_path;
-use crate::config::{load_config_or_default, Config, ModelProfile, ResolvedModel};
+use crate::config::{
+    load_config_or_default, load_or_initialize_config, Config, ModelProfile, ResolvedModel,
+};
 use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
 use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
 use anyhow::Context;
@@ -25,7 +26,6 @@ struct CliArgsInner {
     prompt: Vec<String>,
     mode: Option<String>,
     debug: bool,
-    config: bool,
     config_path: Option<std::path::PathBuf>,
     verbose: bool,
     profile: Option<String>,
@@ -49,7 +49,6 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             prompt,
             mode,
             debug,
-            config,
             config_path,
             verbose,
             profile,
@@ -60,7 +59,6 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
                 prompt,
                 mode,
                 debug,
-                config,
                 config_path,
                 verbose,
                 profile,
@@ -78,7 +76,7 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
         }) => handle_model_command(config_path.unwrap_or_else(default_config_path), action).await,
         None => {
             let config_path = default_config_path();
-            let catalog = load_config_or_default(&config_path);
+            let catalog = load_or_initialize_config(&config_path)?;
             let selected = resolve_selection(&catalog, None, None, None)?;
             let config = selected.apply_to_config(&catalog);
             let security_mode = resolve_security_mode(None, &config);
@@ -88,13 +86,8 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
 }
 
 async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
-    if args.config {
-        let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
-        return open_config_editor(config_path);
-    }
-
     let config_path = args.config_path.clone().unwrap_or_else(default_config_path);
-    let catalog = load_config_or_default(&config_path);
+    let catalog = load_or_initialize_config(&config_path)?;
     let selected = resolve_selection(
         &catalog,
         args.profile.as_deref(),
@@ -399,64 +392,6 @@ fn spawn_immediate_ctrl_c_exit() -> tokio::task::JoinHandle<()> {
             std::process::exit(130);
         }
     })
-}
-
-fn open_config_editor(config_path: std::path::PathBuf) -> anyhow::Result<()> {
-    if !config_path.exists() {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let default_config = r#"# nano-assistant configuration
-[provider]
-# provider = "openai"    # openai | anthropic | gemini | glm | ollama
-# model = "gpt-4o-mini"
-# api_key = "sk-..."
-# api_url = ""
-# temperature = 0.7
-
-[hub]
-# url = "https://hub.nana.dev"
-# enabled = true
-# machine_id = ""
-# identity_path = "~/.config/nano-assistant/identity.key"
-# auto_register = true
-# ad_display = "inline"  # inline | banner | minimal | none
-
-[memory]
-# enabled = true
-# max_messages = 100
-
-[security]
-# mode = "direct"        # direct | confirm | whitelist
-# whitelist = ["ls", "cat", "docker *"]
-
-[behavior]
-# max_iterations = 10
-# debug = false
-# verbose_errors = true
-# explain_tools = true
-"#;
-        std::fs::write(&config_path, default_config)?;
-        eprintln!("[cli] created default config at {}", config_path.display());
-    }
-
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-        if Command::new("nano").arg("--version").output().is_ok() {
-            "nano".to_string()
-        } else {
-            "vim".to_string()
-        }
-    });
-
-    let status = Command::new(&editor).arg(&config_path).status()?;
-
-    if status.success() {
-        eprintln!("[cli] config saved to {}", config_path.display());
-    } else {
-        anyhow::bail!("editor '{editor}' exited with status {}", status);
-    }
-
-    Ok(())
 }
 
 async fn handle_hub_command(command: HubSubcommand) -> anyhow::Result<()> {
@@ -898,12 +833,6 @@ mod tests {
         let mut config = Config::default();
         config.behavior.debug = true;
         assert!(resolve_debug_mode(args.is_debug(), &config));
-    }
-
-    #[test]
-    fn cli_chat_config_flag() {
-        let args = parse_chat(&["--config"]);
-        assert!(args.is_config_flag());
     }
 
     #[test]

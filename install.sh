@@ -225,6 +225,5 @@ info "Verifying installation..."
 "$INSTALL_DIR/na" --version
 
 printf '\n'
-info "Done. Set your API key to get started:"
-printf '  export NA_API_KEY="sk-..."\n'
-printf '  na --config\n'
+info "Done. Run na to create your configuration and connect DeepSeek:"
+printf '  na\n'

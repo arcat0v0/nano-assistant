@@ -80,8 +80,6 @@ pub enum Commands {
         mode: Option<String>,
         #[arg(long)]
         debug: bool,
-        #[arg(long)]
-        config: bool,
         #[arg(long, value_name = "PATH")]
         config_path: Option<PathBuf>,
         #[arg(short, long)]
@@ -152,10 +150,6 @@ impl CliArgs {
                 .unwrap_or_else(crate::config::schema::default_config_path),
             _ => crate::config::schema::default_config_path(),
         }
-    }
-
-    pub fn is_config_flag(&self) -> bool {
-        matches!(&self.command, Some(Commands::Chat { config: true, .. }))
     }
 
     pub fn is_verbose(&self) -> bool {

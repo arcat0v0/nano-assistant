@@ -41,7 +41,7 @@
 
 脚本支持 Linux x86_64 / aarch64，使用 `curl` 或 `wget` 下载静态 musl 二进制，要求 `jq`、`tar`、`gzip`、`sha256sum` 和基础 coreutils；使用 wget 时还要求 `timeout`。它检测公网出口国家：`CN` 优先 Gitee，其他地区优先 GitHub，检测失败显示 `unknown` 并尝试可用来源。代理会影响出口判断。
 
-默认选择首选平台上语义版本最高、带完整发布清单的正式版，排除草稿和预览版。下载失败时自动模式换源重试同一版本，压缩包和校验文件重新成组获取；校验不匹配直接停止。二进制通过 SHA256 与运行版本检查后原子替换到 `~/.local/bin`，并按需将安装目录加入 shell rc 文件的 PATH。脚本不创建配置目录或配置文件，也不修改已有配置；需要创建或编辑配置时运行 `na --config`，由 `na` 二进制负责生成模板并打开编辑器。
+默认选择首选平台上语义版本最高、带完整发布清单的正式版，排除草稿和预览版。下载失败时自动模式换源重试同一版本，压缩包和校验文件重新成组获取；校验不匹配直接停止。二进制通过 SHA256 与运行版本检查后原子替换到 `~/.local/bin`，并按需将安装目录加入 shell rc 文件的 PATH。脚本不创建配置目录或配置文件，也不修改已有配置；正常运行 `na` 时由二进制自动创建缺失的配置，已有配置保持不变。
 
 可选环境变量：
 
@@ -117,26 +117,24 @@ na --help
 
 ## 快速上手
 
-### 第一步：配置 API Key
+### 第一步：运行 na 并连接模型
 
 ```bash
-na --config
+na
 ```
 
-这会用系统编辑器（`$EDITOR`，回退到 `nano`，再回退到 `vim`）打开配置文件。在配置文件中填入你的 API Key：
+正常启动时，`na` 自动创建缺失的配置目录和 `config.toml`，显式保存 DeepSeek / `deepseek-flash` 默认模型；已有配置不会被覆盖。配置默认位于 `${XDG_CONFIG_HOME:-$HOME/.config}/nano-assistant/config.toml`，`--config-path` 可指定其他路径。`--help` 和 `--version` 不创建配置。
 
-```toml
-[provider]
-provider = "openai"       # 选择你的 LLM 提供商
-model = "gpt-4o-mini"     # 选择模型
-api_key = "sk-..."        # 填入你的 API Key
-```
+首次在终端进入交互模式且没有 DeepSeek 凭据时，`na` 引导输入 API Key，遮罩输入并测试连接。验证成功后，密钥保存在配置目录的 `deepseek.key` 中，模型档案及默认选择写入 `config.toml`。需要手动修改设置时直接编辑配置文件，不再提供 `na --config` 或自动打开编辑器的入口。
 
-或者通过环境变量设置（优先级高于配置文件）：
+也可在启动前通过环境变量提供凭据：
 
 ```bash
-export NA_API_KEY="sk-..."
+export DEEPSEEK_API_KEY="sk-..."
+na
 ```
+
+单命令模式不会提示输入密钥；缺少凭据时会报错。其他提供商可通过交互式 `/model add` 添加，或手动编辑配置；`NA_API_KEY` 可用于当前提供商的通用密钥覆盖。
 
 ### 第二步：开始使用
 
@@ -466,7 +464,6 @@ whitelist = [
 | `NANA_HUB_URL` | 覆盖 `[hub].url` | `https://hub.example.com` |
 | `NANA_HUB_DISABLED` | 临时禁用 hub 路由（`1` / `true`） | `1` |
 | `NANA_IDENTITY_PATH` | 覆盖 identity 文件路径 | `/tmp/nana-identity.key` |
-| `EDITOR` | `na --config` 使用的编辑器 | `vim` |
 
 ## 内置工具
 
