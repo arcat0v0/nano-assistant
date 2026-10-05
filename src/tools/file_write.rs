@@ -1,11 +1,69 @@
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use super::file_mutation::PreparedFileMutation;
+use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
+use rig::tool::{DynamicTool, Tool, ToolContext, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 pub struct FileWriteTool;
 
 impl FileWriteTool {
     pub fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn into_dynamic(self, security: Arc<SecurityManager>) -> DynamicTool {
+        security.register_prepared_tool(Self::NAME);
+        DynamicTool::new(
+            Self::NAME,
+            self.description(),
+            self.parameters(),
+            move |_context, args| {
+                let security = Arc::clone(&security);
+                Box::pin(
+                    async move { Self::run(args, Some(&security)).await.map(ToolOutput::text) },
+                )
+            },
+        )
+    }
+
+    async fn run(
+        args: Value,
+        security: Option<&SecurityManager>,
+    ) -> Result<String, ToolExecutionError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'content' parameter"))?;
+        let prepared = PreparedFileMutation::write(std::path::Path::new(path), content).await?;
+        let message = format!("Written {} bytes to {path}", content.len());
+        let mut receipt = None;
+        if let Some(security) = security.filter(|security| security.mode() == SecurityMode::Auto) {
+            let evidence = prepared.evidence();
+            receipt = security
+                .authorize_prepared(
+                    &ToolAction {
+                        tool_name: Self::NAME,
+                        args: &args,
+                        description: Some(&Self.description()),
+                        resolved: Some(ResolvedAction::FileMutation {
+                            evidence: &evidence,
+                        }),
+                    },
+                    &prepared.preview(),
+                )
+                .await
+                .map_err(ToolExecutionError::permission_denied)?;
+        }
+        let result = prepared.commit().await;
+        if let Some(security) = security {
+            security.record_execution(receipt.as_ref(), result.is_ok());
+        }
+        result?;
+        Ok(message)
     }
 }
 
@@ -49,34 +107,7 @@ impl Tool for FileWriteTool {
         _context: &mut ToolContext,
         args: Value,
     ) -> Result<String, ToolExecutionError> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
-        let content = args
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'content' parameter"))?;
-
-        let full_path = std::path::Path::new(path);
-        if super::is_protected_skill_path(full_path) {
-            return Err(ToolExecutionError::permission_denied(format!(
-                "Refusing to write builtin skill source: {}",
-                full_path.display()
-            )));
-        }
-
-        if let Some(parent) = full_path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolExecutionError::other(format!(
-                    "Failed to create parent directory for {path}: {e}"
-                ))
-            })?;
-        }
-        tokio::fs::write(full_path, content)
-            .await
-            .map_err(|e| ToolExecutionError::other(format!("Failed to write file {path}: {e}")))?;
-        Ok(format!("Written {} bytes to {path}", content.len()))
+        Self::run(args, None).await
     }
 }
 

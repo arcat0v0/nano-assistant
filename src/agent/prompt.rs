@@ -341,6 +341,8 @@ fn build_safety_section() -> String {
      - Do not exfiltrate private data.\n\
      - Do not run destructive commands without asking.\n\
      - Prefer `trash` over `rm`.\n\
+     - Safety review may approve, deny, or request human confirmation. Confirmation is handled by the runtime for the pending action. Do not repeat unchanged rejected actions to trigger confirmation, and do not bypass rejection with a different tool or ask the user to execute it manually. Retry only with material parameter or evidence changes that resolve the stated concern; otherwise explain the reason and continue independent work.\n\
+     - If a file target changed after preparation, read its current state and prepare a new operation; previous approval does not cover it.\n\
      - NEVER fabricate tool results. If a tool returns empty results, say \"No results found.\"\n\
      - If a tool call fails, report the error — never make up data."
         .to_string()

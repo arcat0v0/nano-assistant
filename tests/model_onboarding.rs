@@ -320,7 +320,7 @@ fn tui_guides_addition_from_live_models_without_default_model_key() {
             "object": "chat.completion",
             "created": 1,
             "model": "deepseek-zeta",
-            "choices": [{"index":0,"message":{"role":"assistant","content":"{\"risk\":5,\"user_confirmed\":false,\"reason\":\"bounded requested write\"}"},"finish_reason":"stop"}],
+            "choices": [{"index":0,"message":{"role":"assistant","content":"{\"risk\":\"low\",\"authorization\":\"within_scope\",\"reason\":\"bounded requested write\",\"missing_evidence\":[]}"},"finish_reason":"stop"}],
         }).to_string()),
         (200, completion("deepseek-zeta")),
     ]);

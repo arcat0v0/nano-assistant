@@ -695,38 +695,22 @@ fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
 }
 
 #[test]
-fn tui_auto_third_rejection_requires_current_confirmation() {
+fn tui_auto_first_uncertainty_requires_current_confirmation() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("review-marker.txt");
     let command = "printf reviewed > review-marker.txt";
     let main = QueuedCompletionFixture::start(vec![
-        queued_stream(None, "deny_first", Some(command)),
-        queued_stream(None, "deny_second", Some(command)),
         queued_stream(None, "call_deny", Some(command)),
         queued_stream(Some("First operation denied."), "", None),
-        queued_stream(None, "allow_first", Some(command)),
-        queued_stream(None, "allow_second", Some(command)),
         queued_stream(None, "call_allow", Some(command)),
         queued_stream(Some("Second operation completed."), "", None),
     ]);
     let reviewer = QueuedCompletionFixture::start(vec![
         queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
+            r#"{"risk":"unknown","authorization":"within_scope","reason":"first action requires current approval","missing_evidence":[]}"#,
         ),
         queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
-        ),
-        queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"first action requires current approval"}"#,
-        ),
-        queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
-        ),
-        queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
-        ),
-        queued_completion(
-            r#"{"risk":30,"user_confirmed":false,"reason":"second action requires current approval"}"#,
+            r#"{"risk":"unknown","authorization":"within_scope","reason":"second action requires current approval","missing_evidence":[]}"#,
         ),
     ]);
     let config_path = temp.path().join("assistant.toml");
@@ -767,13 +751,13 @@ fn tui_auto_third_rejection_requires_current_confirmation() {
     assert!(terminal.terminal_restored(), "{}", terminal.text());
 
     let main_requests = main.finish();
-    assert_eq!(main_requests.len(), 8);
+    assert_eq!(main_requests.len(), 4);
     for request in &main_requests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         assert_eq!(request.body.as_ref().unwrap()["stream"], true);
     }
-    let denied_result = main_requests[3].body.as_ref().unwrap()["messages"]
+    let denied_result = main_requests[1].body.as_ref().unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
@@ -783,7 +767,7 @@ fn tui_auto_third_rejection_requires_current_confirmation() {
     assert!(denied_result["content"]
         .to_string()
         .contains("Execution denied"));
-    let allowed_result = main_requests[7].body.as_ref().unwrap()["messages"]
+    let allowed_result = main_requests[3].body.as_ref().unwrap()["messages"]
         .as_array()
         .unwrap()
         .iter()
@@ -793,11 +777,8 @@ fn tui_auto_third_rejection_requires_current_confirmation() {
     assert!(!allowed_result["content"].to_string().contains("denied"));
 
     let review_requests = reviewer.finish();
-    assert_eq!(review_requests.len(), 6);
-    for (request, task) in review_requests
-        .iter()
-        .zip(["first", "first", "first", "second", "second", "second"])
-    {
+    assert_eq!(review_requests.len(), 2);
+    for (request, task) in review_requests.iter().zip(["first", "second"]) {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/chat/completions");
         let body = request.body.as_ref().unwrap();

@@ -23,7 +23,7 @@ use crate::agent::streaming::StreamOutputEvent;
 use crate::config::{Config, ResolvedModel, SkillsConfig};
 use crate::mcp::{DeferredMcpToolSet, McpRegistry, McpToolWrapper, ToolSearchTool};
 use crate::memory::Memory;
-use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
+use crate::security::{ResolvedAction, ReviewReceipt, SecurityManager, SecurityMode, ToolAction};
 use crate::skills::Skill;
 use crate::tools;
 
@@ -87,10 +87,14 @@ struct RuntimeState {
     builtin_file_read_active: bool,
     progress_count: usize,
     progress_calls: HashMap<String, usize>,
+    review_receipts: HashMap<String, ReviewReceipt>,
 }
 
 impl RuntimeState {
     async fn add_tool(&mut self, tool: DynamicTool) {
+        if matches!(tool.name(), "file_write" | "file_edit") {
+            self.security.unregister_prepared_tool(tool.name());
+        }
         if tool.name() == "file_read" {
             self.builtin_file_read_active = false;
         }
@@ -379,7 +383,7 @@ impl AgentHook for RuntimeHook {
             None
         };
         match security
-            .authorize(&ToolAction {
+            .authorize_execution(&ToolAction {
                 tool_name: event.tool_name,
                 args: &args,
                 description: description.as_deref(),
@@ -387,7 +391,16 @@ impl AgentHook for RuntimeHook {
             })
             .await
         {
-            Ok(()) => ToolCallAction::run(),
+            Ok(receipt) => {
+                if let Some(receipt) = receipt {
+                    self.0
+                        .lock()
+                        .await
+                        .review_receipts
+                        .insert(event.internal_call_id.to_owned(), receipt);
+                }
+                ToolCallAction::run()
+            }
             Err(reason) => ToolCallAction::skip(reason),
         }
     }
@@ -398,6 +411,10 @@ impl AgentHook for RuntimeHook {
         event: ToolResultEvent<'_>,
     ) -> ToolResultAction {
         let mut state = self.0.lock().await;
+        let receipt = state.review_receipts.remove(event.internal_call_id);
+        state
+            .security
+            .record_execution(receipt.as_ref(), event.raw_result.is_success());
         let name = state
             .progress_calls
             .remove(event.internal_call_id)
@@ -471,6 +488,7 @@ impl Agent {
         } = model_context;
         let handle = ToolServer::new().run();
         tools::register_builtin_tools(&handle).await;
+        tools::register_reviewed_file_tools(&handle, Arc::clone(&security)).await;
         let mut state = RuntimeState {
             handle: handle.clone(),
             skills,
@@ -490,6 +508,7 @@ impl Agent {
             builtin_file_read_active: true,
             progress_count: 0,
             progress_calls: HashMap::new(),
+            review_receipts: HashMap::new(),
         };
         for tool in tools {
             state.add_tool(tool).await;

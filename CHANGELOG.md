@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- Auto safety review now uses categorical risk, task authorization, and missing evidence instead of numeric scoring and three repeated submissions. Unknown or high-risk actions request confirmation immediately; unchanged rejected actions are deduplicated within the current request.
+- Builtin file writes and edits now prepare isolated filesystem evidence and revalidate the approved target. New files use exclusive creation; changed content, identity, or resolved paths cancel the write. Existing Backup files are blocked in auto mode independently of model approval.
+- Review history records bounded recent actions and their actual outcomes using per-execution receipts. Old file contents remain local, and optional real-model evaluation uses a dedicated non-production profile.
+
 ### Added
 
 - Local model profiles, `na model` management commands, one-shot model overrides, and interactive `/model` switching with optional saved default. Switching retains conversation and tool state without inheriting credentials from another provider.
@@ -29,7 +35,7 @@
 - Auto safety review retries malformed reviewer replies up to twice before involving the user, returning the rejection reason and a snippet of the invalid reply so the reviewer can correct its output. Human confirmation is now required only after three consecutive unusable responses; request failures and timeouts still confirm immediately.
 - Auto safety review now scores actions on a 1-100 risk scale: 1-9 auto-approves, 10-49 returns to the main model for revision, 50-69 auto-approves only when the latest user message explicitly confirms the destructive scope, 70-89 always requires live human confirmation, and 90-100 is prohibited outright, even with human approval. Commands that modify or delete existing files under ~/Backup are always prohibited.
 - Review context sections are wrapped in per-request random boundary tokens so forged confirmations embedded in tool arguments or prior rejections cannot impersonate the genuine user_request section.
-- Tool calls render as bordered blocks (⚒ header, 🛡 review verdict, ✓/✗ result) with color-coded risk words, and confirmation prompts show a readable action summary behind a ⚠ [y/N] flag instead of a raw JSON dump.
+- Tool calls render as bordered blocks (⚒ header, 🛡 review verdict, ✓/✗ result) with color-coded review statuses; confirmation prompts show the concrete arguments, resolved execution target, and local file preview behind a ⚠ [y/N] flag.
 
 ### Fixed
 

@@ -72,9 +72,10 @@ impl SkillHttpTool {
                 "Only http/https URLs are allowed",
             ));
         }
+        let mut receipt = None;
         if security.mode() == SecurityMode::Auto {
-            security
-                .authorize(&ToolAction {
+            receipt = security
+                .authorize_execution(&ToolAction {
                     tool_name: &self.tool_name,
                     args: &args,
                     description: Some(&self.description),
@@ -84,45 +85,49 @@ impl SkillHttpTool {
                 .map_err(ToolExecutionError::other)?;
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()
-            .map_err(|e| {
-                ToolExecutionError::network(format!("Failed to build HTTP client: {e}"))
-            })?;
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ToolExecutionError::network(format!("Request failed: {e}")))?;
+        let execution = async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| {
+                    ToolExecutionError::network(format!("Failed to build HTTP client: {e}"))
+                })?;
+            let response = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| ToolExecutionError::network(format!("Request failed: {e}")))?;
 
-        if !response.status().is_success() {
-            return Err(ToolExecutionError::provider(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| ToolExecutionError::network(format!("Failed to read response: {e}")))?;
-        let text = String::from_utf8_lossy(&bytes);
-        let result = if text.len() > MAX_RESPONSE_BYTES {
-            let mut boundary = MAX_RESPONSE_BYTES;
-            while !text.is_char_boundary(boundary) {
-                boundary -= 1;
+            if !response.status().is_success() {
+                return Err(ToolExecutionError::provider(format!(
+                    "HTTP {}",
+                    response.status()
+                )));
             }
-            format!(
-                "{}...\n[response truncated at {} bytes]",
-                &text[..boundary],
-                MAX_RESPONSE_BYTES
-            )
-        } else {
-            text.into_owned()
-        };
 
-        Ok(result)
+            let bytes = response.bytes().await.map_err(|e| {
+                ToolExecutionError::network(format!("Failed to read response: {e}"))
+            })?;
+            let text = String::from_utf8_lossy(&bytes);
+            let result = if text.len() > MAX_RESPONSE_BYTES {
+                let mut boundary = MAX_RESPONSE_BYTES;
+                while !text.is_char_boundary(boundary) {
+                    boundary -= 1;
+                }
+                format!(
+                    "{}...\n[response truncated at {} bytes]",
+                    &text[..boundary],
+                    MAX_RESPONSE_BYTES
+                )
+            } else {
+                text.into_owned()
+            };
+
+            Ok(result)
+        }
+        .await;
+        security.record_execution(receipt.as_ref(), execution.is_ok());
+        execution
     }
 }
 

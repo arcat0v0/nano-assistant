@@ -72,9 +72,10 @@ impl SkillShellTool {
                 command = command.replace(&format!("{{{{{}}}", key), value);
             }
         }
+        let mut receipt = None;
         if security.mode() == SecurityMode::Auto {
-            security
-                .authorize(&ToolAction {
+            receipt = security
+                .authorize_execution(&ToolAction {
                     tool_name: &self.tool_name,
                     args: &args,
                     description: Some(&self.description),
@@ -88,51 +89,56 @@ impl SkillShellTool {
                 .map_err(ToolExecutionError::other)?;
         }
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command).kill_on_drop(true);
+        let execution = async {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(&command).kill_on_drop(true);
 
-        for var in ["PATH", "HOME", "TERM", "LANG", "USER"] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let text = if stdout.len() > MAX_OUTPUT_BYTES {
-                    let mut boundary = MAX_OUTPUT_BYTES;
-                    while !stdout.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    format!(
-                        "{}...\n[output truncated at {} bytes]",
-                        &stdout[..boundary],
-                        MAX_OUTPUT_BYTES
-                    )
-                } else {
-                    stdout.into_owned()
-                };
-                if output.status.success() {
-                    Ok(text)
-                } else {
-                    Err(ToolExecutionError::other(format!(
-                        "Command exited with code {}: {text}\n{}",
-                        output.status.code().unwrap_or(-1),
-                        String::from_utf8_lossy(&output.stderr)
-                    )))
+            for var in ["PATH", "HOME", "TERM", "LANG", "USER"] {
+                if let Ok(val) = std::env::var(var) {
+                    cmd.env(var, val);
                 }
             }
-            Ok(Err(io_err)) => Err(ToolExecutionError::other(format!(
-                "Command failed: {io_err}"
-            ))),
-            Err(_) => Err(ToolExecutionError::timeout(format!(
-                "Command timed out after {SHELL_TIMEOUT_SECS}s"
-            ))),
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let text = if stdout.len() > MAX_OUTPUT_BYTES {
+                        let mut boundary = MAX_OUTPUT_BYTES;
+                        while !stdout.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        format!(
+                            "{}...\n[output truncated at {} bytes]",
+                            &stdout[..boundary],
+                            MAX_OUTPUT_BYTES
+                        )
+                    } else {
+                        stdout.into_owned()
+                    };
+                    if output.status.success() {
+                        Ok(text)
+                    } else {
+                        Err(ToolExecutionError::other(format!(
+                            "Command exited with code {}: {text}\n{}",
+                            output.status.code().unwrap_or(-1),
+                            String::from_utf8_lossy(&output.stderr)
+                        )))
+                    }
+                }
+                Ok(Err(io_err)) => Err(ToolExecutionError::other(format!(
+                    "Command failed: {io_err}"
+                ))),
+                Err(_) => Err(ToolExecutionError::timeout(format!(
+                    "Command timed out after {SHELL_TIMEOUT_SECS}s"
+                ))),
+            }
         }
+        .await;
+        security.record_execution(receipt.as_ref(), execution.is_ok());
+        execution
     }
 }
 

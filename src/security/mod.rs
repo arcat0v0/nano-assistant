@@ -4,8 +4,9 @@ pub mod whitelist;
 use crate::config::schema::SecurityConfig;
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use review::{ReviewRejection, ReviewRequest, SafetyReviewer, Verdict};
-use std::collections::HashSet;
+use review::{ActionRecord, ReviewDecision, ReviewRequest, SafetyReviewer};
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 #[derive(serde::Serialize)]
@@ -18,6 +19,9 @@ pub enum ResolvedAction<'a> {
     },
     HttpGet {
         url: &'a str,
+    },
+    FileMutation {
+        evidence: &'a serde_json::Value,
     },
 }
 
@@ -32,10 +36,74 @@ pub struct ToolAction<'a> {
 #[derive(Default)]
 struct AutoReviewState {
     reviewer: RwLock<Option<Arc<dyn SafetyReviewer>>>,
-    user_request: RwLock<Arc<str>>,
     prepared_tools: RwLock<HashSet<String>>,
-    dialogue: RwLock<Vec<ReviewRejection>>,
+    context: RwLock<ReviewContext>,
     review_gate: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct ReviewContext {
+    user_request: Arc<str>,
+    generation: u64,
+    denied: VecDeque<(String, String)>,
+    history: VecDeque<ActionRecord>,
+}
+
+impl ReviewContext {
+    fn record(
+        &mut self,
+        action: &ToolAction<'_>,
+        fingerprint: &str,
+        receipt: &str,
+        status: &str,
+        reason: &str,
+    ) {
+        let mut value = serde_json::to_value(action).expect("serializable tool action");
+        let mut truncated = false;
+        if value.to_string().len() > 4096 {
+            value = serde_json::json!({"tool_name": action.tool_name, "arguments_omitted": true});
+            truncated = true;
+        }
+        self.history.push_back(ActionRecord {
+            action: value,
+            fingerprint: fingerprint.to_owned(),
+            receipt: receipt.to_owned(),
+            status: status.to_owned(),
+            reason: reason.chars().take(512).collect(),
+            truncated,
+        });
+        while self.history.len() > 20
+            || serde_json::to_vec(&self.history)
+                .expect("serializable history")
+                .len()
+                > 32 * 1024
+        {
+            self.history.pop_front();
+            if let Some(first) = self.history.front_mut() {
+                first.truncated = true;
+            }
+        }
+    }
+
+    fn deny(&mut self, fingerprint: String, reason: String) {
+        self.denied.push_back((fingerprint, reason));
+        if self.denied.len() > 32 {
+            self.denied.pop_front();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReviewReceipt {
+    generation: u64,
+    id: String,
+}
+
+fn action_fingerprint(action: &ToolAction<'_>) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(action).expect("serializable action"))
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -181,8 +249,13 @@ impl SecurityManager {
 
     pub(crate) fn set_user_request(&self, request: &str) {
         if let Some(auto) = &self.auto {
-            *auto.user_request.write() = Arc::from(request);
-            auto.dialogue.write().clear();
+            let mut context = auto.context.write();
+            let generation = context.generation.wrapping_add(1);
+            *context = ReviewContext {
+                user_request: Arc::from(request),
+                generation,
+                ..Default::default()
+            };
         }
     }
 
@@ -190,6 +263,28 @@ impl SecurityManager {
         if self.mode == SecurityMode::Auto {
             if let Some(auto) = &self.auto {
                 auto.prepared_tools.write().insert(name.to_owned());
+            }
+        }
+    }
+
+    pub(crate) fn unregister_prepared_tool(&self, name: &str) {
+        if let Some(auto) = &self.auto {
+            auto.prepared_tools.write().remove(name);
+        }
+    }
+
+    pub(crate) fn record_execution(&self, receipt: Option<&ReviewReceipt>, succeeded: bool) {
+        if let (Some(auto), Some(receipt)) = (&self.auto, receipt) {
+            let mut context = auto.context.write();
+            if context.generation != receipt.generation {
+                return;
+            }
+            if let Some(record) = context
+                .history
+                .iter_mut()
+                .find(|record| record.receipt == receipt.id)
+            {
+                record.status = if succeeded { "executed" } else { "failed" }.into();
             }
         }
     }
@@ -203,127 +298,153 @@ impl SecurityManager {
     }
 
     async fn authorize_auto(&self, action: &ToolAction<'_>) -> Result<(), String> {
+        self.authorize_auto_with_preview(action, None)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn authorize_prepared(
+        &self,
+        action: &ToolAction<'_>,
+        preview: &str,
+    ) -> Result<Option<ReviewReceipt>, String> {
+        if self.mode == SecurityMode::Auto {
+            self.authorize_auto_with_preview(action, Some(preview))
+                .await
+                .map(Some)
+        } else {
+            self.authorize(action).await.map(|_| None)
+        }
+    }
+
+    pub(crate) async fn authorize_execution(
+        &self,
+        action: &ToolAction<'_>,
+    ) -> Result<Option<ReviewReceipt>, String> {
+        if self.mode == SecurityMode::Auto {
+            self.authorize_auto_with_preview(action, None)
+                .await
+                .map(Some)
+        } else {
+            self.authorize(action).await.map(|_| None)
+        }
+    }
+
+    async fn authorize_auto_with_preview(
+        &self,
+        action: &ToolAction<'_>,
+        preview: Option<&str>,
+    ) -> Result<ReviewReceipt, String> {
         let auto = self.auto.as_ref().expect("auto mode has state");
         let _gate = auto.review_gate.lock().await;
-        let mut previous_rejections = std::mem::take(&mut *auto.dialogue.write());
+        let fingerprint = action_fingerprint(action);
+        let (user_request, generation, history) = {
+            let context = auto.context.read();
+            if let Some((_, reason)) = context.denied.iter().find(|(key, _)| key == &fingerprint) {
+                return Err(format!("{reason} Unchanged action and evidence were already rejected; do not resubmit or bypass using another tool."));
+            }
+            (
+                Arc::clone(&context.user_request),
+                context.generation,
+                context.history.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
         let reviewer = auto.reviewer.read().clone();
-        let user_request = Arc::clone(&auto.user_request.read());
         let cwd = std::env::current_dir();
-        let status = match (reviewer, user_request.is_empty(), cwd) {
+        let (mut decision, mut detail) = match (reviewer, user_request.is_empty(), cwd) {
             (Some(reviewer), false, Ok(cwd)) => {
                 let request = ReviewRequest {
                     user_request: &user_request,
                     action,
                     cwd: &cwd,
                     platform: std::env::consts::OS,
-                    previous_rejections: &previous_rejections,
+                    history: &history,
                 };
                 match reviewer.review(&request).await {
                     Ok(outcome) => {
-                        let verdict = Verdict::from_risk(outcome.risk);
-                        let display = format!("risk {}", outcome.risk);
-                        let detail = format!("risk {} · {}", outcome.risk, outcome.reason);
-                        let approved = verdict == Verdict::Safe
-                            || (verdict == Verdict::Confirmable && outcome.user_confirmed);
-                        if approved {
-                            let confirmed = if verdict == Verdict::Confirmable {
-                                " · confirmed by user"
-                            } else {
-                                ""
-                            };
-                            auto.dialogue.write().clear();
-                            eprintln!(
-                                "{}",
-                                crate::console::review_note(&format!(
-                                    "{} · {display}{confirmed}",
-                                    crate::console::green("safe")
-                                ))
-                            );
-                            return Ok(());
-                        }
-                        let rejection = ReviewRejection {
-                            action: serde_json::to_value(action)
-                                .map_err(|_| "Unable to serialize safety action")?,
-                            risk: outcome.risk,
-                            reason: outcome.reason,
-                        };
-                        previous_rejections.push(rejection);
-                        if verdict == Verdict::Prohibited {
-                            *auto.dialogue.write() = previous_rejections;
-                            eprintln!(
-                                "{}",
-                                crate::console::review_note(&format!(
-                                    "{} · {display} · prohibited even with human confirmation",
-                                    crate::console::red("blocked")
-                                ))
-                            );
-                            return Err(format!(
-                                "Execution denied: prohibited by safety policy ({detail}). Do not \
-                                 resubmit this action, and never ask the user to run it manually \
-                                 outside this review. Explain the prohibition to the user; a \
-                                 narrower, recoverable alternative may be submitted for review."
+                        let mut detail = outcome.reason.clone();
+                        if !outcome.missing_evidence.is_empty() {
+                            detail.push_str(&format!(
+                                " · missing evidence: {}",
+                                outcome.missing_evidence.join("; ")
                             ));
                         }
-                        if verdict == Verdict::Severe {
-                            *auto.dialogue.write() = previous_rejections;
-                            format!("risky · {display}")
-                        } else {
-                            let attempt = previous_rejections.len();
-                            if attempt < 3 {
-                                let label = if verdict == Verdict::Confirmable {
-                                    "confirmable"
-                                } else {
-                                    "uncertain"
-                                };
-                                *auto.dialogue.write() = previous_rejections;
-                                eprintln!(
-                                    "{}",
-                                    crate::console::review_note(&format!(
-                                        "{} · {display} · {attempt}/3 · returning to main model",
-                                        crate::console::yellow(label)
-                                    ))
-                                );
-                                return Err(format!(
-                                    "Execution denied by safety reviewer ({attempt}/3): {detail}. \
-                                     Revise the proposed action to address the reviewer's concerns \
-                                     and submit it again; a dated backup under ~/Backup may lower \
-                                     the risk, and for a confirmable action the user's explicit \
-                                     in-chat confirmation of the destructive scope can approve it. \
-                                     If the action already matches the user's explicit request and \
-                                     cannot be made safer, submit it unchanged to reach human \
-                                     confirmation. Never ask the user to run commands manually to \
-                                     bypass review. Three consecutive non-approvals require human \
-                                     confirmation."
-                                ));
-                            }
-                            display
-                        }
+                        (outcome.decision(), detail)
                     }
-                    Err(error) => error.to_string(),
+                    Err(error) => (
+                        ReviewDecision::AskUser,
+                        format!("Safety review unavailable: {error}"),
+                    ),
                 }
             }
-            (None, _, _) => "MissingReviewer".to_owned(),
-            (_, true, _) => "MissingUserRequest".to_owned(),
-            (_, _, Err(_)) => "UnavailableCwd".to_owned(),
+            (None, _, _) => (ReviewDecision::AskUser, "MissingReviewer".into()),
+            (_, true, _) => (ReviewDecision::AskUser, "MissingUserRequest".into()),
+            (_, _, Err(_)) => (ReviewDecision::AskUser, "UnavailableCwd".into()),
         };
-        eprintln!(
-            "{}",
-            crate::console::review_note(&format!(
-                "{} · waiting for human confirmation",
-                crate::console::red(&status)
-            ))
-        );
-        auto.dialogue.write().clear();
-        let prompt = escape_terminal_controls(format!(
-            "{} · {}; safety review: {status}",
-            action.tool_name,
-            crate::console::args_summary(action.tool_name, action.args)
-        ));
-        if self.confirmer.confirm(&prompt).await {
-            Ok(())
-        } else {
-            Err("Execution denied by user after safety review".into())
+        if let Some(ResolvedAction::FileMutation { evidence }) = &action.resolved {
+            if evidence["protected_backup"] == true {
+                decision = ReviewDecision::Deny;
+                detail = "Existing files under ~/Backup are protected by safety policy".into();
+            }
         }
+        if auto.context.read().generation != generation {
+            return Err("Execution denied: user request changed during safety review".into());
+        }
+        let (result, status) = match decision {
+            ReviewDecision::Allow => {
+                eprintln!(
+                    "{}",
+                    crate::console::review_note(&crate::console::green("allowed"))
+                );
+                (Ok(()), "approved")
+            }
+            ReviewDecision::Deny => {
+                eprintln!(
+                    "{}",
+                    crate::console::review_note(&format!(
+                        "{} · {}",
+                        crate::console::red("denied"),
+                        escape_terminal_controls(detail.clone())
+                    ))
+                );
+                (Err(format!("Execution denied by safety policy: {detail}. Do not repeat or bypass this action; explain the reason and only submit a materially changed action that resolves the concern.")), "denied")
+            }
+            ReviewDecision::AskUser => {
+                eprintln!(
+                    "{}",
+                    crate::console::review_note(&format!(
+                        "{} · {}",
+                        crate::console::yellow("waiting for human confirmation"),
+                        escape_terminal_controls(detail.clone())
+                    ))
+                );
+                let serialized = confirmation_action(action);
+                let prompt = escape_terminal_controls(format!(
+                    "{serialized}; safety review: {detail}{}",
+                    preview
+                        .map(|p| format!("; local changes: {p}"))
+                        .unwrap_or_default()
+                ));
+                if self.confirmer.confirm(&prompt).await {
+                    (Ok(()), "approved")
+                } else {
+                    (Err(format!("Execution denied by user after safety review: {detail}. Do not repeat this unchanged action or bypass review.")), "user_rejected")
+                }
+            }
+        };
+        let mut context = auto.context.write();
+        if context.generation != generation {
+            return Err("Execution denied: user request changed during confirmation".into());
+        }
+        let receipt = ReviewReceipt {
+            generation,
+            id: uuid::Uuid::new_v4().to_string(),
+        };
+        context.record(action, &fingerprint, &receipt.id, status, &detail);
+        if let Err(reason) = &result {
+            context.deny(fingerprint, reason.clone());
+        }
+        result.map(|_| receipt)
     }
     fn extract_command(args: &serde_json::Value) -> Option<&str> {
         args.get("command").and_then(|v| v.as_str())
@@ -358,6 +479,30 @@ impl SecurityManager {
     }
 }
 
+fn confirmation_action(action: &ToolAction<'_>) -> String {
+    let mut display = format!("{} · {}", action.tool_name, action.args);
+    match &action.resolved {
+        Some(ResolvedAction::Shell {
+            command,
+            shell,
+            flag,
+        }) => {
+            display.push_str(&format!("; executes {shell} {flag}: {command}"));
+        }
+        Some(ResolvedAction::HttpGet { url }) => {
+            display.push_str(&format!("; GET {url}"));
+        }
+        Some(ResolvedAction::FileMutation { evidence }) => {
+            display.push_str(&format!(
+                "; {} {}",
+                evidence["operation"], evidence["resolved_path"]
+            ));
+        }
+        None => {}
+    }
+    display
+}
+
 fn escape_terminal_controls(text: String) -> String {
     use std::fmt::Write;
     if !text.chars().any(|ch| ch.is_control()) {
@@ -382,18 +527,15 @@ fn escape_terminal_controls(text: String) -> String {
 mod tests {
     use super::*;
 
-    struct FixedReviewer(Result<(u8, bool), review::ReviewError>);
+    struct FixedReviewer(review::ReviewOutcome, std::sync::atomic::AtomicUsize);
     #[async_trait]
     impl SafetyReviewer for FixedReviewer {
         async fn review(
             &self,
             _: &ReviewRequest<'_>,
         ) -> Result<review::ReviewOutcome, review::ReviewError> {
-            self.0.map(|(risk, user_confirmed)| review::ReviewOutcome {
-                risk,
-                user_confirmed,
-                reason: "bounded action \u{1b}[31m\u{9b}31m".into(),
-            })
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.clone())
         }
     }
 
@@ -406,99 +548,195 @@ mod tests {
         }
     }
 
+    fn fixed(risk: review::Risk, authorization: review::Authorization) -> Arc<FixedReviewer> {
+        Arc::new(FixedReviewer(
+            review::ReviewOutcome {
+                risk,
+                authorization,
+                reason: "bounded action \u{1b}[31m".into(),
+                missing_evidence: vec![],
+            },
+            std::sync::atomic::AtomicUsize::new(0),
+        ))
+    }
+
     #[tokio::test]
-    async fn auto_bands_approve_dialogue_gate_or_block_by_risk() {
-        let args = serde_json::json!({"command": "echo \u{1b}[31m\u{9b}31m"});
+    async fn uncertainty_confirms_once_and_unchanged_rejection_is_cached() {
+        let reviewer = fixed(review::Risk::Unknown, review::Authorization::WithinScope);
+        let manager = SecurityManager::new(SecurityMode::Auto)
+            .with_reviewer(reviewer.clone())
+            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                vec![false, true].into(),
+            ))));
+        manager.set_user_request("first");
+        let args = serde_json::json!({"command":"echo hi"});
         let action = ToolAction {
             tool_name: "shell",
             args: &args,
             description: None,
             resolved: None,
         };
-        let manager_with = |result: Result<(u8, bool), review::ReviewError>,
-                            approvals: Vec<bool>| {
-            SecurityManager::new(SecurityMode::Auto)
-                .with_reviewer(Arc::new(FixedReviewer(result)))
-                .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
-                    approvals.into(),
-                ))))
-        };
-
-        for auto_approved in [Ok((5, false)), Ok((55, true))] {
-            let manager = manager_with(auto_approved, vec![]);
-            manager.set_user_request("echo text");
-            assert!(manager.authorize(&action).await.is_ok());
-        }
-
-        let manager = manager_with(Ok((95, false)), vec![]);
-        manager.set_user_request("echo text");
         assert!(manager.authorize(&action).await.is_err());
         assert!(manager.authorize(&action).await.is_err());
+        assert_eq!(reviewer.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let other = serde_json::json!({"command":"echo revised"});
+        assert!(manager
+            .authorize(&ToolAction {
+                tool_name: "shell",
+                args: &other,
+                description: None,
+                resolved: None
+            })
+            .await
+            .is_ok());
+        assert!(manager.authorize(&action).await.is_err());
+        assert_eq!(reviewer.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+        manager.set_user_request("second");
+        manager
+            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                vec![true].into(),
+            ))))
+            .authorize(&action)
+            .await
+            .unwrap();
+        assert_eq!(reviewer.1.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
-        for gated in [
-            Ok((75, false)),
-            Err(review::ReviewError::Timeout),
-            Err(review::ReviewError::RequestFailed),
-            Err(review::ReviewError::InvalidResponse),
+    #[tokio::test]
+    async fn prohibited_or_outside_scope_never_prompt() {
+        let args = serde_json::json!({"command":"echo hi"});
+        for (risk, authorization) in [
+            (
+                review::Risk::Prohibited,
+                review::Authorization::ExplicitlyApproved,
+            ),
+            (review::Risk::Low, review::Authorization::OutsideScope),
         ] {
-            let manager = manager_with(gated, vec![true, false]);
-            manager.set_user_request("echo text");
-            assert!(manager.authorize(&action).await.is_ok());
-            assert!(manager.authorize(&action).await.is_err());
-        }
-
-        for dialogue in [Ok((30, false)), Ok((55, false))] {
-            let manager = manager_with(dialogue, vec![true, false]);
-            manager.set_user_request("echo text");
-            assert!(manager.authorize(&action).await.is_err());
-            assert!(manager.authorize(&action).await.is_err());
-            assert!(manager.authorize(&action).await.is_ok());
-            assert!(manager.authorize(&action).await.is_err());
-            assert!(manager.authorize(&action).await.is_err());
-            assert!(manager.authorize(&action).await.is_err());
+            let manager = SecurityManager::new(SecurityMode::Auto)
+                .with_reviewer(fixed(risk, authorization))
+                .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                    vec![].into(),
+                ))));
+            manager.set_user_request("first");
+            assert!(manager
+                .authorize(&ToolAction {
+                    tool_name: "shell",
+                    args: &args,
+                    description: None,
+                    resolved: None
+                })
+                .await
+                .is_err());
         }
     }
 
     #[tokio::test]
-    async fn auto_approval_and_new_request_reset_rejection_streak() {
-        struct SequenceReviewer(parking_lot::Mutex<std::collections::VecDeque<u8>>);
-        #[async_trait]
-        impl SafetyReviewer for SequenceReviewer {
-            async fn review(
-                &self,
-                _: &ReviewRequest<'_>,
-            ) -> Result<review::ReviewOutcome, review::ReviewError> {
-                Ok(review::ReviewOutcome {
-                    risk: self.0.lock().pop_front().unwrap(),
-                    user_confirmed: false,
-                    reason: "reviewed".into(),
-                })
-            }
-        }
+    async fn execution_receipts_correlate_identical_parallel_actions_and_ignore_old_turns() {
         let manager = SecurityManager::new(SecurityMode::Auto)
-            .with_reviewer(Arc::new(SequenceReviewer(parking_lot::Mutex::new(
-                vec![55, 30, 5, 55, 30, 55, 30, 55].into(),
-            ))))
-            .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
-                vec![true].into(),
-            ))));
-        let args = serde_json::json!({"command":"echo reviewed"});
+            .with_reviewer(fixed(review::Risk::Low, review::Authorization::WithinScope));
+        manager.set_user_request("first");
+        let args = serde_json::json!({"command":"echo hi"});
         let action = ToolAction {
             tool_name: "shell",
             args: &args,
             description: None,
             resolved: None,
         };
-        manager.set_user_request("first");
-        assert!(manager.authorize(&action).await.is_err());
-        assert!(manager.authorize(&action).await.is_err());
-        assert!(manager.authorize(&action).await.is_ok());
-        assert!(manager.authorize(&action).await.is_err());
-        assert!(manager.authorize(&action).await.is_err());
+        let (one, two) = tokio::join!(
+            manager.authorize_execution(&action),
+            manager.authorize_execution(&action)
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+        manager.record_execution(two.as_ref(), false);
+        manager.record_execution(one.as_ref(), true);
+        let auto = manager.auto.as_ref().unwrap();
+        assert_eq!(auto.context.read().history[0].status, "executed");
+        assert_eq!(auto.context.read().history[1].status, "failed");
         manager.set_user_request("second");
-        assert!(manager.authorize(&action).await.is_err());
-        assert!(manager.authorize(&action).await.is_err());
-        assert!(manager.authorize(&action).await.is_ok());
+        manager.record_execution(one.as_ref(), true);
+        assert!(auto.context.read().history.is_empty());
+    }
+
+    #[test]
+    fn history_is_bounded_and_marks_omitted_arguments_and_evicted_actions() {
+        let mut context = ReviewContext::default();
+        let args = serde_json::json!({"content": "x".repeat(5000)});
+        let action = ToolAction {
+            tool_name: "file_write",
+            args: &args,
+            description: None,
+            resolved: None,
+        };
+        for i in 0..40 {
+            context.record(&action, "fingerprint", &i.to_string(), "denied", "reason");
+        }
+        assert_eq!(context.history.len(), 20);
+        assert!(context.history.iter().all(|record| record.truncated));
+        assert!(serde_json::to_vec(&context.history).unwrap().len() <= 32 * 1024);
+        assert!(!serde_json::to_string(&context.history)
+            .unwrap()
+            .contains(&"x".repeat(5000)));
+    }
+
+    #[tokio::test]
+    async fn changed_request_cancels_in_flight_review_without_prompting() {
+        struct PausedReviewer {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl SafetyReviewer for PausedReviewer {
+            async fn review(
+                &self,
+                _: &ReviewRequest<'_>,
+            ) -> Result<review::ReviewOutcome, review::ReviewError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(review::ReviewOutcome {
+                    risk: review::Risk::Unknown,
+                    authorization: review::Authorization::WithinScope,
+                    reason: "uncertain".into(),
+                    missing_evidence: vec![],
+                })
+            }
+        }
+        let reviewer = Arc::new(PausedReviewer {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let manager = Arc::new(
+            SecurityManager::new(SecurityMode::Auto)
+                .with_reviewer(reviewer.clone())
+                .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                    vec![].into(),
+                )))),
+        );
+        manager.set_user_request("first");
+        let executing = manager.clone();
+        let task = tokio::spawn(async move {
+            let args = serde_json::json!({"command":"echo hi"});
+            executing
+                .authorize(&ToolAction {
+                    tool_name: "shell",
+                    args: &args,
+                    description: None,
+                    resolved: None,
+                })
+                .await
+        });
+        reviewer.entered.notified().await;
+        manager.set_user_request("second");
+        reviewer.release.notify_one();
+        assert!(task.await.unwrap().unwrap_err().contains("request changed"));
+        assert!(manager
+            .auto
+            .as_ref()
+            .unwrap()
+            .context
+            .read()
+            .history
+            .is_empty());
     }
 
     #[tokio::test]
@@ -515,7 +753,7 @@ mod tests {
         ));
         assert!(manager.authorize(&action).await.is_err());
         let manager = SecurityManager::new(SecurityMode::Auto)
-            .with_reviewer(Arc::new(FixedReviewer(Ok((5, false)))))
+            .with_reviewer(fixed(review::Risk::Low, review::Authorization::WithinScope))
             .with_confirmer(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
                 vec![false].into(),
             ))));

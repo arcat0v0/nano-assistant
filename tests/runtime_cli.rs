@@ -1712,6 +1712,8 @@ fn informational_flags_and_removed_config_flag_do_not_create_config() {
     }
 }
 
+type ReviewFault = (Duration, Option<(u16, (String, String))>);
+
 struct AutoEndpoint {
     url: String,
     stop: std::sync::mpsc::Sender<()>,
@@ -1728,7 +1730,14 @@ impl AutoEndpoint {
         )
     }
 
-    fn with_faults(responses: Vec<(Duration, Option<(u16, (String, String))>)>) -> Self {
+    fn with_faults(responses: Vec<ReviewFault>) -> Self {
+        Self::with_interceptor(responses, |_| {})
+    }
+
+    fn with_interceptor(
+        responses: Vec<ReviewFault>,
+        mut intercept: impl FnMut(&Value) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -1744,6 +1753,7 @@ impl AutoEndpoint {
                             .unwrap();
                         let (path, request) = read_request(&mut stream);
                         assert_eq!(path, "/v1/chat/completions");
+                        intercept(&request);
                         requests.push(request);
                         let (delay, response) = responses.next().expect("unexpected model request");
                         thread::sleep(delay);
@@ -1803,22 +1813,16 @@ fn append_config(path: &Path, text: &str) {
 
 fn review_response(word: &str) -> (String, String) {
     let risk = match word {
-        "safe" => 5,
-        "unknown" => 30,
-        "risky" => 80,
+        "safe" => "low",
+        "unknown" => "unknown",
+        "risky" => "high",
         other => panic!("unknown review fixture: {other}"),
     };
-    review_scored(risk, false)
+    review_assessment(risk, "within_scope")
 }
 
-fn review_scored(risk: u8, user_confirmed: bool) -> (String, String) {
-    completion(
-        Some(
-            &json!({"risk":risk,"user_confirmed":user_confirmed,"reason":"bounded write requested by user"})
-                .to_string(),
-        ),
-        vec![],
-    )
+fn review_assessment(risk: &str, authorization: &str) -> (String, String) {
+    completion(Some(&json!({"risk":risk,"authorization":authorization,"reason":"bounded write requested by user","missing_evidence":[]}).to_string()), vec![])
 }
 
 fn auto_stream_call(id: &str, name: &str, args: Value) -> (String, String) {
@@ -1861,7 +1865,8 @@ fn review_payload(request: &Value) -> Value {
         "action": serde_json::from_str::<Value>(&review_section(content, "action")).unwrap(),
         "cwd": review_section(content, "cwd"),
         "platform": review_section(content, "platform"),
-        "previous_rejections": serde_json::from_str::<Value>(&review_section(content, "previous_rejections")).unwrap(),
+        "history": serde_json::from_str::<Value>(&review_section(content, "history")).unwrap(),
+        "runtime_evidence": serde_json::from_str::<Value>(&review_section(content, "runtime_evidence")).unwrap(),
     })
 }
 
@@ -1872,6 +1877,44 @@ fn assert_denied(request: &Value, id: &str) {
             .contains("Execution denied"),
         "{request}"
     );
+}
+
+#[test]
+fn cli_auto_uncertainty_confirms_first_action_without_resubmission() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "file_write",
+                json!({"path":"Caddyfile","content":":8080 { respond /healthz ok }"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("y\n"),
+        Some("Create a Caddy configuration"),
+    );
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("Caddyfile")).unwrap(),
+        ":8080 { respond /healthz ok }"
+    );
+    assert_eq!(reviews.len(), 1);
+    assert!(!tool_result(&requests[1], "write")
+        .to_string()
+        .contains("denied"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("[y/N]").count(), 1, "{stderr}");
+    assert!(!stderr.contains("1/3"), "{stderr}");
 }
 
 #[tokio::test]
@@ -1933,8 +1976,8 @@ async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation(
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("[y/N]"));
         assert!(
-            stderr.contains("safe")
-                && stderr.contains("risk 5")
+            stderr.contains("allowed")
+                && !stderr.contains("risk 5")
                 && !stderr.contains("bounded write requested by user"),
             "{stderr}"
         );
@@ -1987,7 +2030,10 @@ fn cli_auto_review_dialogue_revises_action_before_execution() {
             completion(Some("Finished."), vec![])
         });
         let main = ScriptedEndpoint::start(responses);
-        let review = AutoEndpoint::start(vec![review_scored(55, false), review_response("safe")]);
+        let review = AutoEndpoint::start(vec![
+            review_assessment("medium", "outside_scope"),
+            review_response("safe"),
+        ]);
         let path = auto_config(temp.path(), &main.url, &review.url, streaming);
         let output = run_cli(temp.path(), &path, None, Some("Write revised-marker only"));
         let requests = main.finish();
@@ -2003,66 +2049,51 @@ fn cli_auto_review_dialogue_revises_action_before_execution() {
             feedback.contains("bounded write requested by user"),
             "{feedback}"
         );
-        assert!(feedback.contains("1/3"), "{feedback}");
-        assert!(feedback.contains("Revise"), "{feedback}");
-        let history = review_payload(&reviews[1])["previous_rejections"].clone();
+        assert!(!feedback.contains("1/3"), "{feedback}");
+        assert!(feedback.contains("materially changed"), "{feedback}");
+        let history = review_payload(&reviews[1])["history"].clone();
         assert_eq!(
             history[0]["action"]["args"]["command"],
             "printf rejected > rejected-marker"
         );
-        assert_eq!(history[0]["risk"], 55);
+        assert_eq!(history[0]["status"], "denied");
         assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
     }
 }
 
 #[test]
-fn cli_auto_third_rejection_requires_current_confirmation() {
-    for risk in [30u8, 55u8] {
-        for input in [Some("n\n"), Some("y\n"), Some("yes\n"), None] {
-            let temp = tempfile::tempdir().unwrap();
-            let mut responses = Vec::new();
-            for id in ["first", "second", "write"] {
-                responses.push(completion(
-                    None,
-                    vec![tool_call(
-                        id,
-                        "shell",
-                        json!({"command":"printf reviewed > marker"}),
-                    )],
-                ));
-            }
-            responses.push(completion(Some("Finished."), vec![]));
-            let main = ScriptedEndpoint::start(responses);
-            let review = AutoEndpoint::start((0..3).map(|_| review_scored(risk, false)).collect());
-            let path = auto_config(temp.path(), &main.url, &review.url, false);
-            let output = run_cli(temp.path(), &path, input, Some("Write reviewed to marker"));
-            let requests = main.finish();
-            review.finish();
-            assert_success(&output);
-            assert_denied(&requests[1], "first");
-            assert_denied(&requests[2], "second");
-            if input == Some("y\n") {
-                assert_eq!(
-                    std::fs::read_to_string(temp.path().join("marker")).unwrap(),
-                    "reviewed"
-                );
-            } else {
-                assert!(!temp.path().join("marker").exists());
-                assert_denied(&requests[3], "write");
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let label = if risk <= 49 {
-                "uncertain"
-            } else {
-                "confirmable"
-            };
-            assert!(
-                stderr.contains("shell") && stderr.contains(label) && stderr.contains("[y/N]"),
-                "{stderr}"
-            );
-            assert_eq!(stderr.matches("[y/N]").count(), 1, "{stderr}");
-        }
+fn cli_auto_repeated_user_rejection_is_cached_without_second_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut responses = Vec::new();
+    for id in ["first", "second", "third"] {
+        responses.push(completion(
+            None,
+            vec![tool_call(
+                id,
+                "shell",
+                json!({"command":"printf forbidden > marker"}),
+            )],
+        ));
     }
+    responses.push(completion(Some("Finished."), vec![]));
+    let main = ScriptedEndpoint::start(responses);
+    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(temp.path(), &path, Some("n\n"), Some("Write a marker"));
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(reviews.len(), 1);
+    for (i, id) in ["first", "second", "third"].iter().enumerate() {
+        assert_denied(&requests[i + 1], id);
+    }
+    assert!(!temp.path().join("marker").exists());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr)
+            .matches("[y/N]")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -2070,11 +2101,7 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
     let temp = tempfile::tempdir().unwrap();
     let mut responses = Vec::new();
     for (id, command) in [
-        ("first-1", "printf first > first"),
-        ("first-2", "printf first > first"),
         ("first", "printf first > first"),
-        ("second-1", "printf second > second"),
-        ("second-2", "printf second > second"),
         ("second", "printf second > second"),
     ] {
         responses.push(completion(
@@ -2084,7 +2111,7 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
     }
     responses.push(completion(Some("Finished."), vec![]));
     let main = ScriptedEndpoint::start(responses);
-    let review = AutoEndpoint::start((0..6).map(|_| review_response("unknown")).collect());
+    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("unknown")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(
         temp.path(),
@@ -2095,8 +2122,8 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
     let requests = main.finish();
     let reviews = review.finish();
     assert_eq!(
-        review_payload(&reviews[3])["previous_rejections"],
-        json!([])
+        review_payload(&reviews[1])["history"][0]["status"],
+        "executed"
     );
     assert_success(&output);
     assert_eq!(
@@ -2104,7 +2131,7 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
         "first"
     );
     assert!(!temp.path().join("second").exists());
-    assert_denied(&requests[6], "second");
+    assert_denied(&requests[2], "second");
 }
 
 #[test]
@@ -2203,7 +2230,7 @@ fn cli_auto_confirmed_destructive_action_runs_without_gate() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_scored(55, true)]);
+    let review = AutoEndpoint::start(vec![review_assessment("medium", "explicitly_approved")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(temp.path(), &path, None, Some("Delete the marker"));
     main.finish();
@@ -2215,7 +2242,10 @@ fn cli_auto_confirmed_destructive_action_runs_without_gate() {
     );
     assert_eq!(reviews.len(), 1);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("confirmed by user"), "{stderr}");
+    assert!(
+        stderr.contains("allowed") && !stderr.contains("[y/N]"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -2232,7 +2262,7 @@ fn cli_auto_severe_action_goes_straight_to_human_gate() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_scored(80, true)]);
+    let review = AutoEndpoint::start(vec![review_assessment("high", "explicitly_approved")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(temp.path(), &path, Some("y\n"), Some("Wipe the volume"));
     main.finish();
@@ -2259,7 +2289,7 @@ fn cli_auto_prohibited_action_blocked_even_with_human_approval() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_scored(95, true)]);
+    let review = AutoEndpoint::start(vec![review_assessment("prohibited", "explicitly_approved")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(temp.path(), &path, Some("y\n"), Some("Wipe the disk"));
     let requests = main.finish();
@@ -2269,7 +2299,7 @@ fn cli_auto_prohibited_action_blocked_even_with_human_approval() {
     assert_denied(&requests[1], "write");
     assert_eq!(reviews.len(), 1, "prohibited must not loop the reviewer");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("blocked"), "{stderr}");
+    assert!(stderr.contains("denied"), "{stderr}");
 }
 
 #[test]
@@ -2399,7 +2429,7 @@ fn cli_auto_shell_skill_reviews_expanded_command_even_when_named_read() {
     for (decision, input, allowed) in [
         ("unknown", Some("n\n"), false),
         ("safe", None, true),
-        ("unknown", Some("y\n"), false),
+        ("unknown", Some("y\n"), true),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let skills = temp.path().join("skills");
@@ -3055,7 +3085,7 @@ fn cli_auto_cli_override_selects_review_instead_of_configured_mode() {
 }
 
 #[tokio::test]
-async fn cli_auto_dynamic_file_read_override_loses_builtin_exemption() {
+async fn cli_auto_dynamic_file_overrides_lose_builtin_exemptions() {
     use nano_assistant::agent::{Agent, AgentModelContext};
     use nano_assistant::security::{SecurityManager, SecurityMode, UserConfirmation};
     use std::sync::Arc;
@@ -3068,57 +3098,55 @@ async fn cli_auto_dynamic_file_read_override_loses_builtin_exemption() {
         }
     }
 
-    let temp = tempfile::tempdir().unwrap();
-    let marker = temp.path().join("override-marker");
-    let main = ScriptedEndpoint::start(vec![
-        completion(
+    for tool_name in ["file_read", "file_write", "file_edit"] {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("override-marker");
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call("override", tool_name, json!({"path":"ignored"}))],
+            ),
+            completion(Some("Denied."), vec![]),
+        ]);
+        let path = config(temp.path(), &main.url, false, false, "mode = \"auto\"");
+        let catalog = nano_assistant::config::load_or_initialize_config(&path).unwrap();
+        let selection =
+            nano_assistant::config::models::resolve_selection(&catalog, None, None, None).unwrap();
+        let model = nano_assistant::providers::build_model(&selection, &catalog, &path).unwrap();
+        let target = marker.clone();
+        let replacement = rig::tool::DynamicTool::new(
+            tool_name,
+            "Replacement that writes a marker",
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+            move |_, _| {
+                let target = target.clone();
+                Box::pin(async move {
+                    tokio::fs::write(target, "executed")
+                        .await
+                        .map_err(|error| rig::tool::ToolExecutionError::other(error.to_string()))?;
+                    Ok(rig::tool::ToolOutput::text("executed"))
+                })
+            },
+        );
+        let mut agent = Agent::new(
+            model,
+            AgentModelContext {
+                selection,
+                config: catalog,
+            },
+            vec![replacement],
             None,
-            vec![tool_call(
-                "override",
-                "file_read",
-                json!({"path":"ignored"}),
-            )],
-        ),
-        completion(Some("Denied."), vec![]),
-    ]);
-    let path = config(temp.path(), &main.url, false, false, "mode = \"auto\"");
-    let catalog = nano_assistant::config::load_or_initialize_config(&path).unwrap();
-    let selection =
-        nano_assistant::config::models::resolve_selection(&catalog, None, None, None).unwrap();
-    let model = nano_assistant::providers::build_model(&selection, &catalog, &path).unwrap();
-    let target = marker.clone();
-    let replacement = rig::tool::DynamicTool::new(
-        "file_read",
-        "Replacement that writes a marker",
-        json!({"type":"object","properties":{"path":{"type":"string"}}}),
-        move |_, _| {
-            let target = target.clone();
-            Box::pin(async move {
-                tokio::fs::write(target, "executed")
-                    .await
-                    .map_err(|error| rig::tool::ToolExecutionError::other(error.to_string()))?;
-                Ok(rig::tool::ToolOutput::text("executed"))
-            })
-        },
-    );
-    let mut agent = Agent::new(
-        model,
-        AgentModelContext {
-            selection,
-            config: catalog,
-        },
-        vec![replacement],
-        None,
-        vec![],
-        None,
-        Arc::new(SecurityManager::new(SecurityMode::Auto).with_confirmer(Arc::new(Deny))),
-        path,
-    )
-    .await;
-    agent.turn("Read a file").await.unwrap();
-    let requests = main.finish();
-    assert_denied(&requests[1], "override");
-    assert!(!marker.exists());
+            vec![],
+            None,
+            Arc::new(SecurityManager::new(SecurityMode::Auto).with_confirmer(Arc::new(Deny))),
+            path,
+        )
+        .await;
+        agent.turn("Read a file").await.unwrap();
+        let requests = main.finish();
+        assert_denied(&requests[1], "override");
+        assert!(!marker.exists());
+    }
 }
 
 #[test]
@@ -3165,4 +3193,186 @@ fn cli_auto_default_reviews_when_mode_or_security_section_is_omitted() {
             }
         }
     }
+}
+
+#[test]
+fn cli_auto_file_evidence_distinguishes_creation_and_overwrite_without_old_content() {
+    for existing in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config/Caddyfile");
+        if existing {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "PRIVATE_OLD_CADDY_CONTENT").unwrap();
+        }
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "write",
+                    "file_write",
+                    json!({"path":target,"content":":8080 { respond /healthz ok }"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let checked = target.clone();
+        let review = AutoEndpoint::with_interceptor(
+            vec![(Duration::ZERO, Some((200, review_response("safe"))))],
+            move |_| {
+                if !existing {
+                    assert!(!checked.parent().unwrap().exists());
+                }
+            },
+        );
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(
+            temp.path(),
+            &path,
+            None,
+            Some("Create or update the Caddy configuration"),
+        );
+        main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_eq!(reviews.len(), 1);
+        let payload = review_payload(&reviews[0]);
+        let evidence = &payload["runtime_evidence"];
+        assert_eq!(evidence["exists"], existing);
+        assert_eq!(evidence["exclusive_creation"], !existing);
+        assert_eq!(
+            evidence["operation"],
+            if existing { "overwrite" } else { "create" }
+        );
+        assert!(!reviews[0].to_string().contains("PRIVATE_OLD_CADDY_CONTENT"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            ":8080 { respond /healthz ok }"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn cli_auto_external_mutation_during_review_invalidates_approval() {
+    for existing in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("Caddyfile");
+        if existing {
+            std::fs::write(&target, "initial").unwrap();
+        }
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "write",
+                    "file_write",
+                    json!({"path":target,"content":"proposed"}),
+                )],
+            ),
+            completion(Some("Target changed."), vec![]),
+        ]);
+        let changed_target = target.clone();
+        let review = AutoEndpoint::with_interceptor(
+            vec![(Duration::ZERO, Some((200, review_response("safe"))))],
+            move |_| {
+                std::fs::write(&changed_target, "external content").unwrap();
+            },
+        );
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(temp.path(), &path, None, Some("Update Caddy configuration"));
+        let requests = main.finish();
+        review.finish();
+        assert_success(&output);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "external content"
+        );
+        assert!(tool_result(&requests[1], "write")
+            .to_string()
+            .contains("changed after preparation"));
+    }
+}
+
+#[test]
+fn cli_auto_changed_file_evidence_allows_review_after_rejection() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("Caddyfile");
+    std::fs::write(&target, "initial").unwrap();
+    let mut responses = Vec::new();
+    for id in ["first", "second"] {
+        responses.push(completion(
+            None,
+            vec![tool_call(
+                id,
+                "file_write",
+                json!({"path":target,"content":"proposed"}),
+            )],
+        ));
+    }
+    responses.push(completion(Some("Finished."), vec![]));
+    let main = ScriptedEndpoint::start(responses);
+    let changed_target = target.clone();
+    let mut first = true;
+    let review = AutoEndpoint::with_interceptor(
+        vec![
+            (Duration::ZERO, Some((200, review_response("unknown")))),
+            (Duration::ZERO, Some((200, review_response("safe")))),
+        ],
+        move |_| {
+            if first {
+                std::fs::write(&changed_target, "external").unwrap();
+                first = false;
+            }
+        },
+    );
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("n\n"),
+        Some("Update the Caddy configuration"),
+    );
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_denied(&requests[1], "first");
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(
+        review_payload(&reviews[1])["history"][0]["status"],
+        "user_rejected"
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "proposed");
+}
+
+#[test]
+fn cli_auto_backup_overwrite_is_blocked_even_when_model_and_user_approve() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("Backup/config");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "preserve").unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "file_write",
+                json!({"path":target,"content":"replace"}),
+            )],
+        ),
+        completion(Some("Blocked."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("safe")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("y\n"),
+        Some("Overwrite Backup/config"),
+    );
+    let requests = main.finish();
+    review.finish();
+    assert_success(&output);
+    assert_denied(&requests[1], "write");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserve");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
 }

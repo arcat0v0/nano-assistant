@@ -1,5 +1,6 @@
 pub mod content_search;
 pub mod file_edit;
+pub(crate) mod file_mutation;
 pub mod file_read;
 pub mod file_write;
 pub mod glob_search;
@@ -25,6 +26,20 @@ pub async fn register_builtin_tools(handle: &ToolServerHandle) {
     handle.add_tool(web_fetch::WebFetchTool::new()).await;
     handle.add_tool(web_search::WebSearchTool::new()).await;
     handle.add_tool(pty_shell::PtyShellTool::new()).await;
+}
+
+pub(crate) async fn register_reviewed_file_tools(
+    handle: &ToolServerHandle,
+    security: std::sync::Arc<crate::security::SecurityManager>,
+) {
+    handle
+        .add_dynamic_tool(
+            file_write::FileWriteTool::new().into_dynamic(std::sync::Arc::clone(&security)),
+        )
+        .await;
+    handle
+        .add_dynamic_tool(file_edit::FileEditTool::new().into_dynamic(security))
+        .await;
 }
 
 pub(crate) fn is_protected_skill_path(path: &std::path::Path) -> bool {

@@ -1,11 +1,73 @@
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use super::file_mutation::PreparedFileMutation;
+use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
+use rig::tool::{DynamicTool, Tool, ToolContext, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 pub struct FileEditTool;
 
 impl FileEditTool {
     pub fn new() -> Self {
         Self
+    }
+
+    pub(crate) fn into_dynamic(self, security: Arc<SecurityManager>) -> DynamicTool {
+        security.register_prepared_tool(Self::NAME);
+        DynamicTool::new(
+            Self::NAME,
+            self.description(),
+            self.parameters(),
+            move |_context, args| {
+                let security = Arc::clone(&security);
+                Box::pin(
+                    async move { Self::run(args, Some(&security)).await.map(ToolOutput::text) },
+                )
+            },
+        )
+    }
+
+    async fn run(
+        args: Value,
+        security: Option<&SecurityManager>,
+    ) -> Result<String, ToolExecutionError> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
+        let old = args
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'old_string' parameter"))?;
+        let new = args
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'new_string' parameter"))?;
+        let prepared = PreparedFileMutation::edit(std::path::Path::new(path), old, new).await?;
+        let message = format!("Edited {path}: replaced 1 occurrence");
+        let mut receipt = None;
+        if let Some(security) = security.filter(|security| security.mode() == SecurityMode::Auto) {
+            let evidence = prepared.evidence();
+            receipt = security
+                .authorize_prepared(
+                    &ToolAction {
+                        tool_name: Self::NAME,
+                        args: &args,
+                        description: Some(&Self.description()),
+                        resolved: Some(ResolvedAction::FileMutation {
+                            evidence: &evidence,
+                        }),
+                    },
+                    &prepared.preview(),
+                )
+                .await
+                .map_err(ToolExecutionError::permission_denied)?;
+        }
+        let result = prepared.commit().await;
+        if let Some(security) = security {
+            security.record_execution(receipt.as_ref(), result.is_ok());
+        }
+        result?;
+        Ok(message)
     }
 }
 
@@ -53,59 +115,7 @@ impl Tool for FileEditTool {
         _context: &mut ToolContext,
         args: Value,
     ) -> Result<String, ToolExecutionError> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'path' parameter"))?;
-        let old_string = args
-            .get("old_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'old_string' parameter"))?;
-        let new_string = args
-            .get("new_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolExecutionError::invalid_args("Missing 'new_string' parameter"))?;
-
-        if old_string.is_empty() {
-            return Err(ToolExecutionError::invalid_args(
-                "old_string must not be empty",
-            ));
-        }
-
-        let path_buf = std::path::PathBuf::from(path);
-        if super::is_protected_skill_path(&path_buf) {
-            return Err(ToolExecutionError::permission_denied(format!(
-                "Refusing to edit builtin skill source: {}",
-                path_buf.display()
-            )));
-        }
-
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| ToolExecutionError::other(format!("Failed to read file {path}: {e}")))?;
-
-        let match_count = content.matches(old_string).count();
-
-        if match_count == 0 {
-            return Err(ToolExecutionError::not_found(
-                "old_string not found in file",
-            ));
-        }
-        if match_count > 1 {
-            return Err(ToolExecutionError::invalid_args(format!(
-                "old_string matches {match_count} times; must match exactly once"
-            )));
-        }
-
-        let new_content = content.replacen(old_string, new_string, 1);
-
-        tokio::fs::write(path, &new_content)
-            .await
-            .map_err(|e| ToolExecutionError::other(format!("Failed to write file {path}: {e}")))?;
-        Ok(format!(
-            "Edited {path}: replaced 1 occurrence ({} bytes)",
-            new_content.len()
-        ))
+        Self::run(args, None).await
     }
 }
 
