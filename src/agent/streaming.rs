@@ -28,15 +28,20 @@ pub async fn turn_streamed_to_stdout(
         if accumulated.is_empty() {
             crate::render::render_markdown_to_stdout(&result.response);
         } else {
-            println!();
             if let Ok((columns, rows)) = crossterm::terminal::size() {
                 let occupied_rows = terminal_rows(&accumulated, columns as usize);
                 if occupied_rows > 0 && occupied_rows <= rows as usize {
-                    print!("\x1b[{}A\x1b[J", occupied_rows);
+                    print!("\r");
+                    if occupied_rows > 1 {
+                        print!("\x1b[{}A", occupied_rows - 1);
+                    }
+                    print!("\x1b[J");
                     let _ = std::io::stdout().flush();
                     crate::render::render_markdown_to_stdout(&result.response);
+                    return Ok(result);
                 }
             }
+            println!();
         }
     } else {
         crate::render::render_markdown_to_stdout(&result.response);

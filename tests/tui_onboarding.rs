@@ -649,10 +649,43 @@ fn streamed_redraw_clears_wrapped_response_before_markdown_render() {
         .find("\x1b[JHi!")
         .expect("streamed output should be replaced by rendered Markdown");
     assert!(
-        output[..markdown_redraw].ends_with("\x1b[5A"),
-        "80-column wrapped output occupies five terminal rows, but redraw moved by the wrong row count: {}",
+        output[..markdown_redraw].ends_with("\r\x1b[4A"),
+        "redraw should move from the fifth occupied row to the first without an extra newline: {}",
         &output[markdown_redraw.saturating_sub(30)..markdown_redraw]
     );
+}
+
+#[test]
+fn streamed_redraw_replaces_full_height_output_without_scrolling_its_first_line() {
+    for rows in [4, 5, 6] {
+        let temp = tempfile::tempdir().unwrap();
+        let response =
+            "Caddy 已通过 rootless Podman 部署完成并验证通过。\n\n当前状态\n服务已启动\n验证通过";
+        let fixture = CompletionFixture::start(response);
+        let config_path =
+            configured_deepseek_chat(&temp.path().join("assistant.toml"), &fixture.base_url);
+        let mut terminal = Terminal::start_with_size(temp.path(), &config_path, None, 100, rows);
+        terminal.until("❯ ");
+        terminal.send("检查状态\r");
+        let request = fixture.finish();
+        assert_eq!(request.path, "/v1/chat/completions");
+        terminal.collect_for(Duration::from_millis(800));
+        terminal.send("/exit\r");
+        terminal.wait_success();
+
+        let output = terminal.text();
+        let redraw = "验证通过\r\x1b[4A\x1b[J";
+        assert_eq!(
+            output.contains(redraw),
+            rows >= 5,
+            "{rows} rows: {output:?}"
+        );
+        assert_eq!(
+            output.matches("Caddy 已通过 rootless Podman").count(),
+            if rows >= 5 { 2 } else { 1 },
+            "{rows} rows: {output:?}"
+        );
+    }
 }
 
 #[test]
