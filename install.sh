@@ -14,8 +14,6 @@ PROBE_TIMEOUT="${NA_PROBE_TIMEOUT:-4}"
 DOWNLOAD_TIMEOUT="${NA_DOWNLOAD_TIMEOUT:-120}"
 VERSION="${NA_VERSION:-latest}"
 INSTALL_DIR="${NA_INSTALL_DIR:-$HOME/.local/bin}"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nano-assistant"
-CONFIG_FILE="$CONFIG_DIR/config.toml"
 
 info() { printf '==> %s\n' "$*"; }
 fatal() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -197,28 +195,6 @@ fi
 mv -f "$STAGED_BINARY" "$INSTALL_DIR/na"
 STAGED_BINARY=""
 info "Installed $INSTALL_DIR/na"
-
-mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" << 'EOF'
-[provider]
-provider = "openai"
-model = "gpt-4o-mini"
-api_key = ""  # Set your API key here or via NA_API_KEY env var
-
-[memory]
-enabled = true
-
-[security]
-mode = "confirm"  # direct | confirm | whitelist
-whitelist = ["ls", "cat", "grep", "echo", "pwd", "cd"]
-
-[behavior]
-streaming = true
-max_iterations = 10
-EOF
-    info "Created default config at $CONFIG_FILE"
-fi
 
 ensure_path() {
     case ":$PATH:" in

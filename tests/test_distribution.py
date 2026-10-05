@@ -286,6 +286,22 @@ class InstallerTests(unittest.TestCase):
             any(path.startswith("/github") for _, path, _, _ in self.server.requests)
         )
 
+    def test_fresh_install_leaves_config_creation_to_binary(self):
+        self.config.unlink()
+        self.config.parent.rmdir()
+        self.config.parent.parent.rmdir()
+        self.server.ready_release("gitee")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        version = subprocess.run(
+            [str(self.binary), "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(version.stdout.strip(), "na 0.3.2")
+        self.assertFalse(self.config.parent.exists())
+
     def test_overseas_prefers_github(self):
         self.server.country = b"loc=SG\n"
         self.server.ready_release("github")

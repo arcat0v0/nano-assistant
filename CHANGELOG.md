@@ -16,6 +16,7 @@
 - Source builds require Rust 1.88 or newer; the musl vendored OpenSSL release configuration remains in place.
 - GLM chat now uses Z.AI's documented Bearer API key rather than JWT. If its default model-list endpoint is unavailable, discovery reads current text-model IDs from Z.AI's published pricing catalog, which does not guarantee account access.
 - Streamed tool calls and results again show progress on stderr; confirmation prompts name the tool and arguments instead of displaying an unknown command for non-shell tools.
+- The Linux installer no longer creates configuration directories or embeds a default configuration; `na --config` owns configuration template creation, and existing configurations remain untouched.
 
 ### Fixed
 
