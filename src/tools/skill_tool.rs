@@ -1,6 +1,8 @@
+use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::provider_name::{dynamic_tool_name, ToolNamespace};
@@ -18,6 +20,7 @@ pub struct SkillShellTool {
     tool_name: String,
     command: String,
     args: HashMap<String, String>,
+    description: String,
 }
 
 impl SkillShellTool {
@@ -29,11 +32,13 @@ impl SkillShellTool {
             tool_name,
             command,
             args,
+            description: tool.description.clone(),
         }
     }
 
-    pub fn into_dynamic(self) -> DynamicTool {
+    pub fn into_dynamic(self, security: Arc<SecurityManager>) -> DynamicTool {
         let name = self.tool_name.clone();
+        security.register_prepared_tool(&name);
         let schema = self.parameters();
         let tool = std::sync::Arc::new(self);
         DynamicTool::new(
@@ -42,7 +47,8 @@ impl SkillShellTool {
             schema,
             move |_context, args| {
                 let tool = std::sync::Arc::clone(&tool);
-                Box::pin(async move { tool.run(args).await.map(ToolOutput::text) })
+                let security = Arc::clone(&security);
+                Box::pin(async move { tool.run(args, &security).await.map(ToolOutput::text) })
             },
         )
     }
@@ -55,12 +61,31 @@ impl SkillShellTool {
         json!({"type": "object", "properties": properties})
     }
 
-    async fn run(&self, args: Value) -> Result<String, ToolExecutionError> {
+    async fn run(
+        &self,
+        args: Value,
+        security: &SecurityManager,
+    ) -> Result<String, ToolExecutionError> {
         let mut command = self.command.clone();
         for key in self.args.keys() {
             if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
                 command = command.replace(&format!("{{{{{}}}", key), value);
             }
+        }
+        if security.mode() == SecurityMode::Auto {
+            security
+                .authorize(&ToolAction {
+                    tool_name: &self.tool_name,
+                    args: &args,
+                    description: Some(&self.description),
+                    resolved: Some(ResolvedAction::Shell {
+                        command: &command,
+                        shell: "sh",
+                        flag: "-c",
+                    }),
+                })
+                .await
+                .map_err(ToolExecutionError::other)?;
         }
 
         let mut cmd = tokio::process::Command::new("sh");
@@ -136,7 +161,8 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("msg".to_string(), "The message".to_string());
         let tool = make_skill_tool("echo", "shell", "echo {{msg}}", args);
-        let dynamic = SkillShellTool::new("demo", &tool).into_dynamic();
+        let dynamic = SkillShellTool::new("demo", &tool)
+            .into_dynamic(Arc::new(SecurityManager::new(SecurityMode::Direct)));
         let tools = rig::tool::ToolSet::from_dynamic_tools(vec![dynamic]);
         let result = tools
             .execute(
@@ -154,7 +180,10 @@ mod tests {
         let tool = make_skill_tool("fail", "shell", "exit 42", HashMap::new());
         let st = SkillShellTool::new("demo", &tool);
 
-        let error = st.run(json!({})).await.unwrap_err();
+        let error = st
+            .run(json!({}), &SecurityManager::new(SecurityMode::Direct))
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("code 42"));
     }
 }

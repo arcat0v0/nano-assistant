@@ -33,7 +33,7 @@ use crate::config::models::{
 };
 use crate::config::{Config, ModelProfile, ResolvedModel};
 use crate::hub::{maybe_render_ad, model_routes_via_hub};
-use crate::security::SecurityMode;
+use crate::security::SecurityManager;
 use rig::agent::model::ModelHandle;
 
 mod onboarding;
@@ -362,7 +362,7 @@ pub async fn run_tui(
     mut catalog_config: Config,
     selection: ResolvedModel,
     history_path: PathBuf,
-    security_mode: SecurityMode,
+    security: Arc<SecurityManager>,
 ) -> anyhow::Result<()> {
     let mut agent = None;
     let mut current_config = effective_config;
@@ -508,7 +508,7 @@ pub async fn run_tui(
                                     &mut current_config,
                                     &mut current_model,
                                     &config_path,
-                                    security_mode,
+                                    &security,
                                     profile,
                                     save,
                                 )
@@ -532,7 +532,7 @@ pub async fn run_tui(
                                     &mut current_config,
                                     &mut current_model,
                                     &config_path,
-                                    security_mode,
+                                    &security,
                                     provider,
                                 )
                                 .await
@@ -573,7 +573,7 @@ pub async fn run_tui(
                                         &current_model,
                                         &current_config,
                                         &config_path,
-                                        security_mode,
+                                        &security,
                                     )
                                     .await;
                                 }
@@ -618,8 +618,15 @@ async fn activate_model(
     resolved_model: &ResolvedModel,
     config: &Config,
     config_path: &Path,
-    security_mode: SecurityMode,
+    security: &Arc<SecurityManager>,
 ) {
+    if security.needs_reviewer() {
+        security.install_reviewer(Arc::new(crate::security::review::ModelSafetyReviewer::new(
+            model.clone(),
+            resolved_model.temperature,
+            Duration::from_secs(resolved_model.timeout_secs),
+        )));
+    }
     if let Some(agent) = agent {
         agent.switch_model(model, resolved_model, config).await;
     } else {
@@ -629,8 +636,7 @@ async fn activate_model(
                 model,
                 resolved_model.clone(),
                 config,
-                security_mode,
-                None,
+                Arc::clone(security),
                 system_info,
                 config_path.to_path_buf(),
             )
@@ -645,7 +651,7 @@ async fn switch_profile(
     current_config: &mut Config,
     current_model: &mut ResolvedModel,
     config_path: &Path,
-    security_mode: SecurityMode,
+    security: &Arc<SecurityManager>,
     profile: &str,
     save: bool,
 ) -> anyhow::Result<()> {
@@ -658,15 +664,7 @@ async fn switch_profile(
         effective.models.default = default.clone();
         catalog_config.models.default = default;
     }
-    activate_model(
-        agent,
-        model,
-        &selected,
-        &effective,
-        config_path,
-        security_mode,
-    )
-    .await;
+    activate_model(agent, model, &selected, &effective, config_path, security).await;
     *current_config = effective;
     *current_model = selected;
     Ok(())
@@ -723,7 +721,7 @@ async fn add_model_profile(
     current_config: &mut Config,
     current_model: &mut ResolvedModel,
     config_path: &Path,
-    security_mode: SecurityMode,
+    security: &Arc<SecurityManager>,
     requested_provider: Option<&str>,
 ) -> anyhow::Result<bool> {
     let preset = if let Some(id) = requested_provider {
@@ -839,15 +837,7 @@ async fn add_model_profile(
         updated.models.default = Some(name.clone());
         effective.models.default = Some(name.clone());
     }
-    activate_model(
-        agent,
-        model,
-        &selected,
-        &effective,
-        config_path,
-        security_mode,
-    )
-    .await;
+    activate_model(agent, model, &selected, &effective, config_path, security).await;
     *catalog_config = updated;
     *current_config = effective;
     *current_model = selected;

@@ -191,9 +191,12 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub blocked_tools: Vec<String>,
 
-    /// Security enforcement mode: "direct", "confirm", "whitelist". Default: "direct".
+    /// Security enforcement mode: "direct", "confirm", "whitelist", "auto". Default: "auto".
     #[serde(default = "default_security_mode")]
     pub mode: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_profile: Option<String>,
 
     /// Whitelist of allowed commands for whitelist mode. Supports glob wildcards.
     /// Example: ["ls", "cat", "docker *", "systemctl status *"]
@@ -208,13 +211,14 @@ impl Default for SecurityConfig {
             allowed_tools: Vec::new(),
             blocked_tools: Vec::new(),
             mode: default_security_mode(),
+            review_profile: None,
             whitelist: Vec::new(),
         }
     }
 }
 
 fn default_security_mode() -> String {
-    "direct".to_string()
+    "auto".to_string()
 }
 
 fn default_autonomy_level() -> String {
@@ -442,7 +446,7 @@ mod tests {
         assert!(config.memory.enabled);
         assert_eq!(config.memory.max_messages, 100);
         assert!(!config.memory.embeddings_enabled);
-        assert_eq!(config.security.mode, "direct");
+        assert_eq!(config.security.mode, "auto");
         assert!(config.security.whitelist.is_empty());
         assert_eq!(config.security.autonomy_level, "review");
         assert!(config.security.allowed_tools.is_empty());
@@ -484,7 +488,7 @@ mod tests {
     #[test]
     fn security_config_default() {
         let s = SecurityConfig::default();
-        assert_eq!(s.mode, "direct");
+        assert_eq!(s.mode, "auto");
         assert!(s.whitelist.is_empty());
         assert_eq!(s.autonomy_level, "review");
         assert!(s.allowed_tools.is_empty());
@@ -586,7 +590,7 @@ mod tests {
         assert!(config.memory.enabled);
         assert_eq!(config.memory.max_messages, 100);
         assert!(!config.memory.embeddings_enabled);
-        assert_eq!(config.security.mode, "direct");
+        assert_eq!(config.security.mode, "auto");
         assert!(config.security.whitelist.is_empty());
         assert!(config.behavior.streaming);
     }
@@ -603,7 +607,7 @@ mod tests {
         assert!(config.memory.enabled);
         assert_eq!(config.memory.max_messages, 100);
         assert!(!config.memory.embeddings_enabled);
-        assert_eq!(config.security.mode, "direct");
+        assert_eq!(config.security.mode, "auto");
         assert!(config.security.whitelist.is_empty());
         assert_eq!(config.security.autonomy_level, "review");
         assert!(config.security.allowed_tools.is_empty());

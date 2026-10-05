@@ -17,6 +17,7 @@ struct Request {
     method: String,
     path: String,
     headers: String,
+    body: Option<serde_json::Value>,
 }
 
 struct ApiFixture {
@@ -137,6 +138,122 @@ impl ApiFixture {
     }
 }
 
+struct QueuedCompletionFixture {
+    base_url: String,
+    worker: thread::JoinHandle<Vec<Request>>,
+}
+
+impl QueuedCompletionFixture {
+    fn start(responses: Vec<(&'static str, String)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (content_type, body) in responses {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "timed out waiting for queued completion"
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("queued completion fixture failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                requests.push(read_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+        Self { base_url, worker }
+    }
+
+    fn finish(self) -> Vec<Request> {
+        self.worker.join().unwrap()
+    }
+}
+
+fn queued_completion(content: &str) -> (&'static str, String) {
+    (
+        "application/json",
+        serde_json::json!({
+            "id":"fixture",
+            "object":"chat.completion",
+            "created":1,
+            "model":"safety-test-model",
+            "choices":[{
+                "index":0,
+                "message":{"role":"assistant","content":content},
+                "finish_reason":"stop"
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn queued_stream(
+    content: Option<&str>,
+    call_id: &str,
+    command: Option<&str>,
+) -> (&'static str, String) {
+    let delta = match command {
+        Some(command) => serde_json::json!({
+            "role":"assistant",
+            "tool_calls":[{
+                "index":0,
+                "id":call_id,
+                "type":"function",
+                "function":{
+                    "name":"shell",
+                    "arguments":serde_json::json!({"command":command}).to_string()
+                }
+            }]
+        }),
+        None => serde_json::json!({"role":"assistant","content":content.unwrap()}),
+    };
+    let finish = if command.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let chunks = [
+        serde_json::json!({
+            "id":"fixture",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"local-test-model",
+            "choices":[{"index":0,"delta":delta,"finish_reason":null}]
+        }),
+        serde_json::json!({
+            "id":"fixture",
+            "object":"chat.completion.chunk",
+            "created":1,
+            "model":"local-test-model",
+            "choices":[{"index":0,"delta":{},"finish_reason":finish}]
+        }),
+    ];
+    let mut body = chunks
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    ("text/event-stream", body)
+}
+
 fn read_request(stream: &mut TcpStream) -> Request {
     let mut bytes = Vec::new();
     let header_end = loop {
@@ -149,11 +266,26 @@ fn read_request(stream: &mut TcpStream) -> Request {
         }
     };
     let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+        .unwrap_or(0);
+    while bytes.len() < header_end + content_length {
+        let mut buffer = [0; 4096];
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count > 0, "API client closed before complete request body");
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let body = (content_length > 0)
+        .then(|| serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap());
     let mut first = headers.split_whitespace();
     Request {
         method: first.next().unwrap().to_owned(),
         path: first.next().unwrap().to_owned(),
         headers,
+        body,
     }
 }
 
@@ -559,5 +691,114 @@ fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
         terminal.wait_success();
         assert!(terminal.terminal_restored());
         assert!(!config_path.parent().unwrap().join("deepseek.key").exists());
+    }
+}
+
+#[test]
+fn tui_auto_unknown_requires_current_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("review-marker.txt");
+    let command = "printf reviewed > review-marker.txt";
+    let main = QueuedCompletionFixture::start(vec![
+        queued_stream(None, "call_deny", Some(command)),
+        queued_stream(Some("First operation denied."), "", None),
+        queued_stream(None, "call_allow", Some(command)),
+        queued_stream(Some("Second operation completed."), "", None),
+    ]);
+    let reviewer = QueuedCompletionFixture::start(vec![
+        queued_completion(
+            r#"{"decision":"unknown","reason":"first action requires current approval"}"#,
+        ),
+        queued_completion(
+            r#"{"decision":"unknown","reason":"second action requires current approval"}"#,
+        ),
+    ]);
+    let config_path = temp.path().join("assistant.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[provider]\nprovider='compatible'\nmodel='local-test-model'\napi_url='{}'\n\n[behavior]\nstreaming=true\nmax_iterations=8\n\n[security]\nmode='auto'\nreview_profile='reviewer'\n\n[models.profiles.reviewer]\nprovider='compatible'\nmodel='safety-test-model'\napi_url='{}'\ntemperature=0\ntimeout_secs=1\n\n[skills]\nenabled=false\n\n[memory]\nenabled=false\n\n[hub]\nenabled=false\n",
+            main.base_url, reviewer.base_url
+        ),
+    )
+    .unwrap();
+    let mut terminal = Terminal::start(temp.path(), &config_path, None);
+    terminal.until("❯ ");
+    let first_start = terminal.output.len();
+    terminal.send("Write reviewed into review-marker.txt for the first task.\r");
+    terminal.until_from("[y/N]", first_start);
+    terminal.until_from("first action requires current approval", first_start);
+    terminal.until_from("shell", first_start);
+    terminal.until_from(command, first_start);
+    assert!(!marker.exists());
+    let denied_start = terminal.output.len();
+    terminal.send("n\r");
+    terminal.until_from("First operation denied.", denied_start);
+    terminal.until_from("❯ ", denied_start);
+    assert!(!marker.exists());
+
+    let second_start = terminal.output.len();
+    terminal.send("Write reviewed into review-marker.txt for the second task.\r");
+    terminal.until_from("[y/N]", second_start);
+    terminal.until_from("second action requires current approval", second_start);
+    terminal.until_from("shell", second_start);
+    terminal.until_from(command, second_start);
+    assert!(!marker.exists());
+    let allowed_start = terminal.output.len();
+    terminal.send("y\r");
+    terminal.until_from("Second operation completed.", allowed_start);
+    terminal.until_from("❯ ", allowed_start);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "reviewed");
+    wait_for_exit(&mut terminal);
+    assert!(terminal.terminal_restored(), "{}", terminal.text());
+
+    let main_requests = main.finish();
+    assert_eq!(main_requests.len(), 4);
+    for request in &main_requests {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(request.body.as_ref().unwrap()["stream"], true);
+    }
+    let denied_result = main_requests[1].body.as_ref().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("main model should receive the denied tool result");
+    assert!(denied_result["content"]
+        .to_string()
+        .contains("Execution denied by user after safety review"));
+    let allowed_result = main_requests[3].body.as_ref().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .expect("main model should receive the executed tool result");
+    assert!(!allowed_result["content"].to_string().contains("denied"));
+
+    let review_requests = reviewer.finish();
+    assert_eq!(review_requests.len(), 2);
+    for (request, task) in review_requests.iter().zip(["first", "second"]) {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/chat/completions");
+        let body = request.body.as_ref().unwrap();
+        assert_eq!(body["model"], "safety-test-model");
+        assert!(body.get("tools").is_none_or(|tools| {
+            tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
+        }));
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        let payload: serde_json::Value =
+            serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            payload["user_request"],
+            format!("Write reviewed into review-marker.txt for the {task} task.")
+        );
+        assert_eq!(payload["action"]["tool_name"], "shell");
+        assert_eq!(payload["action"]["args"]["command"], command);
+        assert_eq!(payload["action"]["resolved"]["command"], command);
     }
 }

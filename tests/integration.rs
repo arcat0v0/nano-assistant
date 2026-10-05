@@ -81,7 +81,7 @@ streaming = false
 fn security_mode_resolves_from_config_default() {
     let config = SecurityConfig::default();
     let mode: SecurityMode = config.mode.parse().unwrap();
-    assert_eq!(mode, SecurityMode::Direct);
+    assert_eq!(mode, SecurityMode::Auto);
 }
 
 #[test]
@@ -101,7 +101,8 @@ fn security_manager_from_config_with_cli_override() {
         whitelist: vec![],
         ..Default::default()
     };
-    let mgr = SecurityManager::from_config_with_override(&config, Some(SecurityMode::Confirm));
+    let mgr =
+        SecurityManager::from_config_with_override(&config, Some(SecurityMode::Confirm)).unwrap();
     assert_eq!(mgr.mode(), SecurityMode::Confirm);
 }
 
@@ -112,7 +113,7 @@ fn security_manager_from_config_cli_override_none_uses_config() {
         whitelist: vec!["ls".into()],
         ..Default::default()
     };
-    let mgr = SecurityManager::from_config_with_override(&config, None);
+    let mgr = SecurityManager::from_config_with_override(&config, None).unwrap();
     assert_eq!(mgr.mode(), SecurityMode::Whitelist);
 }
 
@@ -122,7 +123,7 @@ fn security_manager_from_config_no_override() {
         mode: "confirm".into(),
         ..Default::default()
     };
-    let mgr = SecurityManager::from_config(&config);
+    let mgr = SecurityManager::from_config(&config).unwrap();
     assert_eq!(mgr.mode(), SecurityMode::Confirm);
 }
 
@@ -288,7 +289,10 @@ command = "https://httpbin.org/get"
     assert_eq!(skills[0].author, Some("test".to_string()));
     assert_eq!(skills[0].tools.len(), 2);
 
-    let tools = nano_assistant::skills::skills_to_tools(&skills);
+    let tools = nano_assistant::skills::skills_to_tools(
+        &skills,
+        std::sync::Arc::new(SecurityManager::new(SecurityMode::Direct)),
+    );
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].name(), "skill__test_2dtoml__hello");
     assert_eq!(tools[1].name(), "skill__test_2dtoml__http_5fcheck");
@@ -319,10 +323,13 @@ fn skill_tool_names_keep_dots_underscores_and_hyphens_distinct() {
         nano_assistant::skills::SkillSource::UserDir(dir.path().to_path_buf()),
     );
     assert_eq!(skills.len(), 4);
-    let mut names: Vec<_> = nano_assistant::skills::skills_to_tools(&skills)
-        .iter()
-        .map(|tool| tool.name().to_owned())
-        .collect();
+    let mut names: Vec<_> = nano_assistant::skills::skills_to_tools(
+        &skills,
+        std::sync::Arc::new(SecurityManager::new(SecurityMode::Direct)),
+    )
+    .iter()
+    .map(|tool| tool.name().to_owned())
+    .collect();
     names.sort();
     assert_eq!(
         names,

@@ -306,12 +306,28 @@ fn tui_guides_addition_from_live_models_without_default_model_key() {
             json!({"object":"list","data":[{"id":"deepseek-alpha"},{"id":"deepseek-zeta"}]})
                 .to_string(),
         ),
+        (200, json!({
+            "id": "onboarding-call",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek-zeta",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": null,
+                "tool_calls": [{"id":"onboarding-write","type":"function","function":{"name":"shell","arguments":"{\"command\":\"printf reviewed > onboarding-marker\"}"}}]},
+                "finish_reason":"tool_calls"}],
+        }).to_string()),
+        (200, json!({
+            "id": "onboarding-review",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "deepseek-zeta",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"{\"decision\":\"safe\",\"reason\":\"bounded requested write\"}"},"finish_reason":"stop"}],
+        }).to_string()),
         (200, completion("deepseek-zeta")),
     ]);
     let path = temp.path().join("assistant.toml");
     std::fs::write(&path, "[provider]\nprovider='openai'\nmodel='gpt-4o-mini'\n\n[behavior]\nstreaming=false\n\n[skills]\nenabled=false\n\n[memory]\nenabled=false\n\n[hub]\nenabled=false\n").unwrap();
     let input = format!(
-        "/model add deepseek\n\n{}\n2\nwork\ny\nhello\n/exit\n",
+        "/model add deepseek\n\n{}\n2\nwork\ny\nWrite reviewed to onboarding-marker\n/exit\n",
         fixture.base_url
     );
     let output = invoke(
@@ -327,6 +343,31 @@ fn tui_guides_addition_from_live_models_without_default_model_key() {
     assert_eq!(requests[0].path, "/models");
     assert_eq!(requests[1].path, "/chat/completions");
     assert_eq!(requests[1].body.as_ref().unwrap()["model"], "deepseek-zeta");
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("onboarding-marker")).unwrap(),
+        "reviewed"
+    );
+    let review = requests[2].body.as_ref().unwrap();
+    assert_eq!(review["model"], "deepseek-zeta");
+    assert_eq!(review["messages"].as_array().unwrap().len(), 2);
+    assert!(review
+        .get("tools")
+        .is_none_or(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)));
+    let payload: Value =
+        serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["user_request"],
+        "Write reviewed to onboarding-marker"
+    );
+    assert_eq!(
+        payload["action"]["resolved"]["command"],
+        "printf reviewed > onboarding-marker"
+    );
+    assert!(requests[3].body.as_ref().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["tool_call_id"] == "onboarding-write"));
     let persisted: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(persisted.models.default.as_deref(), Some("work"));
     assert_eq!(persisted.models.profiles["work"].provider, "deepseek");

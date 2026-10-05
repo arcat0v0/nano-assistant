@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
@@ -23,7 +23,7 @@ use crate::agent::streaming::StreamOutputEvent;
 use crate::config::{Config, ResolvedModel, SkillsConfig};
 use crate::mcp::{DeferredMcpToolSet, McpRegistry, McpToolWrapper, ToolSearchTool};
 use crate::memory::Memory;
-use crate::security::SecurityManager;
+use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
 use crate::skills::Skill;
 use crate::tools;
 
@@ -83,10 +83,15 @@ struct RuntimeState {
     connected_servers: HashSet<String>,
     preamble: String,
     preamble_dirty: bool,
+    tool_descriptions: HashMap<String, Arc<str>>,
+    builtin_file_read_active: bool,
 }
 
 impl RuntimeState {
     async fn add_tool(&mut self, tool: DynamicTool) {
+        if tool.name() == "file_read" {
+            self.builtin_file_read_active = false;
+        }
         self.handle.add_dynamic_tool(tool).await;
     }
 
@@ -106,6 +111,10 @@ impl RuntimeState {
             system_info: self.system_info.as_deref(),
             deferred_tool_names: &self.deferred_names,
         });
+        self.tool_descriptions = tools
+            .into_iter()
+            .map(|tool| (tool.name, Arc::from(tool.description)))
+            .collect();
         self.preamble_dirty = true;
     }
 
@@ -222,7 +231,10 @@ impl RuntimeState {
         let mut added = Vec::new();
         for skill in fresh {
             if !existing.contains(&skill.name) {
-                for tool in crate::skills::skills_to_tools(std::slice::from_ref(&skill)) {
+                for tool in crate::skills::skills_to_tools(
+                    std::slice::from_ref(&skill),
+                    Arc::clone(&self.security),
+                ) {
                     self.add_tool(tool).await;
                 }
                 added.push(skill.name.clone());
@@ -321,12 +333,45 @@ impl AgentHook for RuntimeHook {
     }
 
     async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCallEvent<'_>) -> ToolCallAction {
-        let args = match serde_json::from_str(event.args) {
+        let args: serde_json::Value = match serde_json::from_str(event.args) {
             Ok(args) => args,
             Err(error) => return ToolCallAction::skip(format!("Invalid tool arguments: {error}")),
         };
-        let security = Arc::clone(&self.0.lock().await.security);
-        match security.authorize(event.tool_name, &args).await {
+        let (security, description, exempt, prepared) = {
+            let state = self.0.lock().await;
+            (
+                Arc::clone(&state.security),
+                state.tool_descriptions.get(event.tool_name).cloned(),
+                state.builtin_file_read_active && event.tool_name == "file_read",
+                state.security.reviews_in_executor(event.tool_name),
+            )
+        };
+        if security.mode() == SecurityMode::Auto && (exempt || prepared) {
+            return ToolCallAction::run();
+        }
+        let resolved = if matches!(event.tool_name, "shell" | "pty_shell") {
+            args.get("command")
+                .and_then(serde_json::Value::as_str)
+                .map(|command| {
+                    let (shell, flag) = crate::platform::current_platform().shell_command();
+                    ResolvedAction::Shell {
+                        command,
+                        shell,
+                        flag,
+                    }
+                })
+        } else {
+            None
+        };
+        match security
+            .authorize(&ToolAction {
+                tool_name: event.tool_name,
+                args: &args,
+                description: description.as_deref(),
+                resolved,
+            })
+            .await
+        {
             Ok(()) => ToolCallAction::run(),
             Err(reason) => ToolCallAction::skip(reason),
         }
@@ -415,6 +460,8 @@ impl Agent {
             connected_servers: HashSet::new(),
             preamble: String::new(),
             preamble_dirty: false,
+            tool_descriptions: HashMap::new(),
+            builtin_file_read_active: true,
         };
         for tool in tools {
             state.add_tool(tool).await;
@@ -501,6 +548,11 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<TurnResult> {
+        self.state
+            .lock()
+            .await
+            .security
+            .set_user_request(user_message);
         let prompt = self.enriched_prompt(user_message).await;
         if self.debug {
             eprintln!(
@@ -525,6 +577,11 @@ impl Agent {
         user_message: &str,
         mut on_chunk: impl FnMut(StreamOutputEvent),
     ) -> Result<TurnResult> {
+        self.state
+            .lock()
+            .await
+            .security
+            .set_user_request(user_message);
         let prompt = self.enriched_prompt(user_message).await;
         if self.debug {
             eprintln!(

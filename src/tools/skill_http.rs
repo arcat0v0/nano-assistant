@@ -1,6 +1,8 @@
+use crate::security::{ResolvedAction, SecurityManager, SecurityMode, ToolAction};
 use rig::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::provider_name::{dynamic_tool_name, ToolNamespace};
@@ -18,6 +20,7 @@ pub struct SkillHttpTool {
     tool_name: String,
     url: String,
     args: HashMap<String, String>,
+    description: String,
 }
 
 impl SkillHttpTool {
@@ -29,16 +32,19 @@ impl SkillHttpTool {
             tool_name,
             url,
             args,
+            description: tool.description.clone(),
         }
     }
 
-    pub fn into_dynamic(self) -> DynamicTool {
+    pub fn into_dynamic(self, security: Arc<SecurityManager>) -> DynamicTool {
         let name = self.tool_name.clone();
+        security.register_prepared_tool(&name);
         let schema = self.parameters();
         let tool = std::sync::Arc::new(self);
         DynamicTool::new(name, "Skill HTTP request", schema, move |_context, args| {
             let tool = std::sync::Arc::clone(&tool);
-            Box::pin(async move { tool.run(args).await.map(ToolOutput::text) })
+            let security = Arc::clone(&security);
+            Box::pin(async move { tool.run(args, &security).await.map(ToolOutput::text) })
         })
     }
 
@@ -49,7 +55,11 @@ impl SkillHttpTool {
         }
         json!({"type": "object", "properties": properties})
     }
-    async fn run(&self, args: Value) -> Result<String, ToolExecutionError> {
+    async fn run(
+        &self,
+        args: Value,
+        security: &SecurityManager,
+    ) -> Result<String, ToolExecutionError> {
         let mut url = self.url.clone();
         for key in self.args.keys() {
             if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
@@ -61,6 +71,17 @@ impl SkillHttpTool {
             return Err(ToolExecutionError::invalid_args(
                 "Only http/https URLs are allowed",
             ));
+        }
+        if security.mode() == SecurityMode::Auto {
+            security
+                .authorize(&ToolAction {
+                    tool_name: &self.tool_name,
+                    args: &args,
+                    description: Some(&self.description),
+                    resolved: Some(ResolvedAction::HttpGet { url: &url }),
+                })
+                .await
+                .map_err(ToolExecutionError::other)?;
         }
 
         let client = reqwest::Client::builder()
@@ -131,7 +152,9 @@ mod tests {
         let ht = SkillHttpTool::new("demo", &tool);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let error = rt.block_on(ht.run(json!({}))).unwrap_err();
+        let error = rt
+            .block_on(ht.run(json!({}), &SecurityManager::new(SecurityMode::Direct)))
+            .unwrap_err();
         assert_eq!(error.to_string(), "Only http/https URLs are allowed");
     }
 }

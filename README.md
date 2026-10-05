@@ -10,7 +10,7 @@
 - **MCP 协议支持**: 通过 MCP (Model Context Protocol) 接入外部工具服务器（Exa、Context7、Grep.app 等），支持 Stdio/HTTP/SSE 三种传输，延迟加载节省上下文
 - **skills.sh 生态兼容**: 自动扫描 `~/.agents/skills/`，直接使用 skills.sh 社区生态中的 skill
 - **丰富的运维 Skill**: 内置 Linux 发行版管理（Arch/Debian/Fedora/CentOS）、数据库管理、容器编排、服务器安全加固等 domain skill
-- **3 种安全模式**: direct（直接执行）、confirm（逐次确认）、whitelist（白名单）
+- **4 种安全模式**: direct（直接执行）、confirm（逐次确认）、whitelist（白名单）、auto（安全审查后自动确认）
 - **持久化记忆**: 基于 Markdown 文件的对话记忆存储
 - **实时流式输出**: Rig 原生文本增量、工具调用与多轮结果实时显示，支持 Ctrl+C 中断
 - **两种使用方式**: 单命令模式 `na "prompt"` + 交互模式 `na`
@@ -217,6 +217,8 @@ na --mode confirm "删除所有 .tmp 文件"
 
 # 白名单模式（只允许预定义的安全命令）
 na --mode whitelist "ls -la /etc"
+
+na chat --mode auto "清理本项目的临时构建文件"
 ```
 
 ### 详细输出
@@ -340,7 +342,7 @@ enabled = true               # 是否启用持久化记忆
 max_messages = 100           # 最大保留的对话消息数
 
 [security]
-mode = "confirm"             # 安全模式: direct | confirm | whitelist
+mode = "auto"                # 安全模式: direct | confirm | whitelist | auto
 whitelist = ["ls", "cat", "grep", "docker *", "systemctl status *"]
 
 [behavior]
@@ -399,7 +401,7 @@ ad_display = "inline"
 - hub 无广告或广告接口不可达时，广告展示会静默跳过，不影响回答
 - 其他普通模型名仍按原有 provider 配置直连，不经过 hub
 
-`free/` 是本地路由前缀，向 Hub 请求时发送其后的模型名（例如 `free/glm-5` 对应 Hub 的 `glm-5`）。Hub 接受带 ID 的原生工具调用和结果历史；工具执行与 direct/confirm/whitelist 安全校验仍在本机。免费路由当前不接受图片输入。
+`free/` 是本地路由前缀，向 Hub 请求时发送其后的模型名（例如 `free/glm-5` 对应 Hub 的 `glm-5`）。Hub 接受带 ID 的原生工具调用和结果历史；工具执行与 direct/confirm/whitelist/auto 安全校验仍在本机。免费路由当前不接受图片输入。
 
 常用命令：
 
@@ -447,6 +449,35 @@ whitelist = [
     "grep *",       # 匹配 grep 后跟任意参数
 ]
 ```
+
+**auto（安全审查后自动确认）**
+
+```bash
+na chat --mode auto "执行本项目测试"
+```
+
+除实际内置的 `file_read` 外，每次工具执行前由独立安全审查器判断。只有协议有效的 `safe` 才自动执行；`risky`、`unknown`、超时、网络或响应协议失败均显示工具名、完整参数、实际展开命令/URL（若有）及审查理由，等待本次输入 `y`。拒绝、EOF 或读取失败不会执行，不记忆或复用批准。搜索、写文件、PTY、MCP（包括延迟发现）及名称含 read 的技能均需审查；模板技能先展开一次，再审查并执行同一命令/URL。
+
+未设置 `review_profile`（或值为空白）时，审查器使用聊天启动时选中的主模型参数。也可用已有 `na model add` 配置独立具名 profile：
+
+```bash
+na model add reviewer --provider compatible --model YOUR_MODEL --api-url https://YOUR_ENDPOINT/v1 --api-key-env REVIEW_API_KEY
+```
+
+```toml
+[security]
+mode = "auto"
+review_profile = "reviewer"
+```
+
+审查器独立创建后固定整场会话：主模型切换、默认 profile 变更或编辑配置均不重新绑定审查器。未指定审查 profile 且主模型尚无 API key 时，交互入口保留原有模型配置及首次 DeepSeek 引导；成功配置可用主模型后，以该主模型初始化审查器，再允许聊天和工具执行，不要求额外配置审查模型。主模型在启动时已可用的情况下，审查器仍使用启动时选中的主模型参数。审查 profile 复用普通模型配置的供应商、模型 ID、URL、凭据环境变量、temperature 和 timeout，仍可在主模型菜单中主动选择。显式指定的审查 profile 必须为 `[models.profiles]` 中的具名项，不能为 `default`。
+
+当前原始用户请求、工具描述、完整参数、展开后的命令/URL、实际 cwd 和操作系统会发送给审查模型对应服务。审查请求不携带工具权限、主对话历史、Memory、环境变量值、文件读取结果或 PTY 的后续安全透传输入。依赖未提供的脚本内容、别名、远端副作用或后续输入的操作应转人工判断。
+
+聊天启动遇到已有配置读取/解析失败、所选安全模式无效、显式审查 profile 无效或审查模型无法构建时会停止，不回退 direct。CLI `--mode` 优先于配置；非 auto 不加载审查 profile。默认模式为 auto：新建配置、缺失 `[security]` 或省略 `mode` 均启用安全审查；已有配置显式指定的模式保持有效。`security.autonomy_level` 不是此功能开关。
+
+模型审查是额外防线，不是沙箱，也不保证绝对安全；现实模型可能误判。确认前仍应核对完整操作及影响范围。
+
 
 ### 环境变量
 

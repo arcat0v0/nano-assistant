@@ -7,6 +7,8 @@
 - Local model profiles, `na model` management commands, one-shot model overrides, and interactive `/model` switching with optional saved default. Switching retains conversation and tool state without inheriting credentials from another provider.
 - Built-in DeepSeek, Kimi, GLM, MiMo, and Qwen providers with authenticated live model discovery; `na model discover` and the interactive `/model add` wizard select online models and save local profiles without storing API keys. The wizard is available even when the previous default model cannot initialize.
 - Interactive `/` command palette with arrow-key selection and Right-arrow completion, plus a `/model` submenu for profile switching, provider addition, and optional default selection.
+- `na chat --mode auto` reviews every operation except the actual built-in file reader. Valid safe decisions auto-approve; uncertain, risky, failed, or timed-out reviews require fresh human confirmation. Skills review their expanded execution plans, and PTY/MCP operations use the same gate.
+- A session-fixed, isolated safety reviewer uses `security.review_profile` when explicitly configured, or the startup main model otherwise; it has no tools or shared conversation history.
 
 ### Changed
 
@@ -17,6 +19,9 @@
 - GLM chat now uses Z.AI's documented Bearer API key rather than JWT. If its default model-list endpoint is unavailable, discovery reads current text-model IDs from Z.AI's published pricing catalog, which does not guarantee account access.
 - Streamed tool calls and results again show progress on stderr; confirmation prompts name the tool and arguments instead of displaying an unknown command for non-shell tools.
 - The Linux installer no longer creates configuration directories or embeds a default configuration; normal `na` startup creates missing configuration with explicit DeepSeek defaults and leaves existing files untouched. The redundant `--config` editor entry point is removed; `--help` and `--version` remain read-only.
+- Chat startup now stops on unreadable or malformed existing configuration, invalid selected security modes, and unusable explicitly configured safety models instead of silently falling back to direct execution.
+- Auto safety review is now the default for new and unspecified security configuration; explicitly configured modes and CLI overrides remain effective.
+- Default Auto preserves first-run DeepSeek and model-add onboarding when no usable main-model credential exists. Its implicit reviewer initializes from the first successfully configured main model before chat execution, without requiring a separate review profile.
 
 ### Fixed
 

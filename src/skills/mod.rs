@@ -742,7 +742,10 @@ pub fn skills_to_prompt(skills: &[Skill]) -> String {
     prompt
 }
 
-pub fn skills_to_tools(skills: &[Skill]) -> Vec<rig::tool::DynamicTool> {
+pub fn skills_to_tools(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityManager>,
+) -> Vec<rig::tool::DynamicTool> {
     let mut tools = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
@@ -750,13 +753,13 @@ pub fn skills_to_tools(skills: &[Skill]) -> Vec<rig::tool::DynamicTool> {
                 "shell" | "script" => {
                     tools.push(
                         crate::tools::skill_tool::SkillShellTool::new(&skill.name, tool)
-                            .into_dynamic(),
+                            .into_dynamic(std::sync::Arc::clone(&security)),
                     );
                 }
                 "http" => {
                     tools.push(
                         crate::tools::skill_http::SkillHttpTool::new(&skill.name, tool)
-                            .into_dynamic(),
+                            .into_dynamic(std::sync::Arc::clone(&security)),
                     );
                 }
                 other => {

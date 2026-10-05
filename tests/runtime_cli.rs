@@ -73,6 +73,8 @@ impl ScriptedEndpoint {
 struct LocalMcp {
     url: String,
     worker: thread::JoinHandle<Vec<Value>>,
+    stop: std::sync::mpsc::Sender<()>,
+    expected_calls: usize,
 }
 
 impl LocalMcp {
@@ -81,23 +83,33 @@ impl LocalMcp {
     }
 
     fn start_with_tool(tool_name: &str) -> Self {
+        Self::start_with_expected_calls(tool_name, 1)
+    }
+
+    fn start_with_expected_calls(tool_name: &str, expected_calls: usize) -> Self {
         let tool_name = tool_name.to_string();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (stop, stopped) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
             let mut received = Vec::new();
-            for expected in [
-                "initialize",
-                "notifications/initialized",
-                "tools/list",
-                "tools/call",
-            ] {
+            let mut step = 0;
+            loop {
+                let expected = match step {
+                    0 => "initialize",
+                    1 => "notifications/initialized",
+                    2 => "tools/list",
+                    _ => "tools/call",
+                };
                 let deadline = Instant::now() + Duration::from_secs(20);
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stopped.try_recv().is_ok() {
+                                return received;
+                            }
                             assert!(
                                 Instant::now() < deadline,
                                 "timed out waiting for MCP {expected}"
@@ -137,14 +149,42 @@ impl LocalMcp {
                 ).unwrap();
                 stream.flush().unwrap();
                 received.push(request);
+                step += 1;
             }
-            received
         });
-        Self { url, worker }
+        Self {
+            url,
+            worker,
+            stop,
+            expected_calls,
+        }
     }
 
     fn finish(self) -> Vec<Value> {
-        self.worker.join().unwrap()
+        self.stop.send(()).unwrap();
+        let received = self.worker.join().unwrap();
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request["method"] == "tools/call")
+                .count(),
+            self.expected_calls
+        );
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request["method"] == "initialize")
+                .count(),
+            1
+        );
+        assert_eq!(
+            received
+                .iter()
+                .filter(|request| request["method"] == "tools/list")
+                .count(),
+            1
+        );
+        received
     }
 }
 
@@ -277,7 +317,8 @@ fn run_cli_with_args(
         .env_remove("NA_TEST_UNSET_SWITCH_KEY")
         .env_remove("NA_TEST_MISSING_KEY")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
     if let Some(prompt) = prompt {
         command.arg(prompt);
     }
@@ -1521,7 +1562,7 @@ fn startup_creates_missing_config_and_preserves_it_on_restart() {
         assert_eq!(config.provider.provider.as_deref(), Some("deepseek"));
         assert_eq!(config.provider.model.as_deref(), Some("deepseek-flash"));
         assert!(config.provider.api_key.is_none());
-        assert_eq!(config.security.mode, "direct");
+        assert_eq!(config.security.mode, "auto");
         assert!(config.memory.enabled);
         assert!(config.behavior.streaming);
         let custom = source.replace("deepseek-flash", "user-selected-model");
@@ -1585,5 +1626,1212 @@ fn informational_flags_and_removed_config_flag_do_not_create_config() {
             .unwrap();
         assert_eq!(output.status.success(), succeeds, "{:?}", output);
         assert!(!temp.path().join(".config").exists());
+    }
+}
+
+struct AutoEndpoint {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    worker: thread::JoinHandle<Vec<Value>>,
+}
+
+impl AutoEndpoint {
+    fn start(responses: Vec<(String, String)>) -> Self {
+        Self::with_faults(
+            responses
+                .into_iter()
+                .map(|response| (Duration::ZERO, Some((200, response))))
+                .collect(),
+        )
+    }
+
+    fn with_faults(responses: Vec<(Duration, Option<(u16, (String, String))>)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut responses = responses.into_iter();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let (path, request) = read_request(&mut stream);
+                        assert_eq!(path, "/v1/chat/completions");
+                        requests.push(request);
+                        let (delay, response) = responses.next().expect("unexpected model request");
+                        thread::sleep(delay);
+                        if let Some((status, (content_type, body))) = response {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.try_recv().is_ok() {
+                            assert!(responses.next().is_none(), "missing model request");
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("model listener failed: {error}"),
+                }
+            }
+        });
+        Self { url, stop, worker }
+    }
+
+    fn finish(self) -> Vec<Value> {
+        self.stop.send(()).unwrap();
+        self.worker.join().unwrap()
+    }
+}
+
+fn auto_config(home: &Path, main: &str, review: &str, streaming: bool) -> std::path::PathBuf {
+    let path = config(
+        home,
+        main,
+        streaming,
+        false,
+        "mode = \"auto\"\nreview_profile = \"reviewer\"",
+    );
+    append_config(
+        &path,
+        &format!(
+            "\n[models.profiles.reviewer]\nprovider = \"compatible\"\nmodel = \"safety-test-model\"\napi_url = \"{review}\"\ntemperature = 0\ntimeout_secs = 1\n"
+        ),
+    );
+    path
+}
+
+fn append_config(path: &Path, text: &str) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+fn review_response(decision: &str) -> (String, String) {
+    completion(
+        Some(&json!({"decision":decision,"reason":"bounded write requested by user"}).to_string()),
+        vec![],
+    )
+}
+
+fn auto_stream_call(id: &str, name: &str, args: Value) -> (String, String) {
+    sse(vec![
+        json!({"id":"auto-stream","object":"chat.completion.chunk","created":1,"model":"local-test-model","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":null}]}),
+        json!({"id":"auto-stream","object":"chat.completion.chunk","created":1,"model":"local-test-model","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    ])
+}
+
+fn review_payload(request: &Value) -> Value {
+    assert_eq!(request["model"], "safety-test-model");
+    assert_eq!(request["temperature"].as_f64(), Some(0.0));
+    assert!(request
+        .get("tools")
+        .is_none_or(|tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)));
+    assert_ne!(request["stream"], true);
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "review must not receive main history: {request}"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap()
+}
+
+fn assert_denied(request: &Value, id: &str) {
+    assert!(
+        tool_result(request, id)
+            .to_string()
+            .contains("Execution denied by user after safety review"),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn cli_auto_safe_shell_runs_nonstreamed_and_streamed_without_confirmation() {
+    for streaming in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let memory = MarkdownMemory::new(temp.path().join(".config/nano-assistant/MEMORY.md"));
+        memory
+            .add(
+                "reviewed",
+                "PRIVATE_MEMORY_NOT_FOR_REVIEWER",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        let command = "printf reviewed > review-ok.txt";
+        let args = json!({"command":command});
+        let main = ScriptedEndpoint::start(vec![
+            if streaming {
+                auto_stream_call("allow", "shell", args.clone())
+            } else {
+                completion(None, vec![tool_call("allow", "shell", args.clone())])
+            },
+            if streaming {
+                stream_completion("Reviewed successfully.")
+            } else {
+                completion(Some("Reviewed successfully."), vec![])
+            },
+        ]);
+        let review = AutoEndpoint::start(vec![review_response("safe")]);
+        let path = auto_config(temp.path(), &main.url, &review.url, streaming);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("[memory]\nenabled = false", "[memory]\nenabled = true");
+        std::fs::write(&path, text).unwrap();
+        let output = run_cli(
+            temp.path(),
+            &path,
+            None,
+            Some("Write reviewed to review-ok.txt"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("review-ok.txt")).unwrap(),
+            "reviewed"
+        );
+        assert!(!tool_result(&requests[1], "allow")
+            .to_string()
+            .contains("denied"));
+        assert!(requests[0]
+            .to_string()
+            .contains("PRIVATE_MEMORY_NOT_FOR_REVIEWER"));
+        assert!(!reviews[0]
+            .to_string()
+            .contains("PRIVATE_MEMORY_NOT_FOR_REVIEWER"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+        let payload = review_payload(&reviews[0]);
+        assert_eq!(payload["user_request"], "Write reviewed to review-ok.txt");
+        assert_eq!(payload["action"]["tool_name"], "shell");
+        assert_eq!(payload["action"]["args"], args);
+        assert_eq!(payload["action"]["resolved"]["command"], command);
+        assert_eq!(payload["cwd"], temp.path().to_str().unwrap());
+        assert_eq!(payload["platform"], std::env::consts::OS);
+        assert!(!reviews[0].to_string().contains("Reviewed successfully."));
+    }
+}
+
+#[test]
+fn cli_auto_risky_unknown_eof_and_non_y_require_current_confirmation() {
+    for decision in ["risky", "unknown"] {
+        for input in [Some("n\n"), Some("y\n"), Some("yes\n"), None] {
+            let temp = tempfile::tempdir().unwrap();
+            let main = ScriptedEndpoint::start(vec![
+                completion(
+                    None,
+                    vec![tool_call(
+                        "write",
+                        "shell",
+                        json!({"command":"printf reviewed > marker"}),
+                    )],
+                ),
+                completion(Some("Finished."), vec![]),
+            ]);
+            let review = AutoEndpoint::start(vec![review_response(decision)]);
+            let path = auto_config(temp.path(), &main.url, &review.url, false);
+            let output = run_cli(temp.path(), &path, input, Some("Write reviewed to marker"));
+            let requests = main.finish();
+            review.finish();
+            assert_success(&output);
+            if input == Some("y\n") {
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+                    "reviewed"
+                );
+            } else {
+                assert!(!temp.path().join("marker").exists());
+                assert_denied(&requests[1], "write");
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("shell") && stderr.contains(decision) && stderr.contains("[y/N]"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_auto_previous_yes_does_not_authorize_next_tool() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "first",
+                "shell",
+                json!({"command":"printf first > first"}),
+            )],
+        ),
+        completion(
+            None,
+            vec![tool_call(
+                "second",
+                "shell",
+                json!({"command":"printf second > second"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("unknown")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("y\nn\n"),
+        Some("Write the first and second markers"),
+    );
+    let requests = main.finish();
+    assert_eq!(review.finish().len(), 2);
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("first")).unwrap(),
+        "first"
+    );
+    assert!(!temp.path().join("second").exists());
+    assert_denied(&requests[2], "second");
+}
+
+#[test]
+fn cli_auto_invalid_protocol_never_automatically_executes() {
+    let mut responses = vec![
+        completion(Some("{"), vec![]),
+        completion(Some(r#"{"decision":"maybe","reason":"uncertain"}"#), vec![]),
+        completion(Some(r#"{"decision":"safe","reason":"  "}"#), vec![]),
+        completion(
+            Some(r#"{"decision":"safe","reason":"ok","extra":true}"#),
+            vec![],
+        ),
+        completion(
+            Some("```json\n{\"decision\":\"safe\",\"reason\":\"ok\"}\n```"),
+            vec![],
+        ),
+        completion(
+            None,
+            vec![tool_call("forged", "shell", json!({"command":"true"}))],
+        ),
+    ];
+    let mut truncated: Value = serde_json::from_str(&review_response("safe").1).unwrap();
+    truncated["choices"][0]["finish_reason"] = json!("length");
+    responses.push(("application/json".into(), truncated.to_string()));
+    for response in responses {
+        let temp = tempfile::tempdir().unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "write",
+                    "shell",
+                    json!({"command":"printf forbidden > marker"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![response]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(temp.path(), &path, None, Some("Write marker"));
+        let requests = main.finish();
+        review.finish();
+        assert_success(&output);
+        assert!(!temp.path().join("marker").exists());
+        assert_denied(&requests[1], "write");
+    }
+}
+
+#[test]
+fn cli_auto_network_timeout_and_provider_error_are_private_and_confirmable() {
+    for (delay, response, input) in [
+        (Duration::ZERO, None, None),
+        (Duration::from_millis(1300), Some((200, review_response("safe"))), Some("n\n")),
+        (Duration::ZERO, Some((401, ("application/json".into(), r#"{"error":{"message":"FAKE_CREDENTIAL_DO_NOT_LEAK","type":"authentication_error"}}"#.into()))), Some("y\n")),
+        (Duration::ZERO, Some((200, completion(Some("{"), vec![]))), Some("y\n")),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(None, vec![tool_call("write", "shell", json!({"command":"printf reviewed > marker"}))]),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::with_faults(vec![(delay, response)]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(temp.path(), &path, input, Some("Write reviewed to marker"));
+        let requests = main.finish();
+        review.finish();
+        assert_success(&output);
+        if input == Some("y\n") {
+            assert_eq!(std::fs::read_to_string(temp.path().join("marker")).unwrap(), "reviewed");
+        } else {
+            assert!(!temp.path().join("marker").exists());
+            assert_denied(&requests[1], "write");
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("FAKE_CREDENTIAL_DO_NOT_LEAK"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("FAKE_CREDENTIAL_DO_NOT_LEAK"));
+        assert!(!format!("{requests:?}").contains("FAKE_CREDENTIAL_DO_NOT_LEAK"));
+    }
+}
+
+#[test]
+fn cli_auto_builtin_read_is_exempt_but_write_and_edit_are_reviewed() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let target = temp.path().join("new-directory/target");
+    std::fs::write(&source, "private-read-result").unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call("read", "file_read", json!({"path":source}))],
+        ),
+        completion(
+            None,
+            vec![tool_call(
+                "write",
+                "file_write",
+                json!({"path":target,"content":"new"}),
+            )],
+        ),
+        completion(
+            None,
+            vec![tool_call(
+                "edit",
+                "file_edit",
+                json!({"path":source,"old_string":"private-read-result","new_string":"changed"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("risky")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("n\nn\n"),
+        Some("Read source, write target, edit source"),
+    );
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert!(tool_result(&requests[1], "read")
+        .to_string()
+        .contains("private-read-result"));
+    assert_denied(&requests[2], "write");
+    assert_denied(&requests[3], "edit");
+    assert_eq!(
+        std::fs::read_to_string(source).unwrap(),
+        "private-read-result"
+    );
+    assert!(!temp.path().join("new-directory").exists());
+    assert_eq!(
+        review_payload(&reviews[0])["action"]["tool_name"],
+        "file_write"
+    );
+    assert_eq!(
+        review_payload(&reviews[1])["action"]["tool_name"],
+        "file_edit"
+    );
+    assert!(!reviews[0].to_string().contains("private-read-result"));
+}
+
+fn enable_auto_skills(path: &Path, skills: &Path) {
+    let text = std::fs::read_to_string(path).unwrap();
+    std::fs::write(
+        path,
+        text.replace(
+            "[skills]\nenabled = false",
+            &format!(
+                "[skills]\nenabled = true\nallow_scripts = true\nskills_dir = {:?}",
+                skills.to_str().unwrap()
+            ),
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn cli_auto_shell_skill_reviews_expanded_command_even_when_named_read() {
+    for (decision, input, allowed) in [
+        ("unknown", Some("n\n"), false),
+        ("safe", None, true),
+        ("unknown", Some("y\n"), true),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = temp.path().join("skills");
+        std::fs::create_dir_all(skills.join("fixture")).unwrap();
+        std::fs::write(skills.join("fixture/SKILL.toml"), "[skill]\nname = \"fixture\"\ndescription = \"Fixture\"\n[[tools]]\nname = \"read\"\ndescription = \"Writes marker\"\nkind = \"shell\"\ncommand = \"printf '{{value}' > skill-marker\"\n[tools.args]\nvalue = \"Value\"\n").unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "skill",
+                    "skill__fixture__read",
+                    json!({"value":"expanded"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![review_response(decision)]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        enable_auto_skills(&path, &skills);
+        let output = run_cli(
+            temp.path(),
+            &path,
+            input,
+            Some("Write expanded using fixture"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        let payload = review_payload(&reviews[0]);
+        assert_eq!(
+            payload["action"]["resolved"],
+            json!({"kind":"shell","command":"printf 'expanded' > skill-marker","shell":"sh","flag":"-c"})
+        );
+        assert_eq!(payload["action"]["args"], json!({"value":"expanded"}));
+        if allowed {
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("skill-marker")).unwrap(),
+                "expanded"
+            );
+        } else {
+            assert!(!temp.path().join("skill-marker").exists());
+            assert_denied(&requests[1], "skill");
+        }
+    }
+}
+
+struct AutoHttpTarget {
+    url: String,
+    stop: std::sync::mpsc::Sender<()>,
+    worker: thread::JoinHandle<Vec<String>>,
+}
+
+impl AutoHttpTarget {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut data = Vec::new();
+                        while !data.windows(4).any(|window| window == b"\r\n\r\n") {
+                            let mut buffer = [0; 1024];
+                            let count = stream.read(&mut buffer).unwrap();
+                            assert!(count > 0);
+                            data.extend_from_slice(&buffer[..count]);
+                        }
+                        requests.push(
+                            String::from_utf8(data)
+                                .unwrap()
+                                .lines()
+                                .next()
+                                .unwrap()
+                                .to_owned(),
+                        );
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nmarker").unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopped.try_recv().is_ok() {
+                            return requests;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("HTTP target failed: {error}"),
+                }
+            }
+        });
+        Self { url, stop, worker }
+    }
+
+    fn finish(self) -> Vec<String> {
+        self.stop.send(()).unwrap();
+        self.worker.join().unwrap()
+    }
+}
+
+#[test]
+fn cli_auto_http_skill_reviews_expanded_url_before_get() {
+    for allowed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let target = AutoHttpTarget::start();
+        let skills = temp.path().join("skills");
+        std::fs::create_dir_all(skills.join("fixture")).unwrap();
+        std::fs::write(skills.join("fixture/SKILL.toml"), format!("[skill]\nname = \"fixture\"\ndescription = \"Fixture\"\n[[tools]]\nname = \"read\"\ndescription = \"Remote GET\"\nkind = \"http\"\ncommand = \"{}/{{{{value}}\"\n[tools.args]\nvalue = \"Path\"\n", target.url)).unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "http",
+                    "skill__fixture__read",
+                    json!({"value":"expanded"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![review_response(if allowed {
+            "safe"
+        } else {
+            "unknown"
+        })]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        enable_auto_skills(&path, &skills);
+        let output = run_cli(temp.path(), &path, Some("n\n"), Some("Fetch expanded"));
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_eq!(
+            review_payload(&reviews[0])["action"]["resolved"],
+            json!({"kind":"http_get","url":format!("{}/expanded", target.url)})
+        );
+        let gets = target.finish();
+        if allowed {
+            assert_eq!(gets, ["GET /expanded HTTP/1.1"]);
+            assert!(tool_result(&requests[1], "http")
+                .to_string()
+                .contains("marker"));
+        } else {
+            assert!(gets.is_empty());
+            assert_denied(&requests[1], "http");
+        }
+    }
+}
+
+#[test]
+fn cli_auto_new_skill_after_shell_install_rescan_is_reviewed() {
+    let temp = tempfile::tempdir().unwrap();
+    let skills = temp.path().join("skills");
+    std::fs::create_dir_all(&skills).unwrap();
+    let manifest = skills.join("new/SKILL.toml");
+    let content = "[skill]\nname = \"new\"\ndescription = \"New fixture\"\n[[tools]]\nname = \"read\"\ndescription = \"Writes marker\"\nkind = \"shell\"\ncommand = \"printf forbidden > rescan-marker\"\n";
+    let install = format!("skills() {{ mkdir -p skills/new; printf '%s' '{content}' > skills/new/SKILL.toml; }}; skills add fixture");
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call("install", "shell", json!({"command":install}))],
+        ),
+        completion(
+            None,
+            vec![tool_call("new_skill", "skill__new__read", json!({}))],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("safe"), review_response("unknown")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    enable_auto_skills(&path, &skills);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("n\n"),
+        Some("Install new skill and invoke it"),
+    );
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(std::fs::read_to_string(manifest).unwrap(), content);
+    assert!(requests[1]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "skill__new__read"));
+    assert_eq!(
+        review_payload(&reviews[1])["action"]["resolved"]["command"],
+        "printf forbidden > rescan-marker"
+    );
+    assert_denied(&requests[2], "new_skill");
+    assert!(!temp.path().join("rescan-marker").exists());
+}
+
+#[test]
+fn cli_auto_pty_reviews_full_interactions_and_preserves_real_execution() {
+    for allowed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let args = json!({"command":"printf 'Name: '; read name; printf '%s' \"$name\" > pty-marker","interactions":[{"expect":"Name:","respond":"reviewed","timeout_secs":3}],"timeout_secs":5});
+        let main = ScriptedEndpoint::start(vec![
+            completion(None, vec![tool_call("pty", "pty_shell", args.clone())]),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![review_response(if allowed {
+            "safe"
+        } else {
+            "unknown"
+        })]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(
+            temp.path(),
+            &path,
+            Some("n\n"),
+            Some("Answer Name with reviewed and write pty-marker"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_eq!(review_payload(&reviews[0])["action"]["args"], args);
+        if allowed {
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("pty-marker")).unwrap(),
+                "reviewed"
+            );
+        } else {
+            assert!(!temp.path().join("pty-marker").exists());
+            assert_denied(&requests[1], "pty");
+        }
+    }
+}
+
+#[test]
+fn cli_auto_mcp_read_name_and_deferred_search_are_reviewed_before_call() {
+    for deferred in [false, true] {
+        for allowed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let mcp = LocalMcp::start_with_expected_calls("read", usize::from(allowed));
+            let mut responses = Vec::new();
+            if deferred {
+                responses.push(completion(
+                    None,
+                    vec![tool_call(
+                        "search",
+                        "tool_search",
+                        json!({"query":"select:mcp__demo__read"}),
+                    )],
+                ));
+            }
+            responses.push(completion(
+                None,
+                vec![tool_call(
+                    "mcp",
+                    "mcp__demo__read",
+                    json!({"text":"remote marker"}),
+                )],
+            ));
+            responses.push(completion(Some("Finished."), vec![]));
+            let main = ScriptedEndpoint::start(responses);
+            let mut decisions = Vec::new();
+            if deferred {
+                decisions.push(review_response("safe"));
+            }
+            decisions.push(review_response(if allowed { "safe" } else { "unknown" }));
+            let review = AutoEndpoint::start(decisions);
+            let path = auto_config(temp.path(), &main.url, &review.url, false);
+            append_config(&path, &format!("\n[mcp]\nenabled = true\ndeferred_loading = {deferred}\n[[mcp.servers]]\nname = \"demo\"\ntransport = \"http\"\nurl = \"{}\"\n", mcp.url));
+            let output = run_cli(
+                temp.path(),
+                &path,
+                Some("n\n"),
+                Some("Use remote read with remote marker"),
+            );
+            let requests = main.finish();
+            let reviews = review.finish();
+            assert_success(&output);
+            let mcp_requests = mcp.finish();
+            if deferred {
+                assert_eq!(
+                    review_payload(&reviews[0])["action"]["tool_name"],
+                    "tool_search"
+                );
+                assert!(tool_result(&requests[1], "search")
+                    .to_string()
+                    .contains("mcp__demo__read"));
+            }
+            assert_eq!(
+                review_payload(reviews.last().unwrap())["action"]["tool_name"],
+                "mcp__demo__read"
+            );
+            if allowed {
+                let call = mcp_requests
+                    .iter()
+                    .find(|request| request["method"] == "tools/call")
+                    .unwrap();
+                assert_eq!(call["params"]["name"], "read");
+                assert_eq!(call["params"]["arguments"], json!({"text":"remote marker"}));
+                assert!(tool_result(requests.last().unwrap(), "mcp")
+                    .to_string()
+                    .contains("MCP returned"));
+            } else {
+                assert_denied(requests.last().unwrap(), "mcp");
+            }
+        }
+    }
+}
+
+#[test]
+fn cli_auto_review_profile_stays_fixed_and_uses_current_request_after_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "first",
+                "shell",
+                json!({"command":"printf first > first-marker"}),
+            )],
+        ),
+        completion(Some("First history marker."), vec![]),
+    ]);
+    let second = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "second",
+                "shell",
+                json!({"command":"printf second > second-marker"}),
+            )],
+        ),
+        completion(Some("Second finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("safe"), review_response("safe")]);
+    let path = auto_config(temp.path(), &first.url, &review.url, false);
+    append_config(&path, &format!("\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n", second.url));
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("Write first-marker\n/model second\nWrite second-marker\n/exit\n"),
+        None,
+    );
+    let first_requests = first.finish();
+    let second_requests = second.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("first-marker")).unwrap(),
+        "first"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("second-marker")).unwrap(),
+        "second"
+    );
+    assert_eq!(second_requests[0]["model"], "second-model");
+    assert!(second_requests[0]
+        .to_string()
+        .contains("First history marker."));
+    assert!(tool_result(&second_requests[0], "first").is_object());
+    assert_eq!(first_requests.len(), 2);
+    assert_eq!(
+        review_payload(&reviews[0])["user_request"],
+        "Write first-marker"
+    );
+    assert_eq!(
+        review_payload(&reviews[1])["user_request"],
+        "Write second-marker"
+    );
+    assert!(!reviews[1].to_string().contains("First history marker."));
+    assert!(!reviews[1].to_string().contains("first-marker"));
+}
+
+#[test]
+fn cli_auto_startup_configuration_errors_fail_closed_without_model_requests() {
+    for case in [
+        "toml",
+        "directory",
+        "cli-mode",
+        "config-mode",
+        "default",
+        "absent",
+        "invalid-profile",
+        "credential",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = AutoEndpoint::start(vec![]);
+        let review = AutoEndpoint::start(vec![]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        let args = if case == "cli-mode" {
+            vec!["--mode", "invalid-mode"]
+        } else {
+            vec![]
+        };
+        match case {
+            "toml" => text = "[provider]\napi_key = \"FAKE_CONFIG_CREDENTIAL_DO_NOT_LEAK".into(),
+            "directory" => {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            "config-mode" => text = text.replace("mode = \"auto\"", "mode = \"invalid-mode\""),
+            "default" => {
+                text = text.replace(
+                    "review_profile = \"reviewer\"",
+                    "review_profile = \"default\"",
+                )
+            }
+            "absent" => {
+                text = text.replace(
+                    "review_profile = \"reviewer\"",
+                    "review_profile = \"absent\"",
+                )
+            }
+            "invalid-profile" => {
+                text = text.replace("provider = \"compatible\"", "provider = \"not-a-provider\"")
+            }
+            "credential" => {
+                text = text.replace(
+                    "provider = \"compatible\"",
+                    "provider = \"openai\"\napi_key_env = \"NA_TEST_MISSING_KEY\"",
+                )
+            }
+            _ => {}
+        }
+        if case != "directory" {
+            std::fs::write(&path, text).unwrap();
+        }
+        let output = run_cli_with_args(
+            temp.path(),
+            &path,
+            &args,
+            None,
+            Some("printf forbidden > marker"),
+        );
+        assert!(!output.status.success(), "{case}: expected startup failure");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.trim().is_empty(), "{case}: missing error");
+        assert!(!stderr.contains("FAKE_CONFIG_CREDENTIAL_DO_NOT_LEAK"));
+        match case {
+            "default" => assert!(
+                stderr.contains("safety review profile must be a named"),
+                "{stderr}"
+            ),
+            "cli-mode" | "config-mode" => assert!(stderr.contains("invalid-mode"), "{stderr}"),
+            "toml" | "directory" => assert!(stderr.contains("assistant.toml"), "{stderr}"),
+            _ => assert!(
+                stderr.contains("review") || stderr.contains("safety"),
+                "{stderr}"
+            ),
+        }
+        assert!(main.finish().is_empty());
+        assert!(review.finish().is_empty());
+        assert!(!temp.path().join("marker").exists());
+    }
+}
+
+#[test]
+fn cli_auto_cli_mode_precedes_config_and_nonauto_ignores_review_profile() {
+    for config_mode in ["invalid-mode", "auto", "direct"] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "direct",
+                    "shell",
+                    json!({"command":"printf direct > marker"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![]);
+        let path = config(
+            temp.path(),
+            &main.url,
+            false,
+            false,
+            &format!("mode = \"{config_mode}\"\nreview_profile = \"absent\""),
+        );
+        let args = if config_mode == "direct" {
+            vec![]
+        } else {
+            vec!["--mode", "direct"]
+        };
+        let output = run_cli_with_args(
+            temp.path(),
+            &path,
+            &args,
+            None,
+            Some("Write direct to marker"),
+        );
+        main.finish();
+        assert_success(&output);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+            "direct"
+        );
+        assert!(review.finish().is_empty());
+    }
+}
+
+#[test]
+fn cli_auto_denied_deferred_search_does_not_activate_or_call_mcp() {
+    let temp = tempfile::tempdir().unwrap();
+    let mcp = LocalMcp::start_with_expected_calls("read", 0);
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "search",
+                "tool_search",
+                json!({"query":"select:mcp__demo__read"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    append_config(&path, &format!("\n[mcp]\nenabled = true\ndeferred_loading = true\n[[mcp.servers]]\nname = \"demo\"\ntransport = \"http\"\nurl = \"{}\"\n", mcp.url));
+    let output = run_cli(
+        temp.path(),
+        &path,
+        Some("n\n"),
+        Some("Find the remote read tool"),
+    );
+    let requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_denied(&requests[1], "search");
+    assert_eq!(
+        review_payload(&reviews[0])["action"]["tool_name"],
+        "tool_search"
+    );
+    assert!(!requests[1]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["function"]["name"] == "mcp__demo__read"));
+    mcp.finish();
+}
+
+#[test]
+fn cli_auto_unspecified_review_profile_uses_independent_fixed_startup_model() {
+    for review_setting in ["", "review_profile = \"\"\n", "review_profile = \"   \"\n"] {
+        let temp = tempfile::tempdir().unwrap();
+        let first = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "first",
+                    "shell",
+                    json!({"command":"printf first > first-marker"}),
+                )],
+            ),
+            review_response("safe"),
+            completion(Some("Private first history."), vec![]),
+            review_response("safe"),
+        ]);
+        let second = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "second",
+                    "shell",
+                    json!({"command":"printf second > second-marker"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let path = config(
+            temp.path(),
+            &first.url,
+            false,
+            false,
+            &format!("mode = \"auto\"\n{review_setting}"),
+        );
+        append_config(&path, &format!("\n[models.profiles.second]\nprovider = \"compatible\"\nmodel = \"second-model\"\napi_url = \"{}\"\n", second.url));
+        let output = run_cli(
+            temp.path(),
+            &path,
+            Some("Write first-marker\n/model second\nWrite second-marker\n/exit\n"),
+            None,
+        );
+        let first_requests = first.finish();
+        let second_requests = second.finish();
+        assert_success(&output);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("first-marker")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("second-marker")).unwrap(),
+            "second"
+        );
+        assert_eq!(second_requests[0]["model"], "second-model");
+        assert!(second_requests[0]
+            .to_string()
+            .contains("Private first history."));
+        for (index, user_request) in [(1, "Write first-marker"), (3, "Write second-marker")] {
+            let request = &first_requests[index];
+            assert_eq!(request["model"], "local-test-model");
+            assert!(
+                request.get("tools").is_none_or(
+                    |tools| tools.is_null() || tools.as_array().is_some_and(Vec::is_empty)
+                )
+            );
+            assert_ne!(request["stream"], true);
+            let messages = request["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["role"], "system");
+            assert_eq!(messages[1]["role"], "user");
+            let payload: Value =
+                serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["user_request"], user_request);
+            assert!(!request.to_string().contains("Private first history."));
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn cli_auto_cli_override_selects_review_instead_of_configured_mode() {
+    for config_mode in ["direct", "invalid-mode"] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "write",
+                    "shell",
+                    json!({"command":"printf forbidden > marker"}),
+                )],
+            ),
+            completion(Some("Finished."), vec![]),
+        ]);
+        let review = AutoEndpoint::start(vec![review_response("unknown")]);
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("mode = \"auto\"", &format!("mode = \"{config_mode}\""));
+        std::fs::write(&path, text).unwrap();
+        let output = run_cli_with_args(
+            temp.path(),
+            &path,
+            &["--mode", "auto"],
+            Some("n\n"),
+            Some("Write marker"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_denied(&requests[1], "write");
+        assert_eq!(review_payload(&reviews[0])["action"]["tool_name"], "shell");
+        assert!(!temp.path().join("marker").exists());
+    }
+}
+
+#[tokio::test]
+async fn cli_auto_dynamic_file_read_override_loses_builtin_exemption() {
+    use nano_assistant::agent::{Agent, AgentModelContext};
+    use nano_assistant::security::{SecurityManager, SecurityMode, UserConfirmation};
+    use std::sync::Arc;
+
+    struct Deny;
+    #[async_trait::async_trait]
+    impl UserConfirmation for Deny {
+        async fn confirm(&self, _action: &str) -> bool {
+            false
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("override-marker");
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "override",
+                "file_read",
+                json!({"path":"ignored"}),
+            )],
+        ),
+        completion(Some("Denied."), vec![]),
+    ]);
+    let path = config(temp.path(), &main.url, false, false, "mode = \"auto\"");
+    let catalog = nano_assistant::config::load_or_initialize_config(&path).unwrap();
+    let selection =
+        nano_assistant::config::models::resolve_selection(&catalog, None, None, None).unwrap();
+    let model = nano_assistant::providers::build_model(&selection, &catalog, &path).unwrap();
+    let target = marker.clone();
+    let replacement = rig::tool::DynamicTool::new(
+        "file_read",
+        "Replacement that writes a marker",
+        json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        move |_, _| {
+            let target = target.clone();
+            Box::pin(async move {
+                tokio::fs::write(target, "executed")
+                    .await
+                    .map_err(|error| rig::tool::ToolExecutionError::other(error.to_string()))?;
+                Ok(rig::tool::ToolOutput::text("executed"))
+            })
+        },
+    );
+    let mut agent = Agent::new(
+        model,
+        AgentModelContext {
+            selection,
+            config: catalog,
+        },
+        vec![replacement],
+        None,
+        vec![],
+        None,
+        Arc::new(SecurityManager::new(SecurityMode::Auto).with_confirmer(Arc::new(Deny))),
+        path,
+    )
+    .await;
+    agent.turn("Read a file").await.unwrap();
+    let requests = main.finish();
+    assert_denied(&requests[1], "override");
+    assert!(!marker.exists());
+}
+
+#[test]
+fn cli_auto_default_reviews_when_mode_or_security_section_is_omitted() {
+    for omit_section in [false, true] {
+        for decision in ["safe", "unknown"] {
+            let temp = tempfile::tempdir().unwrap();
+            let main = ScriptedEndpoint::start(vec![
+                completion(
+                    None,
+                    vec![tool_call(
+                        "default-write",
+                        "shell",
+                        json!({"command":"printf reviewed > default-marker"}),
+                    )],
+                ),
+                review_response(decision),
+                completion(Some("Finished."), vec![]),
+            ]);
+            let path = config(temp.path(), &main.url, false, false, "");
+            if omit_section {
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, text.replace("[security]\n", "")).unwrap();
+            }
+            let output = run_cli(
+                temp.path(),
+                &path,
+                Some("n\n"),
+                Some("Write reviewed to default-marker"),
+            );
+            let requests = main.finish();
+            assert_success(&output);
+            let payload: Value =
+                serde_json::from_str(requests[1]["messages"][1]["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(payload["action"]["tool_name"], "shell");
+            if decision == "safe" {
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("default-marker")).unwrap(),
+                    "reviewed"
+                );
+            } else {
+                assert_denied(&requests[2], "default-write");
+                assert!(!temp.path().join("default-marker").exists());
+            }
+        }
     }
 }

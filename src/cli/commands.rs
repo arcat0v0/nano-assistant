@@ -12,7 +12,7 @@ use crate::config::{
     load_config_or_default, load_or_initialize_config, Config, ModelProfile, ResolvedModel,
 };
 use crate::hub::{maybe_render_ad, model_routes_via_hub, HubClient};
-use crate::security::{SecurityManager, SecurityMode, UserConfirmation};
+use crate::security::{SecurityManager, SecurityMode};
 use anyhow::Context;
 use rig::agent::model::ModelHandle;
 
@@ -79,8 +79,14 @@ pub async fn run(args: CliArgs) -> anyhow::Result<()> {
             let catalog = load_or_initialize_config(&config_path)?;
             let selected = resolve_selection(&catalog, None, None, None)?;
             let config = selected.apply_to_config(&catalog);
-            let security_mode = resolve_security_mode(None, &config);
-            run_interactive(config, config_path, security_mode, catalog, selected).await
+            let security_mode = resolve_security_mode(None, &config)?;
+            let security = build_interactive_security_manager(
+                &catalog,
+                &config_path,
+                security_mode,
+                &selected,
+            )?;
+            run_interactive(config, config_path, security, catalog, selected).await
         }
     }
 }
@@ -95,7 +101,12 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
         args.provider.as_deref(),
     )?;
     let mut config = selected.apply_to_config(&catalog);
-    let security_mode = resolve_security_mode(args.mode.as_deref(), &config);
+    let security_mode = resolve_security_mode(args.mode.as_deref(), &config)?;
+    let security = if args.prompt.is_empty() {
+        build_interactive_security_manager(&catalog, &config_path, security_mode, &selected)?
+    } else {
+        build_security_manager(&catalog, &config_path, security_mode, &selected)?
+    };
     config.behavior.debug = resolve_debug_mode(args.debug, &config);
     let streaming = config.behavior.streaming;
 
@@ -114,15 +125,14 @@ async fn run_chat(args: CliArgsInner) -> anyhow::Result<()> {
                 model,
                 selected.clone(),
                 &config,
-                security_mode,
-                None,
+                Arc::clone(&security),
                 system_info,
                 config_path.clone(),
             )
             .await;
             run_single(agent, &prompt, streaming, &config, &config_path).await
         }
-        None => run_interactive(config, config_path, security_mode, catalog, selected).await,
+        None => run_interactive(config, config_path, security, catalog, selected).await,
     }
 }
 
@@ -199,17 +209,74 @@ async fn handle_model_command(
     Ok(())
 }
 
-fn resolve_security_mode(mode_override: Option<&str>, config: &Config) -> SecurityMode {
-    match mode_override {
-        Some(m) => match m.parse::<SecurityMode>() {
-            Ok(mode) => mode,
-            Err(e) => {
-                eprintln!("[cli] warning: invalid --mode '{m}': {e}, using default");
-                config.security.mode.parse().unwrap_or_default()
-            }
-        },
-        None => config.security.mode.parse().unwrap_or_default(),
+fn resolve_security_mode(
+    mode_override: Option<&str>,
+    config: &Config,
+) -> anyhow::Result<SecurityMode> {
+    mode_override
+        .unwrap_or(&config.security.mode)
+        .parse()
+        .map_err(anyhow::Error::msg)
+}
+
+fn build_interactive_security_manager(
+    config: &Config,
+    config_path: &Path,
+    mode: SecurityMode,
+    selected: &ResolvedModel,
+) -> anyhow::Result<Arc<SecurityManager>> {
+    if mode == SecurityMode::Auto
+        && config
+            .security
+            .review_profile
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        && !model_routes_via_hub(&selected.apply_to_config(config))
+        && !crate::providers::credentials_available(config, selected, config_path)?
+    {
+        let manager = SecurityManager::from_config_with_override(&config.security, Some(mode))
+            .map_err(anyhow::Error::msg)?;
+        return Ok(Arc::new(manager));
     }
+    build_security_manager(config, config_path, mode, selected)
+}
+
+pub(crate) fn build_security_manager(
+    config: &Config,
+    config_path: &Path,
+    mode: SecurityMode,
+    selected: &ResolvedModel,
+) -> anyhow::Result<Arc<SecurityManager>> {
+    let manager = SecurityManager::from_config_with_override(&config.security, Some(mode))
+        .map_err(anyhow::Error::msg)?;
+    if mode != SecurityMode::Auto {
+        return Ok(Arc::new(manager));
+    }
+    let resolved = match config
+        .security
+        .review_profile
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+    {
+        None => selected.clone(),
+        Some("default") => {
+            anyhow::bail!("safety review profile must be a named [models.profiles] entry")
+        }
+        Some(name) => crate::config::models::resolve_profile(
+            config,
+            name,
+            crate::config::SelectionSource::Session,
+        )
+        .context("resolving safety review profile")?,
+    };
+    let model = crate::providers::build_model(&resolved, config, config_path)
+        .context("building safety review model")?;
+    let reviewer = crate::security::review::ModelSafetyReviewer::new(
+        model,
+        resolved.temperature,
+        std::time::Duration::from_secs(resolved.timeout_secs),
+    );
+    Ok(Arc::new(manager.with_reviewer(Arc::new(reviewer))))
 }
 
 fn resolve_debug_mode(cli_debug: bool, config: &Config) -> bool {
@@ -263,17 +330,10 @@ pub(crate) async fn build_agent(
     model: ModelHandle,
     resolved_model: ResolvedModel,
     config: &Config,
-    security_mode: SecurityMode,
-    confirmer: Option<Arc<dyn UserConfirmation>>,
+    security: Arc<SecurityManager>,
     system_info: Option<String>,
     config_path: std::path::PathBuf,
 ) -> Agent {
-    let mut sec_mgr =
-        SecurityManager::from_config_with_override(&config.security, Some(security_mode));
-    if let Some(confirmer) = confirmer {
-        sec_mgr = sec_mgr.with_confirmer(confirmer);
-    }
-    let security = Arc::new(sec_mgr);
     let mut dynamic_tools = Vec::new();
 
     let skills = if config.skills.enabled {
@@ -282,7 +342,7 @@ pub(crate) async fn build_agent(
         Vec::new()
     };
 
-    let skill_tools = crate::skills::skills_to_tools(&skills);
+    let skill_tools = crate::skills::skills_to_tools(&skills, Arc::clone(&security));
     dynamic_tools.extend(skill_tools);
 
     // Register knowledge source tools from skills with type = "knowledge-source"
@@ -366,7 +426,7 @@ async fn run_single(
 async fn run_interactive(
     config: Config,
     config_path: std::path::PathBuf,
-    security_mode: SecurityMode,
+    security: Arc<SecurityManager>,
     catalog: Config,
     selected: ResolvedModel,
 ) -> anyhow::Result<()> {
@@ -380,7 +440,7 @@ async fn run_interactive(
         catalog,
         selected,
         history_path,
-        security_mode,
+        security,
     )
     .await
 }
@@ -674,16 +734,16 @@ mod tests {
     fn resolve_security_mode_cli_override_precedence() {
         let args = parse_chat(&["--mode", "confirm"]);
         let config = Config::default();
-        let mode = resolve_security_mode(args.mode(), &config);
+        let mode = resolve_security_mode(args.mode(), &config).unwrap();
         assert_eq!(mode, SecurityMode::Confirm);
     }
 
     #[test]
-    fn resolve_security_mode_invalid_cli_falls_back_to_config() {
+    fn resolve_security_mode_invalid_cli_stops_startup() {
         let args = parse_chat(&["--mode", "bogus"]);
         let config = Config::default();
         let mode = resolve_security_mode(args.mode(), &config);
-        assert_eq!(mode, SecurityMode::Direct);
+        assert!(mode.is_err());
     }
 
     #[test]
@@ -691,7 +751,7 @@ mod tests {
         let args = parse_chat(&[]);
         let mut config = Config::default();
         config.security.mode = "whitelist".to_string();
-        let mode = resolve_security_mode(args.mode(), &config);
+        let mode = resolve_security_mode(args.mode(), &config).unwrap();
         assert_eq!(mode, SecurityMode::Whitelist);
     }
 
@@ -704,7 +764,7 @@ mod tests {
         assert!(config.first_run);
         assert_eq!(config.provider.temperature, 0.7);
         assert!(config.memory.enabled);
-        assert_eq!(config.security.mode, "direct");
+        assert_eq!(config.security.mode, "auto");
         assert_eq!(config.behavior.max_iterations, 10);
         assert!(!config.behavior.debug);
         assert!(config.behavior.streaming);

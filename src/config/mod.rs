@@ -13,9 +13,20 @@ use std::path::Path;
 
 use anyhow::Context;
 
+fn load_chat_config(path: &Path) -> anyhow::Result<Config> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    toml::from_str(&content).map_err(|_| {
+        anyhow::anyhow!(
+            "parsing config {}: invalid TOML configuration",
+            path.display()
+        )
+    })
+}
+
 pub fn load_or_initialize_config(path: &Path) -> anyhow::Result<Config> {
     if path.exists() {
-        return Ok(load_config_or_default(path));
+        return load_chat_config(path);
     }
 
     let config = Config::first_run_default();
@@ -34,7 +45,7 @@ pub fn load_or_initialize_config(path: &Path) -> anyhow::Result<Config> {
     match temporary.persist_noclobber(path) {
         Ok(_) => Ok(config),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(load_config_or_default(path))
+            load_chat_config(path)
         }
         Err(error) => {
             Err(error.error).with_context(|| format!("creating config {}", path.display()))
