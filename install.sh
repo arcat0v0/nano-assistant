@@ -192,7 +192,7 @@ mkdir -p "$INSTALL_DIR"
 STAGED_BINARY=$(mktemp "$INSTALL_DIR/.na.XXXXXX")
 install -m 0755 "$TMP_DIR/na" "$STAGED_BINARY"
 info "Verifying downloaded executable..."
-VERSION_OUTPUT=$("$STAGED_BINARY" --version) || fatal "downloaded binary failed to run; existing installation preserved"
+VERSION_OUTPUT=$("$STAGED_BINARY" --version 2>&1) || fatal "downloaded binary failed to run; existing installation preserved"
 if [ -n "$TAG" ]; then
     [ "${VERSION_OUTPUT##* }" = "${TAG#v}" ] || fatal "binary version does not match $TAG"
 fi

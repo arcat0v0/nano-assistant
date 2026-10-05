@@ -26,8 +26,9 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def archive(version="0.3.2", executable=True):
-    payload = f"#!/bin/sh\nprintf 'na {version}\\n'\n".encode()
+def archive(version="0.3.2", executable=True, stderr=False):
+    redirect = " >&2" if stderr else ""
+    payload = f"#!/bin/sh\nprintf 'na {version}\\n'{redirect}\n".encode()
     if not executable:
         payload = b"invalid executable\n"
     output = io.BytesIO()
@@ -48,6 +49,7 @@ class DistributionServer:
         self.delays = {}
         self.country = b"loc=CN\n"
         self.browser_aliases = False
+        self.missing_gitee_release_is_null = False
         state = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -113,6 +115,13 @@ class DistributionServer:
                     release = next(
                         (r for r in releases if r["tag_name"] == suffix[2]), None
                     )
+                    if (
+                        release is None
+                        and source == "gitee"
+                        and state.missing_gitee_release_is_null
+                    ):
+                        self.respond(200, None)
+                        return
                     self.respond(200 if release else 404, release or {})
                     return
                 release = next((r for r in releases if str(r["id"]) == suffix[1]), None)
@@ -202,14 +211,14 @@ class DistributionServer:
             **values,
         }
 
-    def ready_release(self, source, version="0.3.2", ready=True):
+    def ready_release(self, source, version="0.3.2", ready=True, stderr=False):
         tag = "v" + version
         release = self.release(source, tag)
         self.releases[source].append(release)
         files = {}
         for target in TARGETS:
             name = f"na-{target}.tar.gz"
-            files[name] = archive(version)
+            files[name] = archive(version, stderr=stderr)
             files[name + ".sha256"] = f"{digest(files[name])}  {name}\n".encode()
         files["install.sh"] = b"installer"
         if ready:
@@ -285,6 +294,13 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse(
             any(path.startswith("/github") for _, path, _, _ in self.server.requests)
         )
+
+    def test_version_output_on_stderr_is_validated(self):
+        self.server.ready_release("gitee", stderr=True)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("0.3.2", self.binary.read_text())
+        self.assertEqual(self.config.read_text(), "existing configuration")
 
     def test_overseas_prefers_github(self):
         self.server.country = b"loc=SG\n"
@@ -543,6 +559,16 @@ class ReleaseTests(unittest.TestCase):
         (self.dist / ARTIFACT).write_bytes(b"corrupted")
         with self.assertRaises(self.module.ReleaseError):
             self.prepare()
+
+    def test_gitee_creates_release_when_missing_tag_returns_null(self):
+        self.prepare()
+        self.server.missing_gitee_release_is_null = True
+        self.publisher("gitee").publish(self.dist, "v0.3.2", "notes")
+        self.assertEqual(len(self.server.releases["gitee"]), 1)
+        self.assertEqual(len(self.server.releases["gitee"][0]["assets"]), 8)
+        self.assertIn(
+            "/gitee/releases/download/v0.3.2/release-manifest.json", self.server.files
+        )
 
     def test_both_platforms_receive_same_bundle_and_retries_are_idempotent(self):
         self.prepare()
