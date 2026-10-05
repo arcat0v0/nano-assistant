@@ -954,6 +954,7 @@ async fn add_model_profile(
         api_key_env: Some(key_env),
         temperature: None,
         timeout_secs: None,
+        reasoning_effort: None,
     };
     let mut updated = catalog_config.clone();
     updated
@@ -1340,6 +1341,7 @@ async fn run_deepseek_onboarding(
                         api_key_env: None,
                         temperature: None,
                         timeout_secs: None,
+                        reasoning_effort: None,
                     };
                     if let Err(error) = add_profile(config_path, &profile_name, profile) {
                         let _ = std::fs::remove_file(deepseek_key_path(config_path));
@@ -1361,6 +1363,7 @@ async fn run_deepseek_onboarding(
                             api_key_env: None,
                             temperature: None,
                             timeout_secs: None,
+                            reasoning_effort: None,
                         },
                     );
                     catalog_config.models.default = Some(profile_name.clone());

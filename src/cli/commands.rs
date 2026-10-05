@@ -176,6 +176,7 @@ async fn handle_model_command(
                     api_key_env,
                     temperature: None,
                     timeout_secs: None,
+                    reasoning_effort: None,
                 },
             )?;
             println!("Added model profile {name}");

@@ -595,13 +595,16 @@ impl Agent {
         handle: ToolServerHandle,
         preamble: &str,
     ) -> rig::agent::Agent {
-        AgentBuilder::from_model_handle(model)
+        let mut builder = AgentBuilder::from_model_handle(model)
             .preamble(preamble)
             .temperature(resolved_model.temperature)
             .default_max_turns(config.behavior.max_iterations)
             .add_hook(RuntimeHook(Arc::clone(state)))
-            .tool_server_handle(handle)
-            .build()
+            .tool_server_handle(handle);
+        if let Some(effort) = resolved_model.effective_reasoning_effort() {
+            builder = builder.additional_params(serde_json::json!({ "reasoning_effort": effort }));
+        }
+        builder.build()
     }
 
     pub async fn switch_model(

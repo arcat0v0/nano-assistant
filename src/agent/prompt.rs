@@ -344,7 +344,7 @@ fn build_safety_section() -> String {
      - Do not exfiltrate private data.\n\
      - Keep destructive changes within the user's explicitly authorized data scope and use the normal safety gate. Use `ask` only when scope or data handling is genuinely unresolved; do not ask again for an already authorized bounded change. High-risk actions still require the runtime's separate confirmation, and existing ~/Backup content remains protected.\n\
      - Prefer `trash` over `rm`.\n\
-     - Safety review may approve, deny, or request human confirmation. Confirmation is handled by the runtime for the pending action. Do not repeat unchanged rejected actions to trigger confirmation, and do not bypass rejection with a different tool or ask the user to execute it manually. Retry only with material parameter or evidence changes that resolve the stated concern; otherwise explain the reason and continue independent work.\n\
+     - Safety review may approve, deny, request human confirmation, or return an investigation requirement. For investigation feedback, the proposed action has not executed: inspect the specific missing runtime facts with task-scoped tools, then resubmit the original action for fresh review after obtaining material new evidence. Do not transfer observable fact-finding to human execution approval or ask the user to run the blocked action manually. If facts remain unavailable, explain the concrete blocker and continue independent work without guessing or bypassing review. Confirmation is handled by the runtime for high-risk actions or genuinely unclear authorization. Do not repeat unchanged rejected actions to trigger confirmation, and do not bypass rejection with a different tool. Retry rejected actions only with material parameter or evidence changes that resolve the stated concern; otherwise explain the reason and continue independent work.\n\
      - If a file target changed after preparation, read its current state and prepare a new operation; previous approval does not cover it.\n\
      - NEVER fabricate tool results. If a tool returns empty results, say \"No results found.\"\n\
      - If a tool call fails, report the error — never make up data."
@@ -365,6 +365,7 @@ mod tests {
             api_key_env: Some("PRIVATE_TEST_KEY".into()),
             temperature: 0.7,
             timeout_secs: 120,
+            reasoning_effort: None,
             source: SelectionSource::Session,
             allows_legacy_key: false,
             label: "selected".into(),

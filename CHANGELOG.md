@@ -4,10 +4,13 @@
 
 ### Changed
 
-- Auto safety review uses categorical risk, task authorization, and missing evidence. Before asking for confirmation about observable facts, its bounded read-only tools can collect evidence and reassess the same action. High risk still requires an independent confirmation; prohibited and outside-scope actions remain denied.
+- Auto safety review uses categorical risk, task authorization, and missing evidence. After its bounded read-only supplementation opportunity, a valid unknown-risk or missing-evidence verdict returns actionable investigation feedback to the main model without executing or requesting human approval. The main model gathers observable facts and resubmits the original action for review; investigation is recorded separately and is not denial-cached. High risk or unclear authorization still requires independent human confirmation; prohibited and outside-scope actions remain denied. Unrelated later-task unknowns belong in the reason, not current-action missing evidence. Infrastructure/protocol failures retain fail-closed confirmation.
+- Whole-review evidence budgets are expanded twentyfold to 120 model requests, 160 evidence calls, 1280 KiB of output, and 60 model timeouts overall. Per-probe limits, malformed-response repair limits, high-risk confirmation, and prohibited-action policy are unchanged.
 - Builtin file writes and edits now prepare isolated filesystem evidence and revalidate the approved target. New files use exclusive creation; changed content, identity, or resolved paths cancel the write. Existing Backup files are blocked in auto mode independently of model approval.
 - Review history records bounded recent actions and their actual outcomes using per-execution receipts. Old file contents remain local, and optional real-model evaluation uses a dedicated non-production profile.
 - Ask and safety confirmation share compact inline terminal cards, with numbered plain-text fallback outside a capable TTY. Stream/tool boundaries preserve earlier conversation and completed summaries. Informational startup subprocesses no longer inherit interactive stdin or outlive their version-query timeout.
+
+- Model profiles accept `reasoning_effort` (`none`/`low`/`high`/`max`), sent as a request parameter on every chat turn. DeepSeek profiles now pin `high` by default instead of relying on the server-side default; other providers send nothing unless explicitly configured.
 
 ### Added
 

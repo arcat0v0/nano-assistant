@@ -319,6 +319,7 @@ mod tests {
                 api_key_env: None,
                 temperature: None,
                 timeout_secs: None,
+                reasoning_effort: None,
             },
         );
         let selected = crate::config::models::resolve_profile(
@@ -353,6 +354,7 @@ mod tests {
                 api_key_env: Some("MISSING_PROFILE_KEY".into()),
                 temperature: None,
                 timeout_secs: None,
+                reasoning_effort: None,
             },
         );
         let selected =

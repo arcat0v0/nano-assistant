@@ -516,6 +516,22 @@ impl SecurityManager {
                 );
                 (Err(format!("Execution denied by safety policy: {detail}. Do not repeat or bypass this action; explain the reason and only submit a materially changed action that resolves the concern.")), "denied")
             }
+            ReviewDecision::Investigate => {
+                eprintln!(
+                    "{}",
+                    crate::console::review_note(&format!(
+                        "{} · {}",
+                        crate::console::yellow("investigation required"),
+                        escape_terminal_controls(detail.clone())
+                    ))
+                );
+                let facts = serde_json::to_string(&missing_evidence)
+                    .expect("missing evidence strings serialize");
+                (
+                    Err(format!("Safety review requires investigation: {detail}. Missing facts: {facts}. This action has not executed. Continue investigating with task-scoped tools to resolve these facts. Do not repeat this action without new evidence or bypass safety review; resubmit it for fresh review after investigation.")),
+                    "investigation_required",
+                )
+            }
             ReviewDecision::AskUser => {
                 let mut request = confirmation_action(action);
                 request.reason = Some(detail.clone());
@@ -544,8 +560,10 @@ impl SecurityManager {
             id: uuid::Uuid::new_v4().to_string(),
         };
         context.record(action, &fingerprint, &receipt.id, status, &detail);
-        if let Err(reason) = &result {
-            context.deny(fingerprint, reason.clone());
+        if decision != ReviewDecision::Investigate {
+            if let Err(reason) = &result {
+                context.deny(fingerprint, reason.clone());
+            }
         }
         result.map(|_| receipt)
     }
@@ -902,7 +920,7 @@ mod tests {
 
     #[tokio::test]
     async fn real_clarification_versions_denials_without_erasing_history() {
-        let reviewer = fixed(review::Risk::Unknown, review::Authorization::WithinScope);
+        let reviewer = fixed(review::Risk::High, review::Authorization::WithinScope);
         let manager = SecurityManager::new(SecurityMode::Auto)
             .with_reviewer(reviewer.clone())
             .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
@@ -1039,8 +1057,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertainty_confirms_once_and_unchanged_rejection_is_cached() {
-        let reviewer = fixed(review::Risk::Unknown, review::Authorization::WithinScope);
+    async fn runtime_facts_require_investigation_without_confirmation_or_rejection_cache() {
+        for (risk, facts) in [
+            (
+                review::Risk::Low,
+                vec!["Podman container query failed with exit 125".to_owned()],
+            ),
+            (review::Risk::Unknown, vec![]),
+        ] {
+            let reviewer = Arc::new(FixedReviewer(
+                review::ReviewOutcome {
+                    risk,
+                    authorization: review::Authorization::WithinScope,
+                    reason: "Runtime facts need investigation".into(),
+                    missing_evidence: facts.clone(),
+                },
+                std::sync::atomic::AtomicUsize::new(0),
+            ));
+            let manager = SecurityManager::new(SecurityMode::Auto)
+                .with_reviewer(reviewer)
+                .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(
+                    vec![].into(),
+                ))));
+            manager.set_user_request("Inspect the requested container");
+            let args = serde_json::json!({"command":"podman ps -a"});
+            let action = ToolAction {
+                tool_name: "shell",
+                args: &args,
+                description: None,
+                resolved: None,
+            };
+            for _ in 0..2 {
+                let feedback = manager.authorize(&action).await.unwrap_err();
+                assert!(feedback.starts_with("Safety review requires investigation:"));
+                assert!(feedback.contains("Runtime facts need investigation"));
+                for fact in &facts {
+                    assert!(feedback.contains(fact));
+                }
+                assert!(!feedback.contains("already rejected"));
+            }
+            let context = manager.context.read();
+            assert!(context.denied.is_empty());
+            assert!(context
+                .history
+                .iter()
+                .all(|record| record.status == "investigation_required"));
+        }
+    }
+
+    #[tokio::test]
+    async fn high_risk_confirms_once_and_unchanged_rejection_is_cached() {
+        let reviewer = fixed(review::Risk::High, review::Authorization::WithinScope);
         let manager = SecurityManager::new(SecurityMode::Auto)
             .with_reviewer(reviewer.clone())
             .with_interaction(Arc::new(ConfirmSequence(parking_lot::Mutex::new(

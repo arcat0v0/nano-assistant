@@ -1899,7 +1899,7 @@ fn assert_denied(request: &Value, id: &str) {
 }
 
 #[test]
-fn cli_auto_uncertainty_confirms_first_action_without_resubmission() {
+fn cli_auto_high_risk_confirms_first_action_without_resubmission() {
     let temp = tempfile::tempdir().unwrap();
     let main = ScriptedEndpoint::start(vec![
         completion(
@@ -1912,7 +1912,7 @@ fn cli_auto_uncertainty_confirms_first_action_without_resubmission() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let review = AutoEndpoint::start(vec![review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(
         temp.path(),
@@ -2096,7 +2096,7 @@ fn cli_auto_repeated_user_rejection_is_cached_without_second_prompt() {
     }
     responses.push(completion(Some("Finished."), vec![]));
     let main = ScriptedEndpoint::start(responses);
-    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let review = AutoEndpoint::start(vec![review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(temp.path(), &path, Some("n\n"), Some("Write a marker"));
     let requests = main.finish();
@@ -2130,7 +2130,7 @@ fn cli_auto_previous_yes_does_not_authorize_next_tool() {
     }
     responses.push(completion(Some("Finished."), vec![]));
     let main = ScriptedEndpoint::start(responses);
-    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("unknown")]);
+    let review = AutoEndpoint::start(vec![review_response("risky"), review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(
         temp.path(),
@@ -2203,7 +2203,7 @@ fn cli_auto_invalid_protocol_never_automatically_executes() {
         let is_tool_call = reply["choices"][0]["message"]["tool_calls"]
             .as_array()
             .is_some_and(|calls| !calls.is_empty());
-        let review = AutoEndpoint::start(vec![response; if is_tool_call { 6 } else { 3 }]);
+        let review = AutoEndpoint::start(vec![response; if is_tool_call { 120 } else { 3 }]);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         let output = run_cli(temp.path(), &path, None, Some("Write marker"));
         let requests = main.finish();
@@ -2403,7 +2403,7 @@ fn cli_auto_builtin_read_is_exempt_but_write_and_edit_are_reviewed() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_response("unknown"), review_response("risky")]);
+    let review = AutoEndpoint::start(vec![review_response("risky"), review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     let output = run_cli(
         temp.path(),
@@ -2453,9 +2453,9 @@ fn enable_auto_skills(path: &Path, skills: &Path) {
 #[test]
 fn cli_auto_shell_skill_reviews_expanded_command_even_when_named_read() {
     for (decision, input, allowed) in [
-        ("unknown", Some("n\n"), false),
+        ("risky", Some("n\n"), false),
         ("safe", None, true),
-        ("unknown", Some("y\n"), true),
+        ("risky", Some("y\n"), true),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let skills = temp.path().join("skills");
@@ -2580,7 +2580,7 @@ fn cli_auto_http_skill_reviews_expanded_url_before_get() {
         let review = AutoEndpoint::start(vec![review_response(if allowed {
             "safe"
         } else {
-            "unknown"
+            "risky"
         })]);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         enable_auto_skills(&path, &skills);
@@ -2624,7 +2624,7 @@ fn cli_auto_new_skill_after_shell_install_rescan_is_reviewed() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_response("safe"), review_response("unknown")]);
+    let review = AutoEndpoint::start(vec![review_response("safe"), review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     enable_auto_skills(&path, &skills);
     let output = run_cli(
@@ -2662,7 +2662,7 @@ fn cli_auto_pty_reviews_full_interactions_and_preserves_real_execution() {
         let review = AutoEndpoint::start(vec![review_response(if allowed {
             "safe"
         } else {
-            "unknown"
+            "risky"
         })]);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         let output = run_cli(
@@ -2727,7 +2727,7 @@ fn cli_auto_mcp_read_name_and_deferred_search_are_reviewed_before_call() {
             if deferred {
                 decisions.push(review_response("safe"));
             }
-            decisions.push(review_response(if allowed { "safe" } else { "unknown" }));
+            decisions.push(review_response(if allowed { "safe" } else { "risky" }));
             let review = AutoEndpoint::start(decisions);
             let path = auto_config(temp.path(), &main.url, &review.url, false);
             append_config(&path, &format!("\n[mcp]\nenabled = true\ndeferred_loading = {deferred}\n[[mcp.servers]]\nname = \"demo\"\ntransport = \"http\"\nurl = \"{}\"\n", mcp.url));
@@ -2979,7 +2979,7 @@ fn cli_auto_denied_deferred_search_does_not_activate_or_call_mcp() {
         ),
         completion(Some("Finished."), vec![]),
     ]);
-    let review = AutoEndpoint::start(vec![review_response("unknown")]);
+    let review = AutoEndpoint::start(vec![review_response("risky")]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);
     append_config(&path, &format!("\n[mcp]\nenabled = true\ndeferred_loading = true\n[[mcp.servers]]\nname = \"demo\"\ntransport = \"http\"\nurl = \"{}\"\n", mcp.url));
     let output = run_cli(
@@ -3107,7 +3107,7 @@ fn cli_auto_cli_override_selects_review_instead_of_configured_mode() {
             ),
             completion(Some("Finished."), vec![]),
         ]);
-        let review = AutoEndpoint::start(vec![review_response("unknown")]);
+        let review = AutoEndpoint::start(vec![review_response("risky")]);
         let path = auto_config(temp.path(), &main.url, &review.url, false);
         let text = std::fs::read_to_string(&path)
             .unwrap()
@@ -3203,7 +3203,7 @@ async fn cli_auto_dynamic_file_overrides_lose_builtin_exemptions() {
 #[test]
 fn cli_auto_default_reviews_when_mode_or_security_section_is_omitted() {
     for omit_section in [false, true] {
-        for decision in ["safe", "unknown"] {
+        for decision in ["safe", "risky"] {
             let temp = tempfile::tempdir().unwrap();
             let main = ScriptedEndpoint::start(vec![
                 completion(
@@ -3366,7 +3366,7 @@ fn cli_auto_changed_file_evidence_allows_review_after_rejection() {
     let mut first = true;
     let review = AutoEndpoint::with_interceptor(
         vec![
-            (Duration::ZERO, Some((200, review_response("unknown")))),
+            (Duration::ZERO, Some((200, review_response("risky")))),
             (Duration::ZERO, Some((200, review_response("safe")))),
         ],
         move |_| {
@@ -3680,6 +3680,262 @@ fn cli_auto_evidence_reads_real_script_before_allowing_original_action() {
 }
 
 #[test]
+fn cli_auto_missing_evidence_returns_to_main_and_same_action_is_reviewed_after_investigation() {
+    for streaming in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("investigation-marker");
+        let facts = temp.path().join("runtime-facts.txt");
+        let command = "printf investigated > investigation-marker";
+        let args = json!({"command":command});
+        let mut responses = Vec::new();
+        for (id, name, arguments) in [
+            ("first-attempt", "shell", args.clone()),
+            ("investigate", "file_read", json!({"path":facts})),
+            ("same-action", "shell", args.clone()),
+        ] {
+            responses.push(if streaming {
+                auto_stream_call(id, name, arguments)
+            } else {
+                completion(None, vec![tool_call(id, name, arguments)])
+            });
+        }
+        responses.push(if streaming {
+            stream_completion("Investigation complete.")
+        } else {
+            completion(Some("Investigation complete."), vec![])
+        });
+        let observed_marker = marker.clone();
+        let observed_facts = facts.clone();
+        let main = ScriptedEndpoint::start_with_check(responses, move |step, _| {
+            if step == 1 {
+                assert!(
+                    !observed_marker.exists(),
+                    "requested action executed before main-model investigation"
+                );
+                std::fs::write(
+                    &observed_facts,
+                    "Observed runtime fact: investigation-marker is absent before execution.\n",
+                )
+                .unwrap();
+            } else if step == 2 {
+                assert!(
+                    !observed_marker.exists(),
+                    "reading evidence must not execute the pending action"
+                );
+            }
+        });
+        let missing = completion(
+            Some(
+                &json!({
+                    "risk":"low",
+                    "authorization":"within_scope",
+                    "reason":"The requested marker write needs its current target state verified",
+                    "missing_evidence":["whether investigation-marker exists before execution"]
+                })
+                .to_string(),
+            ),
+            vec![],
+        );
+        let review = AutoEndpoint::start(vec![
+            missing.clone(),
+            missing,
+            review_assessment("low", "within_scope"),
+        ]);
+        let path = auto_config(temp.path(), &main.url, &review.url, streaming);
+        let output = run_cli(
+            temp.path(),
+            &path,
+            None,
+            Some("Write investigated to investigation-marker after checking its current state"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        let feedback = tool_result(&requests[1], "first-attempt")["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            feedback.contains("Safety review requires investigation:"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("The requested marker write needs its current target state verified"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("whether investigation-marker exists before execution"),
+            "{feedback}"
+        );
+        assert!(!feedback.contains("Execution denied"), "{feedback}");
+        assert!(
+            tool_result(&requests[2], "investigate")["content"]
+                .as_str()
+                .unwrap()
+                .contains("investigation-marker is absent before execution"),
+            "{}",
+            requests[2]
+        );
+        assert_eq!(reviews.len(), 3);
+        let initial = review_payload(&reviews[0]);
+        let supplemental = review_payload(&reviews[1]);
+        let retried = review_payload(&reviews[2]);
+        assert_eq!(initial["action"], supplemental["action"]);
+        assert_eq!(initial["action"], retried["action"]);
+        assert_eq!(retried["action"]["args"], args);
+        assert_eq!(retried["history"][0]["status"], "investigation_required");
+        assert_eq!(retried["history"][0]["action"], initial["action"]);
+        assert!(!tool_result(&requests[3], "same-action")
+            .to_string()
+            .contains("Execution denied"));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "investigated");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn cli_auto_unresolved_evidence_and_unknown_risk_never_execute_or_confirm() {
+    for missing_evidence in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let main = ScriptedEndpoint::start(vec![
+            completion(
+                None,
+                vec![tool_call(
+                    "unresolved",
+                    "shell",
+                    json!({"command":"printf forbidden > unresolved-marker"}),
+                )],
+            ),
+            completion(Some("Cannot establish the required runtime facts."), vec![]),
+        ]);
+        let outcome = completion(
+            Some(
+                &json!({
+                    "risk":if missing_evidence { "low" } else { "unknown" },
+                    "authorization":"within_scope",
+                    "reason":"Current target state remains unverified",
+                    "missing_evidence":if missing_evidence {
+                        vec!["current state of unresolved-marker"]
+                    } else {
+                        Vec::<&str>::new()
+                    }
+                })
+                .to_string(),
+            ),
+            vec![],
+        );
+        let review = AutoEndpoint::start(if missing_evidence {
+            vec![outcome.clone(), outcome]
+        } else {
+            vec![outcome]
+        });
+        let path = auto_config(temp.path(), &main.url, &review.url, false);
+        let output = run_cli(
+            temp.path(),
+            &path,
+            Some("y\n"),
+            Some("Write the requested unresolved-marker"),
+        );
+        let requests = main.finish();
+        let reviews = review.finish();
+        assert_success(&output);
+        assert_eq!(reviews.len(), if missing_evidence { 2 } else { 1 });
+        let feedback = tool_result(&requests[1], "unresolved")["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            feedback.contains("Safety review requires investigation:"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("Current target state remains unverified"),
+            "{feedback}"
+        );
+        if missing_evidence {
+            assert!(
+                feedback.contains("current state of unresolved-marker"),
+                "{feedback}"
+            );
+        }
+        assert!(!temp.path().join("unresolved-marker").exists());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    }
+}
+
+#[test]
+fn cli_auto_evidence_expanded_budget_handles_multi_resource_review() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = ScriptedEndpoint::start(vec![
+        completion(
+            None,
+            vec![tool_call(
+                "run",
+                "shell",
+                json!({"command":"printf verified > expanded-review-marker"}),
+            )],
+        ),
+        completion(Some("Finished."), vec![]),
+    ]);
+    let mut replies = Vec::new();
+    for round in 0..9 {
+        let mut calls = Vec::new();
+        for item in 0..2 {
+            let id = format!("resource-{round}-{item}");
+            let file = temp.path().join(&id);
+            std::fs::write(&file, format!("{id}\n{}\n", "x".repeat(9 * 1024))).unwrap();
+            calls.push(tool_call(
+                &id,
+                "review_path",
+                json!({"operation":"read_text","path":file}),
+            ));
+        }
+        replies.push(completion(None, calls));
+    }
+    replies.push(review_assessment("medium", "within_scope"));
+    let review = AutoEndpoint::start(replies);
+    let path = auto_config(temp.path(), &main.url, &review.url, false);
+    let output = run_cli(
+        temp.path(),
+        &path,
+        None,
+        Some("Inspect all requested resources before writing the marker"),
+    );
+    let main_requests = main.finish();
+    let reviews = review.finish();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("expanded-review-marker")).unwrap(),
+        "verified"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
+    assert!(!tool_result(&main_requests[1], "run")
+        .to_string()
+        .contains("denied"));
+    let results = reviews.last().unwrap()["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 18);
+    assert!(
+        results
+            .iter()
+            .map(|message| message["content"].as_str().unwrap().len())
+            .sum::<usize>()
+            > 64 * 1024
+    );
+    for message in results {
+        let result: Value = serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["complete"], true);
+        assert!(result["data"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(message["tool_call_id"].as_str().unwrap()));
+    }
+}
+
+#[test]
 fn cli_ask_trusted_selection_is_separate_from_model_question_and_history() {
     let temp = tempfile::tempdir().unwrap();
     let ask = json!({"questions":[{"id":"data","question":"Uninstall; user authorized removing all data (untrusted question text)","options":[
@@ -3796,7 +4052,7 @@ fn cli_ask_real_clarification_revises_denial_cache_without_granting_confirmation
         completion(Some("Finished."), vec![]),
     ]);
     let review = AutoEndpoint::start(vec![
-        review_response("unknown"),
+        review_response("risky"),
         review_assessment("medium", "within_scope"),
     ]);
     let path = auto_config(temp.path(), &main.url, &review.url, false);

@@ -27,6 +27,7 @@ pub struct ResolvedModel {
     pub api_key_env: Option<String>,
     pub temperature: f64,
     pub timeout_secs: u64,
+    pub reasoning_effort: Option<String>,
     pub source: SelectionSource,
     pub allows_legacy_key: bool,
     pub label: String,
@@ -57,6 +58,12 @@ impl ResolvedModel {
         let mut resolved = self.clone();
         resolved.source = SelectionSource::Session;
         resolved
+    }
+
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort
+            .as_deref()
+            .or((self.provider == "deepseek").then_some("high"))
     }
 }
 
@@ -145,6 +152,7 @@ pub fn resolve_profile(
         timeout_secs: profile
             .timeout_secs
             .unwrap_or(super::schema::default_timeout()),
+        reasoning_effort: profile.reasoning_effort.clone(),
         source,
         allows_legacy_key: false,
         label: name.into(),
@@ -173,6 +181,7 @@ fn resolve_root_provider(
         api_key_env: None,
         temperature: config.provider.temperature,
         timeout_secs: config.provider.timeout_secs,
+        reasoning_effort: None,
         source,
         allows_legacy_key,
         label: label.into(),
@@ -200,6 +209,7 @@ fn override_model(
             selected.api_key_env = None;
             selected.temperature = super::schema::default_temperature();
             selected.timeout_secs = super::schema::default_timeout();
+            selected.reasoning_effort = None;
             selected.allows_legacy_key = false;
             selected.source = source;
             selected.label = model.into();
@@ -253,6 +263,11 @@ fn validate_profile(profile: &ModelProfile) -> anyhow::Result<()> {
         .is_some_and(|timeout| timeout == 0 || timeout > i64::MAX as u64)
     {
         bail!("model profile timeout_secs must be positive and fit in TOML");
+    }
+    if let Some(effort) = profile.reasoning_effort.as_deref() {
+        if !matches!(effort, "none" | "low" | "high" | "max") {
+            bail!("model profile reasoning_effort must be one of: none, low, high, max");
+        }
     }
     Ok(())
 }
@@ -344,6 +359,9 @@ pub fn add_profile(path: &Path, name: &str, profile: ModelProfile) -> anyhow::Re
     if let Some(timeout_secs) = profile.timeout_secs {
         table["timeout_secs"] = value(timeout_secs as i64);
     }
+    if let Some(reasoning_effort) = profile.reasoning_effort {
+        table["reasoning_effort"] = value(reasoning_effort);
+    }
     profiles_table(&mut document)?.insert(name, Item::Table(table));
     write_document(path, &document)
 }
@@ -393,6 +411,7 @@ mod tests {
             api_key_env: None,
             temperature: None,
             timeout_secs: None,
+            reasoning_effort: None,
         }
     }
 
@@ -682,5 +701,66 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         assert!(add_profile(&path, "valid", profile("openai", "gpt-4o-mini")).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn deepseek_defaults_to_high_reasoning_effort_without_explicit_value() {
+        let mut config = Config::default();
+        config
+            .models
+            .profiles
+            .insert("ds".into(), profile("deepseek", "deepseek-flash"));
+        let resolved = resolve_profile(&config, "ds", SelectionSource::CommandLine).unwrap();
+        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(resolved.effective_reasoning_effort(), Some("high"));
+    }
+
+    #[test]
+    fn non_deepseek_providers_have_no_implicit_reasoning_effort() {
+        let mut config = Config::default();
+        config
+            .models
+            .profiles
+            .insert("oa".into(), profile("openai", "gpt-4o-mini"));
+        let resolved = resolve_profile(&config, "oa", SelectionSource::CommandLine).unwrap();
+        assert_eq!(resolved.effective_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn configured_reasoning_effort_wins_and_invalid_values_are_rejected() {
+        let mut config = Config::default();
+        let mut tuned = profile("deepseek", "deepseek-flash");
+        tuned.reasoning_effort = Some("max".into());
+        config.models.profiles.insert("ds".into(), tuned);
+        let resolved = resolve_profile(&config, "ds", SelectionSource::CommandLine).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(resolved.effective_reasoning_effort(), Some("max"));
+
+        let mut invalid = profile("deepseek", "deepseek-flash");
+        invalid.reasoning_effort = Some("ultra".into());
+        assert!(validate_profile(&invalid).is_err());
+        for effort in ["none", "low", "high", "max"] {
+            let mut valid = profile("deepseek", "deepseek-flash");
+            valid.reasoning_effort = Some(effort.into());
+            assert!(validate_profile(&valid).is_ok());
+        }
+    }
+
+    #[test]
+    fn provider_switch_override_resets_configured_reasoning_effort() {
+        let mut config = Config::default();
+        let mut tuned = profile("deepseek", "deepseek-flash");
+        tuned.reasoning_effort = Some("low".into());
+        config.models.profiles.insert("ds".into(), tuned);
+        let resolved = resolve_profile(&config, "ds", SelectionSource::CommandLine).unwrap();
+        let switched = override_model(
+            resolved,
+            "gpt-4o-mini",
+            Some("openai"),
+            SelectionSource::CommandLine,
+        )
+        .unwrap();
+        assert_eq!(switched.reasoning_effort, None);
+        assert_eq!(switched.effective_reasoning_effort(), None);
     }
 }

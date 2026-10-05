@@ -954,7 +954,7 @@ fn escape_and_ctrl_c_during_masked_entry_exit_with_terminal_restored() {
 }
 
 #[test]
-fn tui_auto_first_uncertainty_requires_current_confirmation() {
+fn tui_auto_high_risk_requires_current_confirmation() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("review-marker.txt");
     let command = "printf reviewed > review-marker.txt\n# FULL_ACTION_DETAIL_ONLY";
@@ -966,10 +966,10 @@ fn tui_auto_first_uncertainty_requires_current_confirmation() {
     ]);
     let reviewer = QueuedCompletionFixture::start(vec![
         queued_completion(
-            r#"{"risk":"unknown","authorization":"within_scope","reason":"first action requires current approval","missing_evidence":[]}"#,
+            r#"{"risk":"high","authorization":"within_scope","reason":"first action requires current approval","missing_evidence":[]}"#,
         ),
         queued_completion(
-            r#"{"risk":"unknown","authorization":"within_scope","reason":"second action requires current approval","missing_evidence":[]}"#,
+            r#"{"risk":"high","authorization":"within_scope","reason":"second action requires current approval","missing_evidence":[]}"#,
         ),
     ]);
     let config_path = temp.path().join("assistant.toml");
@@ -1159,7 +1159,14 @@ fn tui_ask_stream_recommended_waits_for_answer_before_execution_at_all_widths() 
         assert!(terminal.text()[start..].contains("Before clarification."));
         terminal.send("\x1b[A\r");
         terminal.until_from("After clarification.", start);
-        terminal.until_from("❯ ", start);
+        let answer = b"After clarification.";
+        let answer_end = terminal
+            .output
+            .windows(answer.len())
+            .rposition(|bytes| bytes == answer)
+            .unwrap()
+            + answer.len();
+        terminal.until_from("❯ ", answer_end);
         assert!(!temp.path().join("remove.txt").exists());
         assert_eq!(
             fs::read_to_string(temp.path().join("keep.txt")).unwrap(),
