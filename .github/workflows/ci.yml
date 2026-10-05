@@ -28,5 +28,16 @@ jobs:
       - name: Cargo test
         run: cargo test --locked
 
+      - name: Install distribution test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+
+      - name: Test installation and publishing
+        run: python3 -m unittest discover -s tests -p 'test_distribution.py' -v
+
+      - name: Check installer
+        run: shellcheck install.sh
+
       - name: Release build
         run: cargo build --release --locked

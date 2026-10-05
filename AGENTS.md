@@ -21,7 +21,7 @@ Core module map (`src/`):
 - `knowledge/` — knowledge source adapters (URL-encoded queries to external docs).
 - `cli/`, `tui/`, `config/` — CLI parsing, terminal rendering (rustyline + termimad + crossterm), config loading.
 
-Integration tests live in `tests/integration.rs`; actual CLI/provider/tool continuation contracts live in `tests/runtime_cli.rs`; unit tests are co-located with modules. Runtime ownership is documented in `docs/runtime.md`, with release notes and design docs under `docs/releases/` and `docs/superpowers/`. Built-in skill content is stored in `skills/`.
+Integration tests live in `tests/integration.rs`; actual CLI/provider/tool continuation contracts live in `tests/runtime_cli.rs`; unit tests are co-located with modules. Distribution integration tests in `tests/test_distribution.py` exercise the Bash installer, publishing client, and temporary Git mirrors through controlled local services. Runtime ownership is documented in `docs/runtime.md`, with release notes and design docs under `docs/releases/` and `docs/superpowers/`. Built-in skill content is stored in `skills/`.
 
 ## Build, Test, and Development Commands
 
@@ -33,6 +33,8 @@ Integration tests live in `tests/integration.rs`; actual CLI/provider/tool conti
 - `cargo test pty_shell -- --nocapture` — run a focused test subset while debugging interactive command support.
 - `cargo fmt` — format (required before committing).
 - `cargo clippy` — lint.
+- `python3 -m unittest discover -s tests -p 'test_distribution.py' -v` — test installation and publishing with isolated local services; requires Python 3.11+, Bash, jq, curl/wget, and coreutils.
+- `shellcheck install.sh` — lint the installer.
 
 Run commands from the repository root where `Cargo.toml` is located.
 
@@ -65,7 +67,9 @@ Two release paths are supported, both executed by `.github/workflows/release.yml
 - Automated (preferred): manually trigger the **Release** workflow from the GitHub Actions page (`workflow_dispatch`) and choose `patch` / `minor` / `major`. It bumps `version` in `Cargo.toml`, syncs `Cargo.lock`, commits as `🔖 chore(release): bump version to vX.Y.Z`, pushes the tag, then builds and publishes the release.
 - Manual: bump `version` in `Cargo.toml` and commit it yourself, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The workflow aborts if the tag does not match the `Cargo.toml` version.
 
-Both paths build `x86_64-linux-gnu`, `x86_64-linux-musl`, and `aarch64-linux-musl` tarballs plus `.sha256` checksums, and attach `install.sh` to the release. The musl targets depend on the vendored `openssl` entry in `Cargo.toml`; do not remove it. After a release, verify with `curl -fsSL https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh | bash` on a clean machine or container.
+Both paths run application/distribution checks, build `x86_64-linux-gnu`, `x86_64-linux-musl`, and `aarch64-linux-musl` tarballs plus `.sha256` checksums, and publish the same bundle to GitHub and Gitee, including `install.sh` and a readiness manifest. Gitee mirror updates never force push. Configure the `GITEE_TOKEN` repository Actions Secret before publishing. The musl targets depend on the vendored `openssl` entry in `Cargo.toml`; do not remove it.
+
+Re-run failed jobs to reuse existing artifacts. To republish an existing version, dispatch Release with its `tag` input; it recovers original GitHub assets without bumping or rebuilding. See `docs/releases/distribution.md`. After publishing, verify the README bootstrap command on clean mainland/overseas Linux environments; static/local tests do not establish real Gitee or regional download success.
 
 ## Security & Configuration
 

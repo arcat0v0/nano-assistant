@@ -21,22 +21,51 @@
 ### 方式一：一键安装脚本（Linux 服务器，推荐）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh | bash
+(
+    set -eu
+    installer=$(mktemp)
+    trap 'rm -f "$installer"' EXIT
+    if curl -fsSL --connect-timeout 3 --max-time 8 \
+        "${NA_GITHUB_INSTALL_URL:-https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh}" -o "$installer" ||
+        curl -fsSL --connect-timeout 3 --max-time 8 \
+        "${NA_GITEE_INSTALL_URL:-https://gitee.com/arcat00/nano-assistant/raw/main/install.sh}" -o "$installer"; then
+        bash "$installer"
+    else
+        printf 'error: cannot download installer from GitHub or Gitee\n' >&2
+        exit 1
+    fi
+)
 ```
 
-脚本自动完成：架构检测（x86_64 / aarch64）、下载静态 musl 链接的二进制（不依赖系统 glibc 版本，新老发行版均可运行）、SHA256 校验、安装到 `~/.local/bin`、生成默认配置、并将安装目录写入 shell rc 文件的 PATH。
+通用入口先尝试 GitHub，失败后改从 Gitee 获取完整脚本，然后执行。也可直接下载 [Gitee 安装脚本](https://gitee.com/arcat00/nano-assistant/raw/main/install.sh) 或 [GitHub 安装脚本](https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh)，保存为 `install.sh` 后运行 `bash install.sh`。
+
+脚本支持 Linux x86_64 / aarch64，使用 `curl` 或 `wget` 下载静态 musl 二进制，要求 `jq`、`tar`、`gzip`、`sha256sum` 和基础 coreutils；使用 wget 时还要求 `timeout`。它检测公网出口国家：`CN` 优先 Gitee，其他地区优先 GitHub，检测失败显示 `unknown` 并尝试可用来源。代理会影响出口判断。
+
+默认选择首选平台上语义版本最高、带完整发布清单的正式版，排除草稿和预览版。下载失败时自动模式换源重试同一版本，压缩包和校验文件重新成组获取；校验不匹配直接停止。二进制通过 SHA256 与运行版本检查后原子替换到 `~/.local/bin`，保留已有配置，并按需将安装目录加入 shell rc 文件的 PATH。
 
 可选环境变量：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `NA_VERSION` | `latest` | 安装指定版本，例如 `NA_VERSION=0.3.2` |
+| `NA_SOURCE` | `auto` | `auto` / `github` / `gitee`；手动指定平台后不自动换源 |
 | `NA_INSTALL_DIR` | `~/.local/bin` | 自定义安装目录 |
-| `NA_BASE_URL` | GitHub Releases | 自定义下载源（镜像或离线测试） |
+| `NA_BASE_URL` | 空 | 优先级最高的自定义地址；沿用 `/latest/download/文件` 或 `/download/v版本/文件`，不识别地区、不换源，也不要求 jq |
+| `NA_CONNECT_TIMEOUT` | `3` | 每次连接超时，单位秒 |
+| `NA_PROBE_TIMEOUT` | `4` | 地区、发行版元数据和校验文件请求的总超时，单位秒 |
+| `NA_DOWNLOAD_TIMEOUT` | `120` | 单个二进制附件下载的总超时，单位秒 |
+
+指定来源和版本：
+
+```bash
+NA_SOURCE=gitee NA_VERSION=0.3.2 bash install.sh
+```
+
+首次启用双平台发布时，先用发布工作流补齐一个已有正式版的清单，或发布一个新版本。旧版本没有清单时仍可通过 `NA_VERSION` 显式安装。两平台发布存在同步窗口，脚本会显示实际选中的版本和来源。
 
 ### 方式二：手动下载预编译二进制
 
-[GitHub Releases](https://github.com/arcat0v0/nano-assistant/releases) 提供的资产：
+[GitHub Releases](https://github.com/arcat0v0/nano-assistant/releases) 和 [Gitee Releases](https://gitee.com/arcat00/nano-assistant/releases) 发布同一批资产：
 
 | 资产 | 适用平台 |
 |------|----------|
@@ -73,7 +102,11 @@ cp target/release/na ~/.local/bin/
 
 ### 发布新版本（维护者）
 
-在仓库 Actions 页面手动触发 **Release** workflow，选择 `patch` / `minor` / `major`：自动递增 `Cargo.toml` 版本号并提交、创建 `vX.Y.Z` tag、构建全部平台产物（含 SHA256 校验文件）并发布 GitHub Release。也可以手动 `git tag vX.Y.Z && git push origin vX.Y.Z` 触发发布（跳过自动递增，要求 `Cargo.toml` 版本与 tag 一致）。
+在仓库 Actions 页面手动触发 **Release** workflow，选择 `patch` / `minor` / `major`，保持 `tag` 为空：检查通过后自动递增版本、提交并创建 tag，一次构建全部产物，再发布到 GitHub 和 Gitee。Gitee 分支与 tag 同步拒绝覆盖冲突历史。也可手动更新版本后推送匹配的 `vX.Y.Z` tag 触发发布。
+
+Gitee 发布需要先在仓库 Actions Secrets 中配置 `GITEE_TOKEN`。某个平台失败时保留另一边的成功发布；优先重跑失败任务。手动触发并填写已有 `tag` 可从 GitHub 原始附件恢复发布，跳过版本递增和构建。
+
+完整的凭据设置、恢复入口及测试方法见 [发布与安装维护说明](docs/releases/distribution.md)。
 
 ### 验证安装
 

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, reqwest (existing), tokio (existing), async-trait (existing), serde_json (existing). No new dependencies.
 
-**Source reference:** ZeroClaw MCP modules at `/home/arcat/Develop/nano-assistant/zeroclaw/src/tools/`
+**Source reference:** ZeroClaw MCP modules at `../zeroclaw/src/tools/`
 
 ---
 

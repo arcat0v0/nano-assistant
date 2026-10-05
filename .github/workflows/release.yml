@@ -12,6 +12,11 @@ on:
           - patch
           - minor
           - major
+      tag:
+        description: "Existing tag to recover from GitHub assets (leave empty for a new release)"
+        required: false
+        default: ""
+        type: string
   push:
     tags:
       - "v*"
@@ -24,7 +29,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check Rust targets
+        run: cargo check --locked --all-targets
+      - name: Test application
+        run: cargo test --locked
+      - name: Install distribution test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+      - name: Test installation and publishing
+        run: python3 -m unittest discover -s tests -p 'test_distribution.py' -v
+      - name: Check installer
+        run: shellcheck install.sh
+
   version:
+    needs: verify
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag || steps.bump.outputs.tag }}
@@ -33,30 +59,42 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.tag == ''
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Use pushed tag
+      - name: Use existing tag
         id: resolve
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::invalid release tag"; exit 1; }
           current=$(awk -F'"' '/^\[/{p=($0=="[package]")} p && /^version = /{print $2;exit}' Cargo.toml)
-          if [ "v$current" != "${GITHUB_REF_NAME}" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${current}"
+          if [ "v$current" != "$RELEASE_TAG" ]; then
+            echo "::error::tag $RELEASE_TAG does not match Cargo.toml version ${current}"
             exit 1
           fi
-          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Bump version, commit and tag
         id: bump
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.tag == ''
         env:
           BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
+
+          existing=$(git for-each-ref --format='%(refname:short) %(contents:subject)' refs/tags |
+            awk -v id="$GITHUB_RUN_ID" '$0 ~ " \\(workflow run " id "\\)$" {print $1}')
+          if [ -n "$existing" ]; then
+            [[ "$existing" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::ambiguous release run tag"; exit 1; }
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           current=$(awk -F'"' '/^\[/{p=($0=="[package]")} p && /^version = /{print $2;exit}' Cargo.toml)
           [ -n "$current" ] || { echo "::error::cannot read version from Cargo.toml"; exit 1; }
@@ -85,7 +123,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
           git commit -m "🔖 chore(release): bump version to $tag"
-          git tag "$tag"
+          git tag -a "$tag" -m "Release $tag (workflow run $GITHUB_RUN_ID)"
           git push origin HEAD:main
           git push origin "$tag"
 
@@ -93,6 +131,7 @@ jobs:
 
   build:
     needs: version
+    if: inputs.tag == ''
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -116,23 +155,35 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.tag }}
 
+      - name: Reuse completed build on retry
+        id: previous
+        if: github.run_attempt > 1
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: .
+
       - name: Install Rust toolchain
+        if: steps.previous.outcome != 'success'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Restore cargo cache
+        if: steps.previous.outcome != 'success'
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
 
       - name: Install cross
-        if: matrix.cross
+        if: matrix.cross && steps.previous.outcome != 'success'
         uses: taiki-e/install-action@v2
         with:
           tool: cross
 
       - name: Build
+        if: steps.previous.outcome != 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -143,40 +194,128 @@ jobs:
           fi
 
       - name: Package (Unix)
-        if: runner.os != 'Windows'
+        if: steps.previous.outcome != 'success'
         run: |
           set -euo pipefail
           tar czf "na-${{ matrix.name }}.tar.gz" -C "target/${{ matrix.target }}/release" na
           sha256sum "na-${{ matrix.name }}.tar.gz" > "na-${{ matrix.name }}.tar.gz.sha256"
 
       - name: Upload artifact
+        if: steps.previous.outcome != 'success'
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
           path: na-${{ matrix.name }}.*
 
-  release:
+  bundle:
     needs: [version, build]
+    if: always() && needs.version.result == 'success' && (needs.build.result == 'success' || inputs.tag != '')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.tag }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Reuse completed bundle on retry
+        id: previous
+        if: github.run_attempt > 1
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
+        if: inputs.tag == '' && steps.previous.outcome != 'success'
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Prepare or recover release bundle
+        if: steps.previous.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RECOVER_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [ -n "$RECOVER_TAG" ]; then
+            python3 scripts/release.py recover --tag "$RELEASE_TAG" --commit "$commit"
+          else
+            git show "$RELEASE_TAG:install.sh" > "$RUNNER_TEMP/release-install.sh"
+            python3 scripts/release.py prepare --tag "$RELEASE_TAG" --commit "$commit" --installer "$RUNNER_TEMP/release-install.sh"
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$RELEASE_TAG" -f target_commitish="$commit" --jq .body > dist/release-notes.md
+          fi
+      - name: Preserve release bundle
+        if: steps.previous.outcome != 'success'
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          files: |
-            dist/*
-            install.sh
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+          name: release-bundle
+          path: dist/*
+          overwrite: true
+          if-no-files-found: error
+
+  github:
+    needs: [version, bundle]
+    if: always() && needs.bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Publish and verify GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: python3 scripts/release.py publish --source github --tag "$RELEASE_TAG" --notes-file dist/release-notes.md
+
+  gitee:
+    needs: [version, bundle]
+    if: always() && needs.bundle.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GITEE_REPO: ${{ vars.GITEE_REPO || 'arcat00/nano-assistant' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: Mirror source and publish Gitee Release
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          [ -n "$GITEE_TOKEN" ] || { echo "::error::set GITEE_TOKEN in repository Actions secrets"; exit 1; }
+          python3 scripts/release.py sync --tag "$RELEASE_TAG"
+          python3 scripts/release.py publish --source gitee --tag "$RELEASE_TAG" --notes-file dist/release-notes.md
+
+  result:
+    needs: [version, github, gitee]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report both platforms
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          GITHUB_RESULT: ${{ needs.github.result }}
+          GITEE_RESULT: ${{ needs.gitee.result }}
+        run: |
+          printf 'Release %s\n\nGitHub: %s\nGitee: %s\n' "$RELEASE_TAG" "$GITHUB_RESULT" "$GITEE_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          [ "$GITHUB_RESULT" = success ] && [ "$GITEE_RESULT" = success ]
