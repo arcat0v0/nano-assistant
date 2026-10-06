@@ -4695,7 +4695,7 @@ dependencies = [
 
 [[package]]
 name = "nano-assistant"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-stream",
