@@ -56,7 +56,7 @@ Gitee 令牌用于向镜像仓库推送分支/tag、创建发行版和上传附�
 
 安装在目标目录中创建暂存文件，验证其可运行且版本正确后原子替换 `na`。失败保留旧二进制和配置，退出或中断清理临时文件。安装脚本不创建配置目录或配置文件，也不修改已有配置；正常运行 `na` 时由二进制自动创建缺失的配置，并显式保存 DeepSeek / `deepseek-flash` 默认模型。已有配置不覆盖，创建失败则报告错误并停止启动；`--help` 和 `--version` 不创建配置。
 
-高级受控测试可设置 `NA_COUNTRY_URL`、`NA_GITHUB_API_URL`、`NA_GITEE_API_URL`、`NA_GITHUB_RELEASES_URL`、`NA_GITEE_RELEASES_URL`。通用引导命令可覆盖 `NA_GITHUB_INSTALL_URL` 与 `NA_GITEE_INSTALL_URL`。正常安装不需要设置这些地址。
+高级受控测试可设置 `NA_COUNTRY_URL`、`NA_GITHUB_API_URL`、`NA_GITEE_API_URL`、`NA_GITHUB_RELEASES_URL`、`NA_GITEE_RELEASES_URL`。正常安装不需要设置这些地址。
 
 ## 测试入口与验收
 

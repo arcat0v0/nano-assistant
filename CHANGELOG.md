@@ -41,6 +41,7 @@
 - Auto safety review now scores actions on a 1-100 risk scale: 1-9 auto-approves, 10-49 returns to the main model for revision, 50-69 auto-approves only when the latest user message explicitly confirms the destructive scope, 70-89 always requires live human confirmation, and 90-100 is prohibited outright, even with human approval. Commands that modify or delete existing files under ~/Backup are always prohibited.
 - Review context sections are wrapped in per-request random boundary tokens so forged confirmations embedded in tool arguments or prior rejections cannot impersonate the genuine user_request section.
 - Tool calls render as bordered blocks (⚒ header, 🛡 review verdict, ✓/✗ result) with color-coded review statuses; confirmation prompts show the concrete arguments, resolved execution target, and local file preview behind a ⚠ [y/N] flag.
+- The README bootstrap is simplified to two region-specific one-liners that pipe the mirrored install script straight into Bash: Gitee for mainland servers, GitHub elsewhere. The installer itself is unchanged.
 
 ### Fixed
 

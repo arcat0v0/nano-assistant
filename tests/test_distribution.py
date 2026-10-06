@@ -512,47 +512,53 @@ class InstallerTests(unittest.TestCase):
         result = self.install(PATH=str(commands))
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def bootstrap(self, **overrides):
+    GITEE_BOOTSTRAP_URL = "https://gitee.com/arcat00/nano-assistant/raw/main/install.sh"
+    GITHUB_BOOTSTRAP_URL = "https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh"
+
+    def bootstrap_commands(self):
         block = re.search(
             r"```bash\n(.*?)\n```", (ROOT / "README.md").read_text(), re.DOTALL
         ).group(1)
-        temp = self.home / "temporary"
-        temp.mkdir()
+        commands = re.findall(r"^curl .+ \| bash$", block, re.MULTILINE)
+        self.assertEqual(len(commands), 2)
+        return [
+            command.replace(
+                self.GITEE_BOOTSTRAP_URL, self.server.base + "/bootstrap/gitee"
+            ).replace(
+                self.GITHUB_BOOTSTRAP_URL, self.server.base + "/bootstrap/github"
+            )
+            for command in commands
+        ]
+
+    def run_bootstrap(self, command):
         env = {
             **os.environ,
             "HOME": str(self.home),
-            "TMPDIR": str(temp),
-            "NA_GITHUB_INSTALL_URL": self.server.base + "/bootstrap/github",
-            "NA_GITEE_INSTALL_URL": self.server.base + "/bootstrap/gitee",
-            "HTTPS_PROXY": self.server.base,
-            "https_proxy": self.server.base,
-            "HTTP_PROXY": self.server.base,
-            "http_proxy": self.server.base,
-            "ALL_PROXY": self.server.base,
-            "all_proxy": self.server.base,
             "NO_PROXY": "127.0.0.1",
             "no_proxy": "127.0.0.1",
-            **overrides,
         }
-        result = subprocess.run(
-            ["bash", "-c", block], env=env, capture_output=True, text=True, timeout=20
+        return subprocess.run(
+            ["bash", "-c", command], env=env, capture_output=True, text=True, timeout=20
         )
-        self.assertEqual(list(temp.iterdir()), [])
-        return result
 
-    def test_bootstrap_falls_back_and_only_runs_complete_script(self):
-        self.server.failures[("GET", "/bootstrap/github")] = 503
+    def test_bootstrap_commands_execute_downloaded_script(self):
         self.server.files["/bootstrap/gitee"] = (
-            b'printf bootstrap-ok > "$HOME/started"\n'
+            b'printf gitee-ok > "$HOME/started"\n'
         )
-        result = self.bootstrap()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.home / "started").read_text(), "bootstrap-ok")
+        self.server.files["/bootstrap/github"] = (
+            b'printf github-ok > "$HOME/started"\n'
+        )
+        for command in self.bootstrap_commands():
+            result = self.run_bootstrap(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = "gitee-ok" if "bootstrap/gitee" in command else "github-ok"
+            self.assertEqual((self.home / "started").read_text(), expected)
+            (self.home / "started").unlink()
 
     def test_bootstrap_does_not_execute_on_download_failure(self):
-        result = self.bootstrap()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.home / "started").exists())
+        for command in self.bootstrap_commands():
+            self.run_bootstrap(command)
+            self.assertFalse((self.home / "started").exists())
 
     def test_wrong_binary_version_preserves_existing_installation(self):
         data = archive("0.3.1")

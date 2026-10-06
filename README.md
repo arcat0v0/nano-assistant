@@ -22,23 +22,14 @@
 ### 方式一：一键安装脚本（Linux 服务器，推荐）
 
 ```bash
-(
-    set -eu
-    installer=$(mktemp)
-    trap 'rm -f "$installer"' EXIT
-    if curl -fsSL --connect-timeout 3 --max-time 8 \
-        "${NA_GITHUB_INSTALL_URL:-https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh}" -o "$installer" ||
-        curl -fsSL --connect-timeout 3 --max-time 8 \
-        "${NA_GITEE_INSTALL_URL:-https://gitee.com/arcat00/nano-assistant/raw/main/install.sh}" -o "$installer"; then
-        bash "$installer"
-    else
-        printf 'error: cannot download installer from GitHub or Gitee\n' >&2
-        exit 1
-    fi
-)
+# 国内服务器
+curl -fsSL https://gitee.com/arcat00/nano-assistant/raw/main/install.sh | bash
+
+# 国外服务器
+curl -fsSL https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh | bash
 ```
 
-通用入口先尝试 GitHub，失败后改从 Gitee 获取完整脚本，然后执行。也可直接下载 [Gitee 安装脚本](https://gitee.com/arcat00/nano-assistant/raw/main/install.sh) 或 [GitHub 安装脚本](https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh)，保存为 `install.sh` 后运行 `bash install.sh`。
+两个地址获取同一个脚本：国内服务器用 Gitee 地址，国外服务器用 GitHub 地址。也可直接下载 [Gitee 安装脚本](https://gitee.com/arcat00/nano-assistant/raw/main/install.sh) 或 [GitHub 安装脚本](https://raw.githubusercontent.com/arcat0v0/nano-assistant/main/install.sh)，保存为 `install.sh` 后运行 `bash install.sh`。
 
 脚本支持 Linux x86_64 / aarch64，使用 `curl` 或 `wget` 下载静态 musl 二进制，要求 `jq`、`tar`、`gzip`、`sha256sum` 和基础 coreutils；使用 wget 时还要求 `timeout`。它检测公网出口国家：`CN` 优先 Gitee，其他地区优先 GitHub，检测失败显示 `unknown` 并尝试可用来源。代理会影响出口判断。
 
